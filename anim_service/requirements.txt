@@ -1,0 +1,6 @@
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+google-genai>=1.14.0
+pydantic==2.5.3
+aiofiles==23.2.1
+Pillow==10.2.0

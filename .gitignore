@@ -1,0 +1,28 @@
+.env
+node_modules/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.DS_Store
+*.log
+/videos/*
+!videos/.gitkeep
+
+# Ignore gemini_manim directory
+gemini_manim/
+
+# Output and test files
+output/
+*.wav
+*.mp4
+
+# Service account keys
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json

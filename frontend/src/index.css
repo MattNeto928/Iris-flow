@@ -1,0 +1,244 @@
+@import "tailwindcss";
+
+/* Iris Design System - Tailwind v4 CSS-based configuration */
+
+@theme {
+  /* Custom color palette */
+  --color-iris-50: #f5f3ff;
+  --color-iris-100: #ede9fe;
+  --color-iris-200: #ddd6fe;
+  --color-iris-300: #c4b5fd;
+  --color-iris-400: #a78bfa;
+  --color-iris-500: #8b5cf6;
+  --color-iris-600: #7c3aed;
+  --color-iris-700: #6d28d9;
+  --color-iris-800: #5b21b6;
+  --color-iris-900: #4c1d95;
+
+  /* Status colors */
+  --color-status-pending: #6b7280;
+  --color-status-processing: #f59e0b;
+  --color-status-completed: #10b981;
+  --color-status-failed: #ef4444;
+
+  /* Segment type colors */
+  --color-type-animation: #3b82f6;
+  --color-type-manim: #8b5cf6;
+  --color-type-pysim: #06b6d4;
+  --color-type-transition: #f97316;
+
+  /* Dark theme base */
+  --color-surface-50: #18181b;
+  --color-surface-100: #27272a;
+  --color-surface-200: #3f3f46;
+  --color-surface-300: #52525b;
+  --color-surface-400: #71717a;
+
+  /* Font family */
+  --font-sans: "Inter", system-ui, sans-serif;
+}
+
+/* Base styles */
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: var(--color-surface-50);
+  color: #fafafa;
+  line-height: 1.5;
+}
+
+/* Canvas dotted background */
+.canvas-bg {
+  background-image: radial-gradient(
+    circle,
+    rgba(255, 255, 255, 0.08) 1px,
+    transparent 1px
+  );
+  background-size: 24px 24px;
+}
+
+/* Glassmorphism cards */
+.glass-card {
+  background: rgba(39, 39, 42, 0.8);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+}
+
+/* Segment status borders */
+.segment-pending {
+  border-color: var(--color-status-pending);
+}
+
+.segment-processing {
+  border-color: var(--color-status-processing);
+  animation: pulse-border 2s ease-in-out infinite;
+}
+
+.segment-completed {
+  border-color: var(--color-status-completed);
+}
+
+.segment-failed {
+  border-color: var(--color-status-failed);
+}
+
+@keyframes pulse-border {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(245, 158, 11, 0);
+  }
+}
+
+/* Type badges */
+.badge-animation {
+  background: var(--color-type-animation);
+}
+
+.badge-manim {
+  background: var(--color-type-manim);
+}
+
+.badge-pysim {
+  background: var(--color-type-pysim);
+}
+
+.badge-transition {
+  background: var(--color-type-transition);
+}
+
+/* Button styles */
+.btn-primary {
+  background: linear-gradient(
+    135deg,
+    var(--color-iris-500),
+    var(--color-iris-700)
+  );
+  color: white;
+  padding: 0.75rem 1.5rem;
+  border-radius: 8px;
+  font-weight: 500;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.btn-primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 20px rgba(139, 92, 246, 0.4);
+}
+
+.btn-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.btn-secondary {
+  background: rgba(255, 255, 255, 0.1);
+  color: white;
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  font-weight: 500;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.btn-secondary:hover {
+  background: rgba(255, 255, 255, 0.15);
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-surface-100);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-surface-300);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-surface-400);
+}
+
+/* Input styling */
+.input-field {
+  background: var(--color-surface-100);
+  border: 1px solid var(--color-surface-300);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  color: white;
+  font-size: 1rem;
+  width: 100%;
+  transition: border-color 0.2s ease;
+}
+
+.input-field:focus {
+  outline: none;
+  border-color: var(--color-iris-500);
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.2);
+}
+
+.input-field::placeholder {
+  color: var(--color-surface-400);
+}
+
+/* Modal overlay */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal-content {
+  background: var(--color-surface-100);
+  border: 1px solid var(--color-surface-300);
+  border-radius: 16px;
+  max-width: 600px;
+  width: 90%;
+  max-height: 80vh;
+  overflow: auto;
+  padding: 1.5rem;
+}
+
+/* Flow arrow */
+.flow-arrow {
+  stroke: var(--color-iris-400);
+  stroke-width: 2;
+  fill: none;
+  opacity: 0.6;
+}
+
+/* Dragging state */
+.dragging {
+  opacity: 0.8;
+  transform: scale(1.02);
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+}

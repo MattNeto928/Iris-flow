@@ -1,0 +1,71 @@
+version: "3.8"
+
+services:
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - main_service
+
+  main_service:
+    build: ./main_service
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./main_service/app:/app
+      - shared_videos:/videos
+      - ./gen-lang-client-0142432606-c78dd6841ded.json:/app/gcp-sa-key.json:ro
+    environment:
+      - GOOGLE_AI_API_KEY=${GOOGLE_AI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-sa-key.json
+      - ANIM_SERVICE_URL=http://anim_service:8001
+      - MANIM_SERVICE_URL=http://manim_service:8002
+      - PYSIM_SERVICE_URL=http://pysim_service:8003
+    depends_on:
+      - anim_service
+      - manim_service
+      - pysim_service
+
+  anim_service:
+    build: ./anim_service
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./anim_service/app:/app
+      - shared_videos:/videos
+      - ./gen-lang-client-0142432606-c78dd6841ded.json:/app/gcp-sa-key.json:ro
+    environment:
+      - GOOGLE_AI_API_KEY=${GOOGLE_AI_API_KEY}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-sa-key.json
+      - GCP_PROJECT_ID=gen-lang-client-0142432606
+      - GCP_LOCATION=us-central1
+
+  manim_service:
+    build: ./manim_service
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./manim_service/app:/app
+      - shared_videos:/videos
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+
+  pysim_service:
+    build: ./pysim_service
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./pysim_service/app:/app
+      - shared_videos:/videos
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+
+volumes:
+  shared_videos:
