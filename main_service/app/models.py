@@ -6,10 +6,23 @@ from datetime import datetime
 
 
 class SegmentType(str, Enum):
+    # Original types
     ANIMATION = "animation"  # Gemini Veo 3.1
     MANIM = "manim"          # Claude + Manim
     PYSIM = "pysim"          # Claude + Python Simulation
     TRANSITION = "transition" # Black screen + voiceover
+    # New node types
+    MESA = "mesa"            # Agent-based modeling
+    PYMUNK = "pymunk"        # 2D physics
+    SIMPY = "simpy"          # Discrete event simulation
+    PLOTLY = "plotly"        # 3D plots
+    NETWORKX = "networkx"    # Graph algorithms
+    AUDIO = "audio"          # Sound/signal visualization
+    STATS = "stats"          # Statistical visualizations
+    FRACTAL = "fractal"      # Fractals & cellular automata
+    GEO = "geo"              # Geographic visualization
+    CHEM = "chem"            # Molecular structures
+    ASTRO = "astro"          # Astronomy
 
 
 class SegmentStatus(str, Enum):

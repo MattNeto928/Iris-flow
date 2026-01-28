@@ -415,6 +415,14 @@ def get_service_url(segment_type: SegmentType) -> str:
         return PYSIM_SERVICE_URL
     elif segment_type == SegmentType.TRANSITION:
         return MANIM_SERVICE_URL
+    # New node types - all route to pysim service with specific endpoints
+    elif segment_type in (
+        SegmentType.MESA, SegmentType.PYMUNK, SegmentType.SIMPY,
+        SegmentType.PLOTLY, SegmentType.NETWORKX, SegmentType.AUDIO,
+        SegmentType.STATS, SegmentType.FRACTAL, SegmentType.GEO,
+        SegmentType.CHEM, SegmentType.ASTRO
+    ):
+        return PYSIM_SERVICE_URL
     else:
         raise ValueError(f"Unknown segment type: {segment_type}")
 

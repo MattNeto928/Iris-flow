@@ -6,11 +6,22 @@ from typing import Optional
 from claude_client import generate_simulation_script
 from simulator import run_simulation_and_compile
 
+# Import new services
+from simpy_service import SimpyService
+from plotly_service import PlotlyService
+from networkx_service import NetworkxService
+from audio_service import AudioService
+from stats_service import StatsService
+from fractal_service import FractalService
+from geo_service import GeoService
+from chem_service import ChemService
+from astro_service import AstroService
+
 
 app = FastAPI(
     title="Iris PySim Service",
     description="Scientific simulation and visualization",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -20,6 +31,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Initialize new services
+simpy_service = SimpyService()
+plotly_service = PlotlyService()
+networkx_service = NetworkxService()
+audio_service = AudioService()
+stats_service = StatsService()
+fractal_service = FractalService()
+geo_service = GeoService()
+chem_service = ChemService()
+astro_service = AstroService()
 
 
 class GenerateRequest(BaseModel):
@@ -116,3 +138,123 @@ async def preview_script(request: GenerateRequest):
         return {"script": script}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ========== NEW SERVICE ENDPOINTS ==========
+
+@app.post("/generate/simpy", response_model=GenerateResponse)
+async def generate_simpy(request: GenerateRequest):
+    """Generate discrete event simulation visualization."""
+    try:
+        video_path = await simpy_service.generate(
+            description=request.description,
+            duration=request.duration_seconds
+        )
+        return GenerateResponse(video_path=video_path, duration=request.duration_seconds)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/generate/plotly", response_model=GenerateResponse)
+async def generate_plotly(request: GenerateRequest):
+    """Generate 3D plot visualization."""
+    try:
+        video_path = await plotly_service.generate(
+            description=request.description,
+            duration=request.duration_seconds
+        )
+        return GenerateResponse(video_path=video_path, duration=request.duration_seconds)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/generate/networkx", response_model=GenerateResponse)
+async def generate_networkx(request: GenerateRequest):
+    """Generate graph algorithm visualization."""
+    try:
+        video_path = await networkx_service.generate(
+            description=request.description,
+            duration=request.duration_seconds
+        )
+        return GenerateResponse(video_path=video_path, duration=request.duration_seconds)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/generate/audio", response_model=GenerateResponse)
+async def generate_audio(request: GenerateRequest):
+    """Generate audio/signal visualization."""
+    try:
+        video_path = await audio_service.generate(
+            description=request.description,
+            duration=request.duration_seconds
+        )
+        return GenerateResponse(video_path=video_path, duration=request.duration_seconds)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/generate/stats", response_model=GenerateResponse)
+async def generate_stats(request: GenerateRequest):
+    """Generate statistical visualization."""
+    try:
+        video_path = await stats_service.generate(
+            description=request.description,
+            duration=request.duration_seconds
+        )
+        return GenerateResponse(video_path=video_path, duration=request.duration_seconds)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/generate/fractal", response_model=GenerateResponse)
+async def generate_fractal(request: GenerateRequest):
+    """Generate fractal/cellular automata visualization."""
+    try:
+        video_path = await fractal_service.generate(
+            description=request.description,
+            duration=request.duration_seconds
+        )
+        return GenerateResponse(video_path=video_path, duration=request.duration_seconds)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/generate/geo", response_model=GenerateResponse)
+async def generate_geo(request: GenerateRequest):
+    """Generate geographic visualization."""
+    try:
+        video_path = await geo_service.generate(
+            description=request.description,
+            duration=request.duration_seconds
+        )
+        return GenerateResponse(video_path=video_path, duration=request.duration_seconds)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/generate/chem", response_model=GenerateResponse)
+async def generate_chem(request: GenerateRequest):
+    """Generate molecular structure visualization."""
+    try:
+        video_path = await chem_service.generate(
+            description=request.description,
+            duration=request.duration_seconds
+        )
+        return GenerateResponse(video_path=video_path, duration=request.duration_seconds)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/generate/astro", response_model=GenerateResponse)
+async def generate_astro(request: GenerateRequest):
+    """Generate astronomy visualization."""
+    try:
+        video_path = await astro_service.generate(
+            description=request.description,
+            duration=request.duration_seconds
+        )
+        return GenerateResponse(video_path=video_path, duration=request.duration_seconds)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+

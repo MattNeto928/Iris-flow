@@ -1,5 +1,22 @@
-// Segment types matching backend
-export type SegmentType = 'animation' | 'manim' | 'pysim';
+// Segment types matching backend - all 14 node types
+export type SegmentType = 
+  // Original types
+  | 'animation' 
+  | 'manim' 
+  | 'pysim' 
+  | 'transition'
+  // New node types
+  | 'mesa'       // Agent-based modeling
+  | 'pymunk'     // 2D physics
+  | 'simpy'      // Discrete event simulation
+  | 'plotly'     // 3D plots
+  | 'networkx'   // Graph algorithms
+  | 'audio'      // Sound/signal visualization
+  | 'stats'      // Statistical visualizations
+  | 'fractal'    // Fractals & cellular automata
+  | 'geo'        // Geographic visualization
+  | 'chem'       // Molecular structures
+  | 'astro';     // Astronomy
 
 export type SegmentStatus = 'pending' | 'processing' | 'completed' | 'failed';
 

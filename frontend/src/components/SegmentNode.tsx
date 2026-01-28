@@ -11,17 +11,43 @@ interface SegmentNodeProps {
 }
 
 const typeLabels: Record<string, string> = {
+  // Original types
   animation: 'Animation',
   manim: 'Manim',
   pysim: 'PySim',
   transition: 'Transition',
+  // New node types
+  mesa: 'Mesa',
+  pymunk: 'Pymunk',
+  simpy: 'SimPy',
+  plotly: 'Plotly',
+  networkx: 'NetworkX',
+  audio: 'Audio',
+  stats: 'Stats',
+  fractal: 'Fractal',
+  geo: 'Geo',
+  chem: 'Chem',
+  astro: 'Astro',
 };
 
 const typeColors: Record<string, string> = {
+  // Original types
   animation: 'badge-animation',
   manim: 'badge-manim',
   pysim: 'badge-pysim',
   transition: 'badge-transition',
+  // New node types - grouped by domain color
+  mesa: 'badge-mesa',        // Green - agent-based
+  pymunk: 'badge-pymunk',    // Green - physics
+  simpy: 'badge-simpy',      // Blue - simulation
+  plotly: 'badge-plotly',    // Purple - visualization
+  networkx: 'badge-networkx', // Orange - networks
+  audio: 'badge-audio',      // Pink - audio
+  stats: 'badge-stats',      // Teal - statistics
+  fractal: 'badge-fractal',  // Magenta - fractals
+  geo: 'badge-geo',          // Cyan - geography
+  chem: 'badge-chem',        // Yellow - chemistry
+  astro: 'badge-astro',      // Purple - astronomy
 };
 
 const statusColors: Record<string, string> = {

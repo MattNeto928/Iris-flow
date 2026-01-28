@@ -26,6 +26,18 @@
   --color-type-manim: #8b5cf6;
   --color-type-pysim: #06b6d4;
   --color-type-transition: #f97316;
+  /* New node type colors */
+  --color-type-mesa: #22c55e;
+  --color-type-pymunk: #84cc16;
+  --color-type-simpy: #0ea5e9;
+  --color-type-plotly: #a855f7;
+  --color-type-networkx: #f97316;
+  --color-type-audio: #ec4899;
+  --color-type-stats: #14b8a6;
+  --color-type-fractal: #d946ef;
+  --color-type-geo: #06b6d4;
+  --color-type-chem: #eab308;
+  --color-type-astro: #6366f1;
 
   /* Dark theme base */
   --color-surface-50: #18181b;
@@ -119,6 +131,51 @@ body {
 
 .badge-transition {
   background: var(--color-type-transition);
+}
+
+/* New node type badges */
+.badge-mesa {
+  background: var(--color-type-mesa);
+}
+
+.badge-pymunk {
+  background: var(--color-type-pymunk);
+}
+
+.badge-simpy {
+  background: var(--color-type-simpy);
+}
+
+.badge-plotly {
+  background: var(--color-type-plotly);
+}
+
+.badge-networkx {
+  background: var(--color-type-networkx);
+}
+
+.badge-audio {
+  background: var(--color-type-audio);
+}
+
+.badge-stats {
+  background: var(--color-type-stats);
+}
+
+.badge-fractal {
+  background: var(--color-type-fractal);
+}
+
+.badge-geo {
+  background: var(--color-type-geo);
+}
+
+.badge-chem {
+  background: var(--color-type-chem);
+}
+
+.badge-astro {
+  background: var(--color-type-astro);
 }
 
 /* Button styles */

@@ -18,3 +18,37 @@ pymunk==6.6.0
 
 # Visualization
 pygame==2.5.2
+
+# === NEW SERVICE DEPENDENCIES ===
+
+# Discrete event simulation
+simpy
+
+# 3D plotting with static export
+plotly
+kaleido
+
+# Graph algorithms
+networkx
+
+# Audio/signal processing
+librosa
+soundfile
+
+# Statistics
+seaborn
+statsmodels
+
+# JIT compilation for fractals
+numba
+
+# Geographic visualization
+cartopy
+geopandas
+
+# Chemistry/molecular
+rdkit-pypi
+
+# Astronomy
+astropy
+skyfield
