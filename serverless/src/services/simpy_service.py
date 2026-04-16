@@ -23,116 +23,260 @@ FRAMES_DIR = OUTPUT_DIR / "frames"
 VIDEOS_DIR = OUTPUT_DIR / "videos"
 
 
-SIMPY_PROMPT = """You are an expert Python programmer specializing in discrete event simulation using SimPy.
-Generate a complete, self-contained Python script that creates a SimPy simulation and visualizes it as an animated Gantt chart or timeline.
+SIMPY_PROMPT = """# SimPy Segment Generation
 
-CRITICAL DURATION REQUIREMENTS:
-- Target video duration: {duration} seconds
-- Frame rate: 30 FPS
-- EXACT frame count required: {frames} frames
-- You MUST generate EXACTLY {frames} PNG files, no more, no less
-- Frame naming: frame_00000.png, frame_00001.png, etc. (5-digit zero-padded)
+SimPy segments visualize discrete event systems (queues, processes, workflows). The pattern is **always two-phase**: first run the full simulation capturing state snapshots, then render as matplotlib frames.
 
-VIDEO FORMAT: VERTICAL (9:16 for Shorts/Reels/TikTok)
-- Output resolution: 1080x1920 pixels (portrait)
-- Use figsize=(6, 10.67) or similar vertical aspect ratio
-- Center all visual elements
+## Mandatory Two-Phase Pattern
 
-**SIMPY BEST PRACTICES:**
-1. Use `simpy.Environment()` to create the simulation environment
-2. Define processes as generator functions using `yield env.timeout()` and `yield resource.request()`
-3. Run simulation to completion FIRST, then animate the recorded events
-4. Record all events (arrivals, service starts, departures) with timestamps
-
-**VISUALIZATION APPROACH:**
-1. Run the full SimPy simulation, recording all events to a list
-2. For each frame, show the state of the system at that point in time
-3. Use Gantt-style bars for resource utilization
-4. Show queue lengths, waiting times, or throughput as needed
-
-**COMMON SIMPY PATTERNS:**
 ```python
-import simpy
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import numpy as np
-
-def process(env, name, resource, events):
-    arrival = env.now
-    with resource.request() as req:
-        yield req
-        start = env.now
-        yield env.timeout(service_time)
-        end = env.now
-    events.append({{'name': name, 'arrival': arrival, 'start': start, 'end': end}})
-```
-
-**REQUIRED TEMPLATE:**
-```python
-import sys
+import simpy
 import os
-import simpy
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-import numpy as np
+from collections import deque
 
-def run_simulation():
-    '''Run SimPy simulation and return recorded events.'''
-    env = simpy.Environment()
-    events = []
-    # ... setup processes ...
-    env.run()
-    return events
+OUTPUT_DIR = os.environ.get('OUTPUT_DIR', '/tmp/frames')
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+DURATION = float(os.environ.get('DURATION', '8'))
+FPS = 30
+N_FRAMES = int(DURATION * FPS)
 
-def main(output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    TOTAL_FRAMES = {frames}
-    
-    # Run simulation first
-    events = run_simulation()
-    
-    # Calculate time range
-    max_time = max(e['end'] for e in events) if events else 10
-    
-    fig, ax = plt.subplots(figsize=(6, 10.67))
-    
-    for frame_num in range(TOTAL_FRAMES):
-        ax.clear()
-        t = (frame_num / TOTAL_FRAMES) * max_time
-        
-        # Draw events up to time t
-        # ... visualization code ...
-        
-        ax.set_xlim(0, max_time)
-        ax.set_title(f"Time: {{t:.1f}}", fontsize=14, color='white')
-        ax.set_facecolor('#1a1a2e')
-        fig.patch.set_facecolor('#1a1a2e')
-        ax.tick_params(colors='white')
-        
-        plt.savefig(os.path.join(output_dir, f"frame_{{frame_num:05d}}.png"),
-                    dpi=180, bbox_inches='tight', pad_inches=0.1,
-                    facecolor='#1a1a2e')
-    
-    plt.close()
-    print(f"Generated {{TOTAL_FRAMES}} frames")
+plt.rcParams.update({
+    'font.family': 'sans-serif',
+    'font.sans-serif': ['Roboto', 'Helvetica Neue', 'DejaVu Sans'],
+    'axes.facecolor': '#0D0D0D',
+    'figure.facecolor': '#0D0D0D',
+    'text.color': '#F5F5F5',
+})
 
-if __name__ == "__main__":
-    main(sys.argv[1])
+# ══════════════════════════════════════════════════════════════
+# PHASE 1: Run simulation, capture snapshots
+# ══════════════════════════════════════════════════════════════
+
+SIM_DURATION = 60.0  # simulation time units
+snapshots = []       # list of state dicts, one per time unit
+
+# ... define processes + run simulation ...
+
+env = simpy.Environment()
+env.process(simulation_process(env, snapshots))
+env.run(until=SIM_DURATION)
+
+# ══════════════════════════════════════════════════════════════
+# PHASE 2: Render frames from snapshots
+# ══════════════════════════════════════════════════════════════
+
+for frame_idx in range(N_FRAMES):
+    # Map frame index to simulation snapshot
+    snap_idx = int((frame_idx / N_FRAMES) * len(snapshots))
+    snap_idx = min(snap_idx, len(snapshots) - 1)
+    snap = snapshots[snap_idx]
+
+    # Draw from snapshot
+    # ...
+
+    fig.savefig(os.path.join(OUTPUT_DIR, f'frame_{frame_idx:04d}.png'),
+                dpi=120, bbox_inches='tight', pad_inches=0.1,
+                facecolor='#0D0D0D')
 ```
 
-**STYLE GUIDE:**
-- Use dark theme: background '#1a1a2e', text 'white'
-- Use vibrant colors for bars: '#00d4ff', '#ff6b6b', '#4ecdc4', '#ffe66d'
-- Add smooth transitions between states
-- Show labels and legends clearly
+## M/M/1 Queue Simulation
 
-Description: {description}
+```python
+import simpy
+import random
 
-GENERATE ONLY PYTHON CODE (no markdown, no explanation):
+def mm1_simulation(arrival_rate=0.8, service_rate=1.0, sim_time=100):
+    \"\"\"Returns list of (time, queue_length, server_busy, wait_times) snapshots.\"\"\"
+    env = simpy.Environment()
+    server = simpy.Resource(env, capacity=1)
+    snapshots = []
+    wait_times = []
+
+    def customer(env, name, server):
+        arrival = env.now
+        with server.request() as req:
+            yield req
+            wait = env.now - arrival
+            wait_times.append(wait)
+            service_time = random.expovariate(service_rate)
+            yield env.timeout(service_time)
+
+    def arrivals(env, server):
+        i = 0
+        while True:
+            yield env.timeout(random.expovariate(arrival_rate))
+            env.process(customer(env, i, server))
+            i += 1
+
+    def monitor(env, server, snapshots, interval=0.5):
+        while True:
+            snapshots.append({
+                'time': env.now,
+                'queue_len': len(server.queue),
+                'utilization': server.count / server.capacity,
+                'avg_wait': np.mean(wait_times) if wait_times else 0,
+            })
+            yield env.timeout(interval)
+
+    env.process(arrivals(env, server))
+    env.process(monitor(env, server, snapshots))
+    env.run(until=sim_time)
+    return snapshots
+
+snapshots = mm1_simulation(arrival_rate=0.75, service_rate=1.0, sim_time=100)
+```
+
+## Queue Length Time Series Visualization
+
+```python
+times   = [s['time'] for s in snapshots]
+q_lens  = [s['queue_len'] for s in snapshots]
+util    = [s['utilization'] for s in snapshots]
+
+fig, (ax_q, ax_u) = plt.subplots(2, 1, figsize=(9, 16), dpi=120,
+                                   gridspec_kw={'height_ratios': [2, 1]})
+for a in [ax_q, ax_u]:
+    a.set_facecolor('#0D0D0D')
+
+# Fixed limits based on full data
+ax_q.set_xlim(0, max(times))
+ax_q.set_ylim(0, max(q_lens) * 1.2 + 1)
+ax_u.set_xlim(0, max(times))
+ax_u.set_ylim(0, 1.2)
+
+# Initialize artists — line draws in from left
+q_line, = ax_q.plot([], [], color='#4FC3F7', lw=2)
+u_line, = ax_u.plot([], [], color='#FFD54F', lw=2)
+u_fill = None
+
+ax_q.set_ylabel("Queue Length", color='#909090', fontsize=14)
+ax_u.set_ylabel("Server Utilization", color='#909090', fontsize=14)
+ax_u.set_xlabel("Time", color='#909090', fontsize=14)
+
+# Add ρ = λ/μ theoretical line
+rho = 0.75
+ax_u.axhline(rho, color='#FF7043', lw=1.5, linestyle='--', alpha=0.7)
+ax_u.text(max(times)*0.02, rho+0.03, f"ρ = {rho}", color='#FF7043', fontsize=12)
+
+for frame_idx in range(N_FRAMES):
+    snap_idx = max(1, int((frame_idx / N_FRAMES) * len(snapshots)))
+    t_show = times[:snap_idx]
+    q_show = q_lens[:snap_idx]
+    u_show = util[:snap_idx]
+
+    q_line.set_data(t_show, q_show)
+    u_line.set_data(t_show, u_show)
+
+    # Remove old fill, add new (fill_between can't update in-place)
+    for coll in ax_u.collections:
+        coll.remove()
+    if len(t_show) > 1:
+        ax_u.fill_between(t_show, u_show, alpha=0.2, color='#FFD54F')
+
+    fig.savefig(os.path.join(OUTPUT_DIR, f'frame_{frame_idx:04d}.png'),
+                dpi=120, bbox_inches='tight', pad_inches=0.1,
+                facecolor='#0D0D0D')
+```
+
+## Animated Queue Diagram (Customers as Circles)
+
+```python
+# Visual queue: circles representing customers
+MAX_VISIBLE = 12
+
+def draw_queue_diagram(ax, queue_len, server_busy, time, avg_wait):
+    ax.clear()
+    ax.set_facecolor('#0D0D0D')
+    ax.set_xlim(-1, 14)
+    ax.set_ylim(-3, 4)
+    ax.axis('off')
+
+    # Server box
+    server_color = '#FF7043' if server_busy else '#2A2A2A'
+    ax.add_patch(patches.FancyBboxPatch((11, -0.7), 1.8, 1.4,
+                  boxstyle="round,pad=0.1", facecolor=server_color,
+                  edgecolor='#555555', lw=1.5))
+    ax.text(11.9, 0, "Server", ha='center', va='center',
+            fontsize=11, color='#F5F5F5', fontfamily='Roboto')
+
+    # Queue line
+    n_shown = min(queue_len, MAX_VISIBLE)
+    for i in range(n_shown):
+        x = 9.5 - i * 0.85
+        circle = plt.Circle((x, 0), 0.35, color='#4FC3F7', alpha=0.85)
+        ax.add_patch(circle)
+
+    if queue_len > MAX_VISIBLE:
+        ax.text(0.5, 0, f"+{queue_len-MAX_VISIBLE} more",
+                ha='center', va='center', fontsize=12, color='#909090')
+
+    # Arrow from queue to server
+    ax.annotate('', xy=(11, 0), xytext=(10.3, 0),
+                arrowprops=dict(arrowstyle='->', color='#555555', lw=1.5))
+
+    # Stats
+    ax.text(6.5, 2.5, f"Queue: {queue_len}  |  t = {time:.1f}  |  avg wait = {avg_wait:.2f}",
+            ha='center', fontsize=14, color='#909090', fontfamily='Roboto')
+
+fig, ax = plt.subplots(figsize=(9, 16), dpi=120)
+fig.patch.set_facecolor('#0D0D0D')
+
+for frame_idx in range(N_FRAMES):
+    snap = snapshots[min(int(frame_idx/N_FRAMES*len(snapshots)), len(snapshots)-1)]
+    draw_queue_diagram(ax, snap['queue_len'], snap['utilization'] > 0,
+                       snap['time'], snap['avg_wait'])
+    fig.savefig(...)
+```
+
+## Gantt Chart (Process Timeline)
+
+```python
+# Track job start/end times for Gantt
+job_log = []  # list of {'job_id': int, 'start': float, 'end': float, 'wait': float}
+
+# After simulation, draw Gantt chart building over time
+MAX_JOBS_SHOWN = 20
+
+fig, ax = plt.subplots(figsize=(9, 16), dpi=120)
+fig.patch.set_facecolor('#0D0D0D')
+ax.set_facecolor('#0D0D0D')
+
+for frame_idx in range(N_FRAMES):
+    n_jobs = max(1, int((frame_idx / N_FRAMES) * len(job_log)))
+    visible = job_log[-MAX_JOBS_SHOWN:n_jobs]
+
+    ax.clear()
+    ax.set_facecolor('#0D0D0D')
+
+    for i, job in enumerate(visible):
+        y = i
+        wait_bar = ax.barh(y, job['wait'], left=job['start'],
+                           color='#FF7043', alpha=0.5, height=0.6)
+        service_bar = ax.barh(y, job['end']-job['start']-job['wait'],
+                              left=job['start']+job['wait'],
+                              color='#4FC3F7', alpha=0.8, height=0.6)
+
+    ax.set_xlabel("Simulation Time", color='#909090')
+    ax.set_ylabel("Job", color='#909090')
+
+    # Legend
+    ax.barh(-2, 0, color='#FF7043', alpha=0.5, label='Wait time')
+    ax.barh(-2, 0, color='#4FC3F7', alpha=0.8, label='Service time')
+    ax.legend(loc='upper left', facecolor='#1A1A1A', labelcolor='#F5F5F5')
+
+    fig.savefig(...)
+```
+
+CRITICAL DYNAMIC REQUIREMENTS:
+- Target Duration: {duration} seconds
+- Exact frames required: {frames}
+- Description: {description}
+
+GENERATE ONLY PYTHON CODE. Be concise — use loops, helper functions, and avoid repeating similar code blocks. No markdown, no explanation:
 """
 
 
@@ -188,13 +332,19 @@ class SimpyService:
         
         final_prompt = SIMPY_PROMPT.replace("{description}", description).replace("{duration}", str(duration)).replace("{frames}", str(frames)) + error_context
         
+        self._last_prompt = final_prompt
+        
+        self._last_model = 'claude-opus-4-7'
+        
         message = client.messages.create(
-            model="claude-opus-4-5-20251101",
-            max_tokens=4096,
+            model="claude-opus-4-7",
+            max_tokens=16384,
             messages=[{"role": "user", "content": final_prompt}]
         )
         
         response_text = message.content[0].text
+        if message.stop_reason == "max_tokens":
+            raise RuntimeError("Code generation was truncated (hit max_tokens). The description may be too complex for a single segment.")
         
         # Clean markdown if present
         if "```python" in response_text:
@@ -217,10 +367,14 @@ class SimpyService:
         
         logger.info(f"[SimPy] Running simulation...")
         
+        env = os.environ.copy()
+        env["OUTPUT_DIR"] = output_dir
+        env["DURATION"] = str(float(env.get("DURATION", "8")))
         process = await asyncio.create_subprocess_exec(
-            "python", str(script_path), output_dir,
+            "python", str(script_path),
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
         
         stdout, stderr = await process.communicate()
@@ -245,7 +399,7 @@ class SimpyService:
         cmd = [
             "ffmpeg", "-y",
             "-framerate", str(fps),
-            "-i", f"{frames_dir}/frame_%05d.png",
+            "-i", f"{frames_dir}/frame_%04d.png",
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",

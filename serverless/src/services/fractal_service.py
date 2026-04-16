@@ -23,159 +23,265 @@ FRAMES_DIR = OUTPUT_DIR / "frames"
 VIDEOS_DIR = OUTPUT_DIR / "videos"
 
 
-FRACTAL_PROMPT = """You are an expert Python programmer specializing in fractal visualization and cellular automata using numba for performance.
-Generate a complete, self-contained Python script that creates mesmerizing fractal or cellular automata animations.
+FRACTAL_PROMPT = """# Fractal Segment Generation
 
-CRITICAL DURATION REQUIREMENTS:
-- Target video duration: {duration} seconds
-- Frame rate: 30 FPS
-- EXACT frame count required: {frames} frames
-- You MUST generate EXACTLY {frames} PNG files, no more, no less
-- Frame naming: frame_00000.png, frame_00001.png, etc. (5-digit zero-padded)
+Fractal segments render mathematically-generated imagery using Numba for performance. Claude generates a complete Python script producing `N = int(duration * 30)` PNG frames at 1080×1920 with cinematic zoom or parameter animation.
 
-VIDEO FORMAT: VERTICAL (9:16 for Shorts/Reels/TikTok)
-- Output resolution: 1080x1920 pixels (portrait)
-- Use figsize=(6, 10.67) or vertical image dimensions
+## Mandatory Structure
 
-**NUMBA JIT COMPILATION (CRITICAL FOR PERFORMANCE):**
 ```python
-from numba import jit, prange
-import numpy as np
-
-@jit(nopython=True, parallel=True)
-def compute_mandelbrot(xmin, xmax, ymin, ymax, width, height, max_iter):
-    result = np.zeros((height, width))
-    for j in prange(height):
-        for i in range(width):
-            x0 = xmin + (xmax - xmin) * i / width
-            y0 = ymin + (ymax - ymin) * j / height
-            x, y = 0.0, 0.0
-            iteration = 0
-            while x*x + y*y <= 4 and iteration < max_iter:
-                xtemp = x*x - y*y + x0
-                y = 2*x*y + y0
-                x = xtemp
-                iteration += 1
-            result[j, i] = iteration
-    return result
-```
-
-**FRACTAL TYPES:**
-
-1. **Mandelbrot Zoom:**
-```python
-# Animate zoom into interesting region
-center_x, center_y = -0.743643887037151, 0.131825904205330  # Famous spiral
-for frame_num in range(TOTAL_FRAMES):
-    t = frame_num / TOTAL_FRAMES
-    zoom = 4.0 * (0.5 ** (t * 10))  # Exponential zoom
-    xmin, xmax = center_x - zoom, center_x + zoom
-    ymin, ymax = center_y - zoom * 1.78, center_y + zoom * 1.78  # 9:16 aspect
-```
-
-2. **Julia Set Animation (varying c parameter):**
-```python
-@jit(nopython=True, parallel=True)
-def julia(c_real, c_imag, xmin, xmax, ymin, ymax, width, height, max_iter):
-    # Similar to Mandelbrot but z starts at the pixel, c is constant
-    ...
-
-# Animate c along a path in complex plane
-for frame_num in range(TOTAL_FRAMES):
-    t = frame_num / TOTAL_FRAMES
-    c_real = 0.7885 * np.cos(t * 2 * np.pi)
-    c_imag = 0.7885 * np.sin(t * 2 * np.pi)
-```
-
-3. **Conway's Game of Life:**
-```python
-@jit(nopython=True)
-def step(grid):
-    rows, cols = grid.shape
-    new_grid = np.zeros_like(grid)
-    for i in range(rows):
-        for j in range(cols):
-            neighbors = (grid[(i-1)%rows,(j-1)%cols] + grid[(i-1)%rows,j] + 
-                        grid[(i-1)%rows,(j+1)%cols] + grid[i,(j-1)%cols] +
-                        grid[i,(j+1)%cols] + grid[(i+1)%rows,(j-1)%cols] +
-                        grid[(i+1)%rows,j] + grid[(i+1)%rows,(j+1)%cols])
-            if grid[i,j] == 1:
-                new_grid[i,j] = 1 if neighbors in (2, 3) else 0
-            else:
-                new_grid[i,j] = 1 if neighbors == 3 else 0
-    return new_grid
-```
-
-4. **L-System (Fractal Plants):**
-```python
-def apply_rules(axiom, rules, iterations):
-    result = axiom
-    for _ in range(iterations):
-        result = ''.join(rules.get(c, c) for c in result)
-    return result
-
-def draw_lsystem(commands, angle, length):
-    # Turtle graphics to generate points
-    ...
-```
-
-**COLORMAPS:**
-- Use 'hot', 'magma', 'plasma', 'twilight' for fractals
-- Or create custom: `colors = plt.cm.hot(iterations / max_iter)`
-
-**STYLE GUIDE:**
-- Black or very dark background
-- Vibrant, saturated colors for fractals
-- For Game of Life: white/bright cells on dark background
-- Smooth color transitions
-
-**REQUIRED TEMPLATE:**
-```python
-import sys
-import os
-import numpy as np
-from numba import jit, prange
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import numpy as np
+from numba import njit, prange
+import os
 
-@jit(nopython=True, parallel=True)
-def compute_fractal(...):
-    # JIT-compiled fractal computation
-    ...
+OUTPUT_DIR = os.environ.get('OUTPUT_DIR', '/tmp/frames')
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+DURATION = float(os.environ.get('DURATION', '8'))
+FPS = 30
+N_FRAMES = int(DURATION * FPS)
 
-def main(output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    TOTAL_FRAMES = {frames}
-    
-    # Image dimensions (9:16 vertical)
-    width, height = 1080, 1920
-    
-    for frame_num in range(TOTAL_FRAMES):
-        t = frame_num / TOTAL_FRAMES
-        
-        # Compute fractal for this frame
-        result = compute_fractal(...)
-        
-        # Create image
-        fig = plt.figure(figsize=(width/180, height/180), dpi=180)
-        ax = fig.add_axes([0, 0, 1, 1])
-        ax.imshow(result, cmap='magma', origin='lower')
-        ax.axis('off')
-        
-        plt.savefig(os.path.join(output_dir, f"frame_{{frame_num:05d}}.png"),
-                    dpi=180, bbox_inches='tight', pad_inches=0)
-        plt.close()
-    
-    print(f"Generated {{TOTAL_FRAMES}} frames")
+WIDTH, HEIGHT = 1080, 1920
 
-if __name__ == "__main__":
-    main(sys.argv[1])
+plt.rcParams.update({
+    'font.family': 'sans-serif',
+    'font.sans-serif': ['Roboto', 'Helvetica Neue', 'DejaVu Sans'],
+})
+
+fig, ax = plt.subplots(figsize=(9, 16), dpi=120)
+fig.patch.set_facecolor('#000000')
+ax.set_facecolor('#000000')
+ax.axis('off')
+plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+def ease_in_out_cubic(t):
+    if t < 0.5: return 4 * t**3
+    return 1 - (-2*t + 2)**3 / 2
 ```
 
-Description: {description}
+## Numba — JIT Compilation
 
-GENERATE ONLY PYTHON CODE (no markdown, no explanation):
+Always use `@njit(parallel=True)` for the escape-time inner loop. Never use Python loops over pixels.
+
+```python
+from numba import njit, prange
+
+# MUST call once before frame loop to trigger JIT compilation
+# Pass dummy args to warm up
+@njit(parallel=True, cache=True)
+def mandelbrot_escape(cx_min, cx_max, cy_min, cy_max, width, height, max_iter):
+    \"\"\"Returns iteration count array [height, width].\"\"\"
+    result = np.zeros((height, width), dtype=np.float64)
+    for py in prange(height):
+        cy = cy_min + (cy_max - cy_min) * py / height
+        for px in range(width):
+            cx = cx_min + (cx_max - cx_min) * px / width
+            x, y = 0.0, 0.0
+            for i in range(max_iter):
+                x2, y2 = x*x, y*y
+                if x2 + y2 > 4.0:
+                    # Smooth coloring: fractional escape count
+                    log_zn = np.log(x2 + y2) / 2
+                    nu = np.log(log_zn / np.log(2)) / np.log(2)
+                    result[py, px] = i + 1 - nu
+                    break
+                y = 2*x*y + cy
+                x = x2 - y2 + cx
+            else:
+                result[py, px] = 0.0  # inside set
+    return result
+
+# Warm up JIT (mandatory — first call compiles, subsequent calls are fast)
+_ = mandelbrot_escape(-2.0, 0.5, -1.25, 1.25, 64, 64, 50)
+```
+
+## Mandelbrot Zoom Animation
+
+```python
+# Target zoom coordinates (interesting region)
+TARGET_X = -0.7269
+TARGET_Y = 0.1889
+ZOOM_START = 3.5    # initial view width
+ZOOM_END = 0.002    # final view width (logarithmic zoom)
+
+img_artist = ax.imshow(
+    np.zeros((HEIGHT, WIDTH)),
+    extent=[0, 1, 0, 1],  # dummy, we just need the artist
+    cmap='inferno',
+    origin='lower',
+    interpolation='bilinear',
+    vmin=0, vmax=1,
+    aspect='auto',
+)
+
+for frame_idx in range(N_FRAMES):
+    t = frame_idx / max(N_FRAMES - 1, 1)
+    t_e = ease_in_out_cubic(t)
+
+    # Logarithmic zoom — feels natural
+    zoom = ZOOM_START * (ZOOM_END / ZOOM_START) ** t_e
+    aspect = HEIGHT / WIDTH  # 1920/1080
+
+    cx_min = TARGET_X - zoom / 2
+    cx_max = TARGET_X + zoom / 2
+    cy_min = TARGET_Y - zoom * aspect / 2
+    cy_max = TARGET_Y + zoom * aspect / 2
+
+    max_iter = int(50 + 200 * t_e)  # increase detail as we zoom
+
+    raw = mandelbrot_escape(cx_min, cx_max, cy_min, cy_max, WIDTH, HEIGHT, max_iter)
+
+    # Normalize using histogram equalization for contrast
+    inside = raw == 0
+    outside = raw > 0
+    if outside.sum() > 0:
+        flat = raw[outside]
+        # Percentile stretch
+        lo, hi = np.percentile(flat, 2), np.percentile(flat, 98)
+        normed = np.clip((raw - lo) / (hi - lo + 1e-8), 0, 1)
+        normed[inside] = 0
+    else:
+        normed = raw / (max_iter + 1e-8)
+
+    img_artist.set_data(normed)
+    img_artist.set_clim(0, 1)
+
+    fig.savefig(
+        os.path.join(OUTPUT_DIR, f'frame_{frame_idx:04d}.png'),
+        dpi=120, bbox_inches='tight', pad_inches=0,
+        facecolor='#000000',
+    )
+
+plt.close(fig)
+```
+
+## Julia Set Animation
+
+Animate the `c` parameter along a smooth path for mesmerizing morphing:
+
+```python
+@njit(parallel=True, cache=True)
+def julia_escape(cx_min, cx_max, cy_min, cy_max, cr, ci, width, height, max_iter):
+    result = np.zeros((height, width), dtype=np.float64)
+    for py in prange(height):
+        zy = cy_min + (cy_max - cy_min) * py / height
+        for px in range(width):
+            zx = cx_min + (cx_max - cx_min) * px / width
+            x, y = zx, zy
+            for i in range(max_iter):
+                x2, y2 = x*x, y*y
+                if x2 + y2 > 4.0:
+                    log_zn = np.log(x2 + y2) / 2
+                    nu = np.log(log_zn / np.log(2)) / np.log(2)
+                    result[py, px] = i + 1 - nu
+                    break
+                x, y = x2 - y2 + cr, 2*x*y + ci
+    return result
+
+# Warm up
+_ = julia_escape(-1.5, 1.5, -1.5, 1.5, -0.4, 0.6, 32, 32, 30)
+
+# Animate c along a circle in parameter space
+for frame_idx in range(N_FRAMES):
+    t = frame_idx / max(N_FRAMES - 1, 1)
+    # Smooth parameter path
+    angle = 2 * np.pi * t * 0.5  # half revolution
+    cr = 0.7885 * np.cos(angle)
+    ci = 0.7885 * np.sin(angle)
+
+    raw = julia_escape(-1.8, 1.8, -3.2, 3.2, cr, ci, WIDTH, HEIGHT, 120)
+    # normalize + imshow + save...
+```
+
+## Colormaps for Fractals
+
+```python
+# Best single colormaps for fractals (apply to imshow)
+'inferno'    # black→purple→orange→yellow — very dramatic
+'magma'      # black→purple→pink→cream
+'twilight'   # cyclic — good for phase/angle
+'hot'        # black→red→orange→white
+'plasma'     # purple→orange→yellow
+'gist_heat'  # black→red→yellow→white
+
+# Custom: map escape count to HSV for classic rainbow fractal
+def escape_to_rgb(normed):
+    \"\"\"normed: float array [0,1], returns uint8 [H, W, 3]\"\"\"
+    import matplotlib.colors as mcolors
+    cmap = plt.get_cmap('inferno')
+    rgba = cmap(normed)
+    return (rgba[:, :, :3] * 255).astype(np.uint8)
+```
+
+## L-System Animation
+
+```python
+def apply_rules(axiom, rules, n):
+    s = axiom
+    for _ in range(n):
+        s = ''.join(rules.get(c, c) for c in s)
+    return s
+
+def lsystem_to_path(instructions, angle_deg=25, step=0.15):
+    \"\"\"Convert L-system string to list of (x, y) coordinates.\"\"\"
+    x, y, angle = 0.0, 0.0, 90.0
+    stack = []
+    path = [(x, y)]
+    for cmd in instructions:
+        if cmd in 'Ff':
+            rad = np.radians(angle)
+            x += step * np.cos(rad)
+            y += step * np.sin(rad)
+            path.append((x, y))
+        elif cmd == '+':
+            angle += angle_deg
+        elif cmd == '-':
+            angle -= angle_deg
+        elif cmd == '[':
+            stack.append((x, y, angle))
+        elif cmd == ']':
+            x, y, angle = stack.pop()
+            path.append((x, y))
+    return np.array(path)
+
+# Dragon curve
+rules = {'X': 'X+YF+', 'Y': '-FX-Y', 'F': 'F'}
+axiom = 'FX'
+for n in range(1, 14):
+    s = apply_rules(axiom, rules, n)
+    path = lsystem_to_path(s, angle_deg=90, step=0.05)
+    # Animate growth frame-by-frame: draw first k% of path per frame
+```
+
+## Positioning and Labels
+
+```python
+# Title overlaid at top
+ax.text(0.5, 0.97, "Mandelbrot Set", transform=ax.transAxes,
+        ha='center', va='top', fontsize=24, color='#F5F5F5',
+        fontfamily='Roboto', alpha=0.9)
+
+# Zoom level / coordinates at bottom
+ax.text(0.02, 0.02, f"zoom: {1/zoom:.0f}x", transform=ax.transAxes,
+        ha='left', va='bottom', fontsize=12, color='#555555', fontfamily='Roboto')
+```
+
+## Performance Notes
+
+- `@njit(parallel=True, cache=True)` — `cache=True` avoids recompiling across runs
+- First call always compiles — call with small dummy data before frame loop
+- 1080×1920 @ max_iter=200 takes ~0.3–1.0s per frame depending on CPU cores
+- Increase `max_iter` as zoom increases (deeper zoom needs more iterations to show detail)
+- `prange` in outer loop, `range` in inner — Numba parallelizes the outer dimension
+
+CRITICAL DYNAMIC REQUIREMENTS:
+- Target Duration: {duration} seconds
+- Exact frames required: {frames}
+- Description: {description}
+
+GENERATE ONLY PYTHON CODE. Be concise — use loops, helper functions, and avoid repeating similar code blocks. No markdown, no explanation:
 """
 
 
@@ -231,13 +337,19 @@ class FractalService:
         
         final_prompt = FRACTAL_PROMPT.replace("{description}", description).replace("{duration}", str(duration)).replace("{frames}", str(frames)) + error_context
         
+        self._last_prompt = final_prompt
+        
+        self._last_model = 'claude-opus-4-7'
+        
         message = client.messages.create(
-            model="claude-opus-4-5-20251101",
-            max_tokens=4096,
+            model="claude-opus-4-7",
+            max_tokens=16384,
             messages=[{"role": "user", "content": final_prompt}]
         )
         
         response_text = message.content[0].text
+        if message.stop_reason == "max_tokens":
+            raise RuntimeError("Code generation was truncated (hit max_tokens). The description may be too complex for a single segment.")
         
         # Clean markdown if present
         if "```python" in response_text:
@@ -260,10 +372,14 @@ class FractalService:
         
         logger.info(f"[Fractal] Running visualization...")
         
+        env = os.environ.copy()
+        env["OUTPUT_DIR"] = output_dir
+        env["DURATION"] = str(float(env.get("DURATION", "8")))
         process = await asyncio.create_subprocess_exec(
-            "python", str(script_path), output_dir,
+            "python", str(script_path),
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
         
         stdout, stderr = await process.communicate()
@@ -288,7 +404,7 @@ class FractalService:
         cmd = [
             "ffmpeg", "-y",
             "-framerate", str(fps),
-            "-i", f"{frames_dir}/frame_%05d.png",
+            "-i", f"{frames_dir}/frame_%04d.png",
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",

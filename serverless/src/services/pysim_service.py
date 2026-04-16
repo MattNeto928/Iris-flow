@@ -24,106 +24,441 @@ FRAMES_DIR = OUTPUT_DIR / "frames"
 VIDEOS_DIR = OUTPUT_DIR / "videos"
 
 
-PYSIM_PROMPT = """You are an expert Python scientific computing programmer. Generate a complete, self-contained Python script that creates a simulation and outputs frames for video creation.
+PYSIM_PROMPT = """# PySim Segment Generation
 
-CRITICAL DURATION REQUIREMENTS:
-- Target video duration: {duration} seconds
-- Frame rate: 30 FPS
-- EXACT frame count required: {frames} frames
-- You MUST generate EXACTLY {frames} PNG files, no more, no less
-- Frame naming: frame_00000.png, frame_00001.png, etc. (5-digit zero-padded)
+PySim segments generate scientific simulations as PNG frame sequences compiled into MP4 by FFmpeg. Claude generates a **complete, self-contained Python script** that produces exactly `N = int(duration * 30)` frames saved as `frame_0000.png`, `frame_0001.png`, etc.
 
-VIDEO FORMAT: VERTICAL (9:16 for Shorts/Reels/TikTok)
-- Output resolution: 1080x1920 pixels (portrait)
-- Use figsize=(6, 10.67) or similar vertical aspect ratio
-- Center all visual elements
+## Mandatory Script Structure
 
-**CRITICAL - MUST FOLLOW THESE RULES:**
-1. **USE MATPLOTLIB ONLY** - Do NOT use pygame, tkinter, or any GUI libraries
-2. **SET BACKEND FIRST** - Start with: `import matplotlib; matplotlib.use('Agg')`
-3. **NO EVENT LOOPS** - No while True, no pygame.event loop, no blocking calls
-4. **FINITE LOOP ONLY** - Use exactly: `for frame_num in range({frames}):`
-5. **NO USER INPUT** - Script must run completely autonomously
-6. Output ONLY the Python code - no explanations, no markdown backticks
-
-**PERFORMANCE RULES (PREVENT TIMEOUTS - CRITICAL):**
-- **VECTORIZATION IS MANDATORY**: NEVER loop over particles/agents to draw them individually.
-    - BAD: `for p in particles: ax.scatter(p.x, p.y, ...)` (This causes timeouts!)
-    - GOOD: `ax.scatter(particles_x, particles_y, s=sizes, c=colors, ...)` (One call per frame)
-- Keep particle/agent counts reasonable (< 500 per frame)
-- Avoid expensive operations (scipy.optimize, heavy matrix ops) inside frame loop
-- Pre-compute static data BEFORE the frame loop
-- If adding glow/effects, use layers (e.g. 3 scatter calls total), DO NOT iterate points.
-
-**AVOID THESE COMMON ERRORS:**
-- NO plt.colorbar() - causes layout errors
-- NO plt.tight_layout() inside the loop
-- Use ax.clear() at start of each frame
-- Use fixed axis limits (ax.set_xlim, ax.set_ylim)
-
-**PARAMETER VALIDATION RULES:**
-- ALWAYS clamp alpha values to [0, 1] range: `alpha = np.clip(alpha, 0, 1)`
-- ALWAYS clamp color values if performing math: `colors = np.clip(colors * factor, 0, 1)`
-- BAD: `c=colors * 1.5` (Causes crash: "RGBA values should be within 0-1 range")
-- ALWAYS ensure marker sizes are positive: `s = np.maximum(s, 1)`
-- NEVER compute values that could go negative for positive-only params
-
-**STRING FORMATTING RULES (PREVENT CRASHES):**
-- NEVER use curly braces `{{}}` in f-strings with undefined or potentially undefined variables
-- BAD: `ax.text("Value: {{}}".format())` - missing argument causes crash!
-- BAD: `f"Rate: {{speed}}x"` when speed might be undefined
-- GOOD: Define all variables BEFORE using them in f-strings
-- GOOD: Use string concatenation for labels: `"Value: " + str(value)`
-
-**CODE SYNTAX RULES:**
-- ALWAYS close all parentheses, brackets, and braces
-- ALWAYS match function call opening ( with closing )
-- DOUBLE-CHECK multi-line function calls have proper closing parentheses
-- BAD: `ax.text2D(0.5, 0.05, "Label", transform=ax.transAxes,` (unclosed!)
-- GOOD: Complete all function calls on single line or properly close multi-line calls
-
-REQUIRED TEMPLATE:
-```
-import sys
-import os
+```python
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('Agg')  # MUST be before any other matplotlib import
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 import numpy as np
+import os
 
-def main(output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    TOTAL_FRAMES = {frames}
-    
-    # Vertical format for Shorts/Reels
-    fig, ax = plt.subplots(figsize=(6, 10.67))
-    
-    for frame_num in range(TOTAL_FRAMES):
-        ax.clear()
-        
-        # === YOUR SIMULATION CODE HERE ===
-        t = frame_num / TOTAL_FRAMES
-        # ... simulation logic ...
-        # === END SIMULATION CODE ===
-        
-        ax.set_xlim(-2, 2)
-        ax.set_ylim(-4, 4)
-        ax.set_aspect('equal')
-        ax.axis('off')
-        
-        plt.savefig(os.path.join(output_dir, f"frame_{{frame_num:05d}}.png"), 
-                    dpi=180, bbox_inches='tight', pad_inches=0)
-    
-    plt.close()
-    print(f"Generated {{TOTAL_FRAMES}} frames")
+# ── Output setup ──────────────────────────────────────────────────────────────
+OUTPUT_DIR = os.environ.get('OUTPUT_DIR', '/tmp/frames')
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+DURATION = float(os.environ.get('DURATION', '8'))
+FPS = 30
+N_FRAMES = int(DURATION * FPS)
 
-if __name__ == "__main__":
-    main(sys.argv[1])
+# ── Global style ──────────────────────────────────────────────────────────────
+plt.rcParams.update({
+    'font.family': 'sans-serif',
+    'font.sans-serif': ['Roboto', 'Helvetica Neue', 'DejaVu Sans'],
+    'text.color': '#F5F5F5',
+    'axes.facecolor': '#0D0D0D',
+    'figure.facecolor': '#0D0D0D',
+    'axes.edgecolor': '#2A2A2A',
+    'grid.color': '#1E1E1E',
+    'grid.linewidth': 0.5,
+})
+
+# ── Figure — fixed at 1080×1920 ───────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(9, 16), dpi=120)  # 9*120=1080, 16*120=1920
+fig.patch.set_facecolor('#0D0D0D')
+ax.set_facecolor('#0D0D0D')
+
+# ── Axis limits — SET ONCE, NEVER INSIDE THE FRAME LOOP ──────────────────────
+XLIM = (-5, 5)
+YLIM = (-8.5, 8.5)
+ax.set_xlim(XLIM)
+ax.set_ylim(YLIM)
+ax.set_aspect('equal')
+ax.axis('off')  # or configure ticks/spines explicitly
+
+# ── Initialize simulation state ───────────────────────────────────────────────
+# ... all state variables here ...
+
+# ── Initialize artists (create once, update in loop) ──────────────────────────
+# e.g. scatter = ax.scatter([], [], c=[], s=[], cmap='plasma', vmin=0, vmax=1)
+# e.g. line, = ax.plot([], [], color='#4FC3F7', lw=2)
+
+# ── Easing utilities ──────────────────────────────────────────────────────────
+def ease_in_out_cubic(t):
+    \"\"\"t in [0,1] → eased value in [0,1]\"\"\"
+    if t < 0.5:
+        return 4 * t**3
+    return 1 - (-2*t + 2)**3 / 2
+
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+# ── Frame loop ────────────────────────────────────────────────────────────────
+for frame_idx in range({frames}):
+    t = frame_idx / max({frames} - 1, 1)  # normalized time [0, 1]
+    t_eased = ease_in_out_cubic(t)
+
+    # Update simulation state (vectorized, no Python loops)
+    # ...
+
+    # Update artist data — NEVER call plt.cla() or ax.clear()
+    # scatter.set_offsets(positions)
+    # scatter.set_array(colors)
+    # line.set_data(x_data, y_data)
+
+    # Save frame
+    fig.savefig(
+        os.path.join(OUTPUT_DIR, f'frame_{frame_idx:04d}.png'),
+        dpi=120,
+        bbox_inches='tight',
+        pad_inches=0,
+        facecolor=fig.get_facecolor(),
+    )
+
+plt.close(fig)
+print(f"Rendered {{N_FRAMES}} frames to {{OUTPUT_DIR}}")
 ```
 
-Description: {description}
+## The Golden Rule: Never Recreate Artists
 
-GENERATE ONLY PYTHON CODE (no markdown, no explanation):
+The most common source of jitter is recreating matplotlib artists inside the frame loop. Always initialize once, update with `set_data` / `set_offsets` / `set_array`.
+
+```python
+# WRONG — causes flicker/jitter
+for frame in range(N_FRAMES):
+    ax.clear()           # ← NEVER
+    ax.scatter(x, y)     # ← NEVER create inside loop
+    ax.set_xlim(...)     # ← NEVER reset limits inside loop
+
+# RIGHT — initialize once, update properties only
+scatter = ax.scatter(x0, y0, c=colors, s=sizes, cmap='plasma', vmin=0, vmax=1)
+for frame in range(N_FRAMES):
+    # Update positions and colors via set_* methods
+    scatter.set_offsets(np.column_stack([new_x, new_y]))
+    scatter.set_array(new_colors)
+```
+
+## Axis Limits — Fixed Forever
+
+Set axis limits ONCE before the frame loop. They must never change mid-animation (causes zoom jitter):
+
+```python
+# Set based on the maximum extent of the simulation
+# Add 15% padding beyond the maximum coordinate
+ax.set_xlim(-X_MAX * 1.15, X_MAX * 1.15)
+ax.set_ylim(-Y_MAX * 1.15, Y_MAX * 1.15)
+```
+
+## Easing — Smooth Parameter Changes
+
+All parameter transitions must use easing, not linear interpolation:
+
+```python
+def ease_in_out_cubic(t):
+    if t < 0.5: return 4 * t**3
+    return 1 - (-2*t + 2)**3 / 2
+
+def ease_out_expo(t):
+    return 1 - 2**(-10 * t) if t > 0 else 0
+
+# Phase-based easing (multiple phases in one animation)
+def phase_ease(t, start, end):
+    \"\"\"Remap global t to [0,1] within a time window.\"\"\"
+    if t <= start: return 0.0
+    if t >= end: return 1.0
+    return ease_in_out_cubic((t - start) / (end - start))
+
+# Example: zoom in from t=0→0.3, hold t=0.3→0.7, zoom out t=0.7→1.0
+zoom = lerp(1.0, 2.5, phase_ease(t, 0.0, 0.3)) \
+     + lerp(2.5, 2.5, phase_ease(t, 0.3, 0.7) - phase_ease(t, 0.0, 0.3)) \
+     + lerp(2.5, 1.0, phase_ease(t, 0.7, 1.0))
+```
+
+## Dark Aesthetic Palette
+
+```python
+BG          = '#0D0D0D'
+PANEL_BG    = '#121212'
+ELECTRIC    = '#4FC3F7'   # primary data / curves
+GOLD        = '#FFD54F'   # highlight / key value
+CORAL       = '#FF7043'   # secondary data
+MINT        = '#80CBC4'   # tertiary
+LAVENDER    = '#CE93D8'   # quaternary
+WARM_WHITE  = '#F5F5F5'   # text
+DIM_GREY    = '#424242'   # secondary text / grid
+
+# Good colormaps on dark backgrounds
+# 'plasma', 'inferno', 'magma', 'viridis', 'twilight', 'cool', 'hot'
+```
+
+## Text and Labels
+
+```python
+# Title — top of frame, always
+ax.text(0, 8.0, "Simulation Title",
+        ha='center', va='top',
+        fontsize=22, color=WARM_WHITE, fontweight='bold',
+        fontfamily='Roboto')
+
+# Annotation — never overlap with data
+ax.text(-4.5, -7.5, f"t = {{sim_time:.2f}}s",
+        ha='left', va='bottom',
+        fontsize=14, color=DIM_GREY, fontfamily='Roboto')
+
+# Use ax.transAxes for fixed screen-space text (doesn't move with data)
+ax.text(0.5, 0.97, "Title",
+        transform=ax.transAxes,
+        ha='center', va='top',
+        fontsize=22, color=WARM_WHITE)
+```
+
+## Vectorized Simulation Patterns
+
+### Particle System
+```python
+N = 200  # number of particles
+pos = np.random.uniform(-4, 4, (N, 2))
+vel = np.random.randn(N, 2) * 0.1
+mass = np.random.uniform(0.5, 2.0, N)
+
+scatter = ax.scatter(pos[:, 0], pos[:, 1],
+                     c=mass, cmap='plasma', s=20,
+                     vmin=mass.min(), vmax=mass.max(),
+                     alpha=0.85, linewidths=0)
+
+for frame_idx in range({frames}):
+    t = frame_idx / ({frames} - 1)
+    # Vectorized update — no Python loop over particles
+    pos += vel * (1.0 / FPS)
+    # Boundary: wrap or bounce
+    vel[pos > 4.5] *= -1
+    vel[pos < -4.5] *= -1
+    pos = np.clip(pos, -4.5, 4.5)
+
+    scatter.set_offsets(pos)
+    fig.savefig(...)
+```
+
+### Wave Equation
+```python
+x = np.linspace(-4.5, 4.5, 400)
+line, = ax.plot(x, np.zeros_like(x), color=ELECTRIC, lw=2.5, alpha=0.9)
+fill = ax.fill_between(x, np.zeros_like(x), alpha=0.15, color=ELECTRIC)
+
+for frame_idx in range({frames}):
+    t_sec = frame_idx / FPS
+    y = np.sin(2 * np.pi * (x - t_sec * 1.5)) * np.exp(-0.1 * x**2)
+    line.set_ydata(y)
+    # Update fill: remove old, add new (fill_between must be recreated)
+    # Alternative: use imshow or contourf for wave fields
+    fig.savefig(...)
+```
+
+### 3D Matplotlib Rotation
+```python
+from mpl_toolkits.mplot3d import Axes3D
+
+fig = plt.figure(figsize=(9, 16), dpi=120)
+ax = fig.add_subplot(111, projection='3d')
+fig.patch.set_facecolor('#0D0D0D')
+ax.set_facecolor('#0D0D0D')
+
+# Plot once
+X, Y = np.meshgrid(np.linspace(-3, 3, 60), np.linspace(-3, 3, 60))
+Z = np.sin(np.sqrt(X**2 + Y**2))
+surf = ax.plot_surface(X, Y, Z, cmap='plasma', alpha=0.9,
+                        linewidth=0, antialiased=True)
+
+# Rotate per frame — set_xlim NOT needed, view_init only
+for frame_idx in range({frames}):
+    t = frame_idx / ({frames} - 1)
+    azim = -60 + ease_in_out_cubic(t) * 120  # rotate 120° total
+    ax.view_init(elev=30, azim=azim)
+    fig.savefig(...)
+```
+
+### Flow Field + Tracer Particles (premium science-viz look)
+
+Stream plot as a static base, then particles that actually follow the field lines on top. This is the pattern that makes videos look research-grade vs. toy:
+
+```python
+from scipy.interpolate import RegularGridInterpolator
+
+# Vector field — example: rotational flow with sink
+grid = np.linspace(-4, 4, 40)
+X, Y = np.meshgrid(grid, grid)
+U = -Y - 0.2 * X  # flow field components
+V =  X - 0.2 * Y
+
+# Draw static streamlines (slim, low alpha — they're context)
+ax.streamplot(X, Y, U, V, color='#1E1E1E', density=1.6, linewidth=0.6, arrowsize=0)
+
+# Interpolators so particles read the field continuously
+fu = RegularGridInterpolator((grid, grid), U.T, bounds_error=False, fill_value=0.0)
+fv = RegularGridInterpolator((grid, grid), V.T, bounds_error=False, fill_value=0.0)
+
+# Particles
+N = 300
+pts = np.random.uniform(-4, 4, (N, 2))
+trails = np.zeros((N, 8, 2))  # last 8 positions per particle for trail fade
+trails[:] = pts[:, None, :]
+
+scatter = ax.scatter(pts[:, 0], pts[:, 1], s=14, c='#4FC3F7', alpha=0.9, linewidths=0)
+# Trail lines — use LineCollection for efficiency
+from matplotlib.collections import LineCollection
+trail_lines = LineCollection([], colors='#4FC3F7', linewidths=1.2, alpha=0.4)
+ax.add_collection(trail_lines)
+
+DT = 0.08
+for frame_idx in range({frames}):
+    # Step particles along the field
+    vx = fu(pts); vy = fv(pts)
+    pts += np.stack([vx, vy], axis=1) * DT
+    # Respawn particles that left the box
+    out = (np.abs(pts[:, 0]) > 4.2) | (np.abs(pts[:, 1]) > 4.2)
+    pts[out] = np.random.uniform(-4, 4, (out.sum(), 2))
+    # Shift trails
+    trails = np.roll(trails, -1, axis=1); trails[:, -1, :] = pts
+    scatter.set_offsets(pts)
+    trail_lines.set_segments(trails)
+    fig.savefig(...)
+```
+
+### Manifold / Parametric Surface Reveal
+
+A surface that gradually "un-crumples" from a flat disc to its target shape. Great for visualizing non-trivial geometry (Möbius, torus, hyperbolic paraboloid):
+
+```python
+# Parametric sphere → torus morph
+U_, V_ = np.meshgrid(np.linspace(0, 2*np.pi, 80), np.linspace(0, np.pi, 40))
+R, r = 2.0, 0.7
+
+for frame_idx in range({frames}):
+    t = ease_in_out_cubic(frame_idx / ({frames} - 1))
+    # Blend: at t=0 a sphere, at t=1 a torus
+    sphere_x = R * np.sin(V_) * np.cos(U_)
+    sphere_y = R * np.sin(V_) * np.sin(U_)
+    sphere_z = R * np.cos(V_)
+    torus_x = (R + r * np.cos(V_ * 2)) * np.cos(U_)
+    torus_y = (R + r * np.cos(V_ * 2)) * np.sin(U_)
+    torus_z = r * np.sin(V_ * 2)
+    Xm = (1 - t) * sphere_x + t * torus_x
+    Ym = (1 - t) * sphere_y + t * torus_y
+    Zm = (1 - t) * sphere_z + t * torus_z
+    # Use ax.clear() ONLY for 3D surfaces since plot_surface can't be updated in place
+    ax.clear()
+    ax.set_facecolor('#0D0D0D'); ax.set_axis_off()
+    ax.plot_surface(Xm, Ym, Zm, cmap='plasma', alpha=0.92, linewidth=0)
+    ax.view_init(elev=20 + 20*t, azim=-40 + 180*t)
+    fig.savefig(...)
+```
+
+Note: 3D surfaces are the ONE exception to the "never use ax.clear()" rule, because `plot_surface` doesn't support in-place data update. Limit 3D surface scenes to short clips for this reason.
+
+### Heatmap + Moving Indicator (dual layer)
+
+Live data often reads better as a heatmap with a cursor indicating the current value — like a research dashboard:
+
+```python
+# Example: wave equation on a 2D grid
+N = 128
+u = np.zeros((N, N)); v = np.zeros((N, N))
+# Seed a pulse
+u[N//2, N//2] = 5.0
+im = ax.imshow(u, cmap='magma', vmin=-1, vmax=1,
+               extent=[-4, 4, -4, 4], origin='lower', interpolation='bilinear')
+# Add contours for extra richness (computed each frame)
+contour_set = [None]
+# Cursor marker (bright dot tracking peak)
+cursor = ax.scatter([0], [0], s=200, c='#FFD54F',
+                    edgecolors='#FFFFFF', linewidths=2, zorder=5)
+
+C = 0.3  # wave speed
+for frame_idx in range({frames}):
+    # Simple 2D wave update
+    lap = (np.roll(u, 1, 0) + np.roll(u, -1, 0) +
+           np.roll(u, 1, 1) + np.roll(u, -1, 1) - 4*u)
+    v += C * lap
+    u += v * 0.5
+    u *= 0.997  # damping
+    im.set_data(u)
+    # Move cursor to highest-amplitude point
+    iy, ix = np.unravel_index(np.argmax(np.abs(u)), u.shape)
+    cursor.set_offsets([[ix * 8/N - 4, iy * 8/N - 4]])
+    fig.savefig(...)
+```
+
+### Multi-Panel Composite (data-dashboard aesthetic)
+
+For topics that have multiple facets (stats + time series + spatial distribution), use a GridSpec layout. Mobile safe only if you keep panels chunky:
+
+```python
+import matplotlib.gridspec as gridspec
+
+fig = plt.figure(figsize=(9, 16), dpi=120)
+fig.patch.set_facecolor('#0D0D0D')
+gs = gridspec.GridSpec(3, 1, height_ratios=[3, 2, 2], hspace=0.35)
+
+ax_big = fig.add_subplot(gs[0]);  ax_big.set_facecolor('#0D0D0D')
+ax_mid = fig.add_subplot(gs[1]);  ax_mid.set_facecolor('#0D0D0D')
+ax_sm  = fig.add_subplot(gs[2]);  ax_sm.set_facecolor('#0D0D0D')
+
+# Each sub-axis has its own artists — initialize ONCE, update in loop
+# Never call plt.subplots inside the loop
+```
+
+### Glow / Bloom Fake (cheap visual lift)
+
+Matplotlib has no native bloom, but layering the same artist at increasing line widths + decreasing alpha fakes it convincingly:
+
+```python
+# Draw the same curve 4 times — widest+faintest first, crispest last
+for lw, a in [(14, 0.08), (9, 0.14), (5, 0.24), (2, 1.0)]:
+    ax.plot(x, y, color='#4FC3F7', lw=lw, alpha=a, solid_capstyle='round')
+```
+
+Apply this to any "hero" line (main data curve, highlighted trajectory) for immediate premium-look. Works in the frame loop — update each layer via `set_data`.
+
+## Positioning — Safe Coordinate Bounds
+
+For a figure with `xlim=(-5,5)`, `ylim=(-8.5, 8.5)`:
+- Data region: keep within x∈[-4.5,4.5], y∈[-7.5,7.5]
+- Title text: y = 8.0 (top, inside axes)
+- Time/info text: y = -7.8, x = -4.5 (bottom-left)
+- Legend: use `ax.legend(loc='upper right', bbox_to_anchor=(0.98, 0.98))`
+
+Never use `tight_layout()` inside the frame loop — call it once before the loop if needed.
+
+## Choosing the Right Pattern
+
+Pick the simulation pattern that actually SERVES the concept — don't default to particles for every topic. Good choices:
+
+| Topic shape | Pattern |
+|-------------|---------|
+| "Something flows / circulates" | Flow Field + Tracer Particles |
+| "Shape A becomes shape B" | Manifold / Parametric Morph |
+| "Wave or propagation on a medium" | Heatmap + Moving Indicator |
+| "Compare multiple angles of one thing" | Multi-Panel Composite |
+| "A single trajectory with dramatic motion" | Particle + Glow layering |
+| "Pattern emerges from simple rules" | Vectorized cellular update + imshow |
+| "Distribution shifts over time" | Animated histogram / density curve |
+
+Avoid: a lone scattered cloud of dots floating aimlessly. Always give motion a REASON (field, gradient, rule, interaction).
+
+## The "Not AI Slop" Checklist
+
+Before submitting, verify:
+1. **Motion has causation** — every moving thing is moving because of a rule, field, or interaction, not just a sine wave on position.
+2. **At least one element uses glow layering** for visual punch.
+3. **Easing is applied** — no raw linear interpolation on any transform.
+4. **Color is restricted** — 2-3 accent colors max per scene, everything else is greyscale background.
+5. **One focal point per frame** — the viewer's eye should know exactly where to look.
+6. **Data is real or physically plausible** — not hand-waved constants picked for prettiness.
+
+## Reference Files
+
+- `references/simulations.md` — Particle gravity, orbital mechanics, fluid flow, wave PDE patterns
+
+CRITICAL DYNAMIC REQUIREMENTS:
+- Target Duration: {duration} seconds
+- Exact frames required: {frames}
+- Description: {description}
+
+GENERATE ONLY PYTHON CODE. Be concise — use loops, helper functions, and avoid repeating similar code blocks. No markdown, no explanation:
 """
 
 
@@ -181,13 +516,19 @@ class PysimService:
         # Use replace() instead of format() to avoid conflicts with curly braces in the prompt examples
         final_prompt = PYSIM_PROMPT.replace("{description}", description).replace("{duration}", str(duration)).replace("{frames}", str(frames)) + error_context
         
+        self._last_prompt = final_prompt
+        
+        self._last_model = 'claude-opus-4-7'
+        
         message = client.messages.create(
-            model="claude-opus-4-5-20251101",
-            max_tokens=4096,
+            model="claude-opus-4-7",
+            max_tokens=16384,
             messages=[{"role": "user", "content": final_prompt}]
         )
         
         response_text = message.content[0].text
+        if message.stop_reason == "max_tokens":
+            raise RuntimeError("Code generation was truncated (hit max_tokens). The description may be too complex for a single segment.")
         
         # Clean markdown if present
         if "```python" in response_text:
@@ -210,10 +551,15 @@ class PysimService:
         
         logger.info(f"[PySim] Running simulation...")
         
+        env = os.environ.copy()
+        env["OUTPUT_DIR"] = output_dir
+        env["DURATION"] = str(float(env.get("DURATION", "8")))
+
         process = await asyncio.create_subprocess_exec(
-            "python", str(script_path), output_dir,
+            "python", str(script_path),
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
         
         stdout, stderr = await process.communicate()
@@ -239,7 +585,7 @@ class PysimService:
         cmd = [
             "ffmpeg", "-y",
             "-framerate", str(fps),
-            "-i", f"{frames_dir}/frame_%05d.png",
+            "-i", f"{frames_dir}/frame_%04d.png",
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",  # Ensure even dimensions for libx264
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",

@@ -12,7 +12,7 @@ import uuid
 import logging
 from datetime import datetime, timedelta
 import boto3
-from google import genai
+import anthropic
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 sqs = boto3.client('sqs', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
 dynamodb = boto3.resource('dynamodb', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
 
-# Initialize Gemini client
-gemini_client = genai.Client(api_key=os.environ.get('GOOGLE_AI_API_KEY'))
+# Initialize Anthropic client
+anthropic_client = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY'))
 
 # Table and queue names from environment
 TOPIC_QUEUE_URL = os.environ.get('TOPIC_QUEUE_URL')
@@ -49,7 +49,7 @@ class TopicManager:
             return queue_topic
         
         # Queue empty - generate a topic
-        logger.info("Queue empty, generating topic with Gemini...")
+        logger.info("Queue empty, generating topic with Claude...")
         return await self._generate_topic()
     
     async def _get_from_queue(self) -> dict | None:
@@ -79,22 +79,25 @@ class TopicManager:
                 ReceiptHandle=message['ReceiptHandle']
             )
             
-            return {
+            result = {
                 'topic_id': body.get('topic_id', str(uuid.uuid4())[:8]),
                 'prompt': body.get('prompt', body.get('topic', '')),
                 'category': body.get('category', 'general')
             }
+            if 'target_duration' in body:
+                result['target_duration'] = int(body['target_duration'])
+            return result
             
         except Exception as e:
             logger.error(f"Error reading from SQS: {e}")
             return None
     
     async def _generate_topic(self) -> dict:
-        """Generate a unique topic using Gemini, avoiding recent topics."""
+        """Generate a unique topic using Claude, avoiding recent topics."""
         # Get recent topics from DynamoDB to avoid repeats
         recent_topics = await self._get_recent_topics()
         recent_list = ', '.join(recent_topics) if recent_topics else 'none'
-        
+
         prompt = f"""Generate a unique, engaging topic prompt for an educational STEM video that would go viral on social media (TikTok, Instagram Reels, YouTube Shorts).
 
 AVOID these recently used topics: {recent_list}
@@ -120,19 +123,15 @@ Return a JSON object with:
 Return ONLY the JSON object, no markdown."""
 
         try:
-            response = gemini_client.models.generate_content(
-                model="gemini-3-flash-preview",
-                contents=prompt,
-                config={
-                    "temperature": 0.9,
-                    "top_p": 0.95,
-                    "max_output_tokens": 2048,  # Increased from 1024 to prevent truncation
-                    "response_mime_type": "application/json",
-                }
+            response = anthropic_client.messages.create(
+                model="claude-opus-4-7",
+                max_tokens=2048,
+                temperature=0.9,
+                messages=[{"role": "user", "content": prompt}]
             )
-            
-            text = response.text.strip()
-            logger.info(f"Gemini topic response (first 200 chars): {text[:200]}")
+
+            text = response.content[0].text.strip()
+            logger.info(f"Claude topic response (first 200 chars): {text[:200]}")
             
             result = None
             
@@ -164,7 +163,7 @@ Return ONLY the JSON object, no markdown."""
             
             # If all parsing fails, use the raw text as the prompt
             if not result:
-                logger.warning("Could not parse JSON from Gemini, using raw text as prompt")
+                logger.warning("Could not parse JSON from Claude, using raw text as prompt")
                 result = {
                     "prompt": text if len(text) > 20 else "Demonstrate a fascinating mathematical pattern that appears in nature",
                     "category": "general",

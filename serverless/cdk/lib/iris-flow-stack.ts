@@ -10,6 +10,10 @@ import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as batch from 'aws-cdk-lib/aws-batch';
+import * as lambda_ from 'aws-cdk-lib/aws-lambda';
+import * as sfn from 'aws-cdk-lib/aws-stepfunctions';
+import * as tasks from 'aws-cdk-lib/aws-stepfunctions-tasks';
 import { Construct } from 'constructs';
 
 export class IrisFlowStack extends cdk.Stack {
@@ -43,15 +47,14 @@ export class IrisFlowStack extends cdk.Stack {
     // =====================
     const musicBucket = new s3.Bucket(this, 'MusicBucket', {
       bucketName: `iris-flow-music-${this.account}`,
-      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL, // Private bucket, only app needs access
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
     // =====================
     // DynamoDB Tables
     // =====================
-    
-    // Jobs table - tracks generation jobs
+
     const jobsTable = new dynamodb.Table(this, 'JobsTable', {
       tableName: 'iris-flow-jobs',
       partitionKey: { name: 'job_id', type: dynamodb.AttributeType.STRING },
@@ -60,7 +63,6 @@ export class IrisFlowStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
-    // Topics table - tracks generated topics (from queue or auto-generated)
     const topicsTable = new dynamodb.Table(this, 'TopicsTable', {
       tableName: 'iris-flow-topics',
       partitionKey: { name: 'topic_id', type: dynamodb.AttributeType.STRING },
@@ -70,7 +72,6 @@ export class IrisFlowStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
-    // GSI for querying topics by category
     topicsTable.addGlobalSecondaryIndex({
       indexName: 'category-index',
       partitionKey: { name: 'category', type: dynamodb.AttributeType.STRING },
@@ -79,24 +80,22 @@ export class IrisFlowStack extends cdk.Stack {
 
     // =====================
     // SQS Queue for topic input
-    // User can populate this with topics; if empty, auto-generate
     // =====================
     const topicQueue = new sqs.Queue(this, 'TopicQueue', {
       queueName: 'iris-flow-topic-queue',
-      visibilityTimeout: cdk.Duration.minutes(30), // Long enough for video generation
+      visibilityTimeout: cdk.Duration.minutes(30),
       retentionPeriod: cdk.Duration.days(14),
     });
 
     // =====================
-    // Secrets Manager for API keys
-    // Import existing secret (created separately to avoid secrets in CDK)
+    // Secrets Manager
     // =====================
     const apiSecrets = secretsmanager.Secret.fromSecretNameV2(
       this, 'ApiSecrets', 'iris-flow/api-keys'
     );
 
     // =====================
-    // VPC for ECS (no NAT Gateway - use public subnets for cost savings)
+    // VPC (public subnets only — no NAT Gateway)
     // =====================
     const vpc = new ec2.Vpc(this, 'IrisFlowVpc', {
       maxAzs: 2,
@@ -118,7 +117,16 @@ export class IrisFlowStack extends cdk.Stack {
     );
 
     // =====================
-    // ECS Cluster with Spot Capacity
+    // Security Group for Batch / ECS tasks
+    // =====================
+    const taskSecurityGroup = new ec2.SecurityGroup(this, 'TaskSecurityGroup', {
+      vpc,
+      description: 'Security group for Iris Flow Batch jobs',
+      allowAllOutbound: true,
+    });
+
+    // =====================
+    // EXISTING ECS (kept for rollback — remove in follow-up)
     // =====================
     const cluster = new ecs.Cluster(this, 'IrisFlowCluster', {
       clusterName: 'iris-flow-cluster',
@@ -127,42 +135,29 @@ export class IrisFlowStack extends cdk.Stack {
       enableFargateCapacityProviders: true,
     });
 
-    // =====================
-    // Task Role - what the container can access
-    // =====================
-    const taskRole = new iam.Role(this, 'TaskRole', {
+    const ecsTaskRole = new iam.Role(this, 'TaskRole', {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
     });
+    videoBucket.grantReadWrite(ecsTaskRole);
+    musicBucket.grantRead(ecsTaskRole);
+    jobsTable.grantReadWriteData(ecsTaskRole);
+    topicsTable.grantReadWriteData(ecsTaskRole);
+    topicQueue.grantConsumeMessages(ecsTaskRole);
+    apiSecrets.grantRead(ecsTaskRole);
 
-    // Grant permissions
-    videoBucket.grantReadWrite(taskRole);
-    musicBucket.grantRead(taskRole);
-    jobsTable.grantReadWriteData(taskRole);
-    topicsTable.grantReadWriteData(taskRole);
-    topicQueue.grantConsumeMessages(taskRole);
-    apiSecrets.grantRead(taskRole);
-
-    // =====================
-    // Task Execution Role - what ECS needs to run the container
-    // =====================
     const executionRole = new iam.Role(this, 'ExecutionRole', {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
       managedPolicies: [
         iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonECSTaskExecutionRolePolicy'),
       ],
     });
-
     ecrRepo.grantPull(executionRole);
     apiSecrets.grantRead(executionRole);
 
-    // =====================
-    // ECS Task Definition (Fargate Spot)
-    // 8 GB RAM, 2 vCPU for video rendering
-    // =====================
     const taskDefinition = new ecs.FargateTaskDefinition(this, 'IrisFlowTask', {
       memoryLimitMiB: 8192,
       cpu: 2048,
-      taskRole,
+      taskRole: ecsTaskRole,
       executionRole,
       runtimePlatform: {
         cpuArchitecture: ecs.CpuArchitecture.X86_64,
@@ -170,7 +165,6 @@ export class IrisFlowStack extends cdk.Stack {
       },
     });
 
-    // Container definition
     taskDefinition.addContainer('IrisFlowGenerator', {
       image: ecs.ContainerImage.fromEcrRepository(ecrRepo, 'latest'),
       logging: ecs.LogDrivers.awsLogs({
@@ -192,48 +186,307 @@ export class IrisFlowStack extends cdk.Stack {
         METRICOOL_API_KEY: ecs.Secret.fromSecretsManager(apiSecrets, 'METRICOOL_API_KEY'),
         METRICOOL_USER_ID: ecs.Secret.fromSecretsManager(apiSecrets, 'METRICOOL_USER_ID'),
         METRICOOL_BLOG_ID: ecs.Secret.fromSecretsManager(apiSecrets, 'METRICOOL_BLOG_ID'),
+        FAL_KEY: ecs.Secret.fromSecretsManager(apiSecrets, 'FAL_KEY'),
       },
     });
 
-    // =====================
-    // Security Group for ECS Tasks
-    // =====================
-    const taskSecurityGroup = new ec2.SecurityGroup(this, 'TaskSecurityGroup', {
+    // =============================================
+    // NEW: AWS Batch Infrastructure
+    // =============================================
+
+    // Batch Job Role (same permissions as ECS task role)
+    const batchJobRole = new iam.Role(this, 'BatchJobRole', {
+      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
+    });
+    videoBucket.grantReadWrite(batchJobRole);
+    musicBucket.grantRead(batchJobRole);
+    jobsTable.grantReadWriteData(batchJobRole);
+    topicsTable.grantReadWriteData(batchJobRole);
+    topicQueue.grantConsumeMessages(batchJobRole);
+    apiSecrets.grantRead(batchJobRole);
+
+    // Batch Execution Role
+    const batchExecRole = new iam.Role(this, 'BatchExecRole', {
+      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonECSTaskExecutionRolePolicy'),
+      ],
+    });
+    ecrRepo.grantPull(batchExecRole);
+    apiSecrets.grantRead(batchExecRole);
+
+    // Batch Fargate Compute Environment (Spot)
+    const computeEnv = new batch.FargateComputeEnvironment(this, 'BatchComputeEnv', {
       vpc,
-      description: 'Security group for Iris Flow video generation tasks',
-      allowAllOutbound: true,
+      vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
+      securityGroups: [taskSecurityGroup],
+      spot: true,
+      maxvCpus: 32,
     });
 
-    // =====================
-    // EventBridge Rule: 4 times daily (9am, 12pm, 3pm, 7pm EST)
-    // EST = UTC-5 (standard) or UTC-4 (daylight saving)
-    // Using UTC times: 14:00, 17:00, 20:00, 00:00
-    // =====================
-    // EventBridge Scheduled Rule - Daily at 6am EST
-    // At 6am, generates 2-5 random videos scheduled throughout the day
-    // =====================
+    // Batch Job Queue
+    const jobQueue = new batch.JobQueue(this, 'BatchJobQueue', {
+      jobQueueName: 'iris-flow-job-queue',
+      priority: 1,
+      computeEnvironments: [
+        { computeEnvironment: computeEnv, order: 1 },
+      ],
+    });
+
+    // Shared environment variables for all Batch jobs
+    const batchEnvVars: { [key: string]: string } = {
+      VIDEO_BUCKET_NAME: videoBucket.bucketName,
+      MUSIC_BUCKET_NAME: musicBucket.bucketName,
+      JOBS_TABLE: jobsTable.tableName,
+      TOPICS_TABLE: topicsTable.tableName,
+      TOPIC_QUEUE_URL: topicQueue.queueUrl,
+      AWS_REGION: this.region,
+    };
+
+    // Shared secrets for Batch jobs
+    const batchSecrets: { [key: string]: batch.Secret } = {
+      GOOGLE_AI_API_KEY: batch.Secret.fromSecretsManager(apiSecrets, 'GOOGLE_AI_API_KEY'),
+      ANTHROPIC_API_KEY: batch.Secret.fromSecretsManager(apiSecrets, 'ANTHROPIC_API_KEY'),
+      GCP_SERVICE_ACCOUNT_KEY: batch.Secret.fromSecretsManager(apiSecrets, 'GCP_SERVICE_ACCOUNT_KEY'),
+      METRICOOL_API_KEY: batch.Secret.fromSecretsManager(apiSecrets, 'METRICOOL_API_KEY'),
+      METRICOOL_USER_ID: batch.Secret.fromSecretsManager(apiSecrets, 'METRICOOL_USER_ID'),
+      METRICOOL_BLOG_ID: batch.Secret.fromSecretsManager(apiSecrets, 'METRICOOL_BLOG_ID'),
+      FAL_KEY: batch.Secret.fromSecretsManager(apiSecrets, 'FAL_KEY'),
+    };
+
+    // Helper to create Batch job definitions
+    const createJobDef = (
+      logicalId: string,
+      jobType: string,
+      vcpu: number,
+      memoryMiB: number,
+      timeoutMinutes: number,
+    ): batch.EcsJobDefinition => {
+      const container = new batch.EcsFargateContainerDefinition(this, `${logicalId}Container`, {
+        image: ecs.ContainerImage.fromEcrRepository(ecrRepo, 'latest'),
+        cpu: vcpu,
+        memory: cdk.Size.mebibytes(memoryMiB),
+        jobRole: batchJobRole,
+        executionRole: batchExecRole,
+        environment: {
+          ...batchEnvVars,
+          JOB_TYPE: jobType,
+        },
+        secrets: batchSecrets,
+        logging: ecs.LogDrivers.awsLogs({
+          streamPrefix: `iris-flow-${jobType}`,
+          logRetention: logs.RetentionDays.ONE_WEEK,
+        }),
+        assignPublicIp: true,
+        fargatePlatformVersion: ecs.FargatePlatformVersion.LATEST,
+      });
+
+      return new batch.EcsJobDefinition(this, logicalId, {
+        jobDefinitionName: `iris-flow-${jobType}`,
+        container,
+        timeout: cdk.Duration.minutes(timeoutMinutes),
+        retryAttempts: 3,
+        retryStrategies: [
+          {
+            action: batch.Action.RETRY,
+            on: batch.Reason.SPOT_INSTANCE_RECLAIMED,
+          },
+          {
+            action: batch.Action.RETRY,
+            on: batch.Reason.CANNOT_PULL_CONTAINER,
+          },
+        ],
+      });
+    };
+
+    // 5 Batch Job Definitions
+    const prepJobDef = createJobDef('PrepJobDef', 'prep', 2, 4096, 15);
+    const visualJobDef = createJobDef('VisualJobDef', 'visual', 4, 16384, 30);
+    const transitionJobDef = createJobDef('TransitionJobDef', 'transition', 2, 4096, 10);
+    const concatJobDef = createJobDef('ConcatJobDef', 'concatenate', 4, 8192, 15);
+    const postprocessJobDef = createJobDef('PostprocessJobDef', 'postprocess', 1, 2048, 10);
+
+    // =============================================
+    // NEW: Lambda Functions
+    // =============================================
+
+    // Orchestrator Lambda (pure boto3)
+    const orchestratorFn = new lambda_.Function(this, 'OrchestratorFn', {
+      functionName: 'iris-flow-orchestrator',
+      runtime: lambda_.Runtime.PYTHON_3_12,
+      handler: 'orchestrator.handler',
+      code: lambda_.Code.fromAsset('../src/lambdas'),
+      timeout: cdk.Duration.minutes(2),
+      memorySize: 256,
+      environment: {
+        TOPIC_QUEUE_URL: topicQueue.queueUrl,
+        // AWS_REGION is set automatically by Lambda runtime
+      },
+    });
+    topicQueue.grantConsumeMessages(orchestratorFn);
+
+    // Read Manifest Lambda (pure boto3)
+    const readManifestFn = new lambda_.Function(this, 'ReadManifestFn', {
+      functionName: 'iris-flow-read-manifest',
+      runtime: lambda_.Runtime.PYTHON_3_12,
+      handler: 'read_manifest.handler',
+      code: lambda_.Code.fromAsset('../src/lambdas'),
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 256,
+      environment: {
+        VIDEO_BUCKET_NAME: videoBucket.bucketName,
+      },
+    });
+    videoBucket.grantRead(readManifestFn);
+
+    // =============================================
+    // NEW: Step Functions State Machine
+    // =============================================
+
+    // Step 1: Prep Batch Job
+    const prepJob = new tasks.BatchSubmitJob(this, 'PrepJob', {
+      jobDefinitionArn: prepJobDef.jobDefinitionArn,
+      jobName: sfn.JsonPath.format('prep-{}', sfn.JsonPath.stringAt('$.video_id')),
+      jobQueueArn: jobQueue.jobQueueArn,
+      containerOverrides: {
+        environment: {
+          VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
+          TARGET_DURATION: sfn.JsonPath.stringAt('States.Format(\'{}\', $.target_duration)'),
+          TOPIC: sfn.JsonPath.stringAt('$.topic'),
+        },
+      },
+      resultPath: '$.prepResult',
+    });
+
+    // Step 2: Read Manifest Lambda
+    const readManifest = new tasks.LambdaInvoke(this, 'ReadManifest', {
+      lambdaFunction: readManifestFn,
+      payloadResponseOnly: true,
+      resultPath: '$.manifestResult',
+    });
+
+    // Step 3: Visual Map (parallel Batch jobs)
+    const visualJob = new tasks.BatchSubmitJob(this, 'VisualJob', {
+      jobDefinitionArn: visualJobDef.jobDefinitionArn,
+      jobName: sfn.JsonPath.format('visual-{}-{}',
+        sfn.JsonPath.stringAt('$.video_id'),
+        sfn.JsonPath.stringAt('States.Format(\'{}\', $.segment_index)')
+      ),
+      jobQueueArn: jobQueue.jobQueueArn,
+      containerOverrides: {
+        environment: {
+          VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
+          SEGMENT_INDEX: sfn.JsonPath.stringAt('States.Format(\'{}\', $.segment_index)'),
+        },
+      },
+    });
+
+    // Catch errors on individual visual jobs so one failure doesn't kill the pipeline
+    const visualJobWithCatch = visualJob.addCatch(new sfn.Pass(this, 'VisualJobFailed', {
+      result: sfn.Result.fromObject({ status: 'FAILED' }),
+    }), { resultPath: '$.error' });
+
+    const visualMap = new sfn.Map(this, 'VisualMap', {
+      itemsPath: '$.manifestResult.visualSegments',
+      maxConcurrency: 10,
+      resultPath: '$.visualResults',
+    });
+    visualMap.itemProcessor(visualJobWithCatch);
+
+    // Step 4: Transition Map (parallel Batch jobs)
+    const transitionJob = new tasks.BatchSubmitJob(this, 'TransitionJob', {
+      jobDefinitionArn: transitionJobDef.jobDefinitionArn,
+      jobName: sfn.JsonPath.format('transition-{}-{}',
+        sfn.JsonPath.stringAt('$.video_id'),
+        sfn.JsonPath.stringAt('States.Format(\'{}\', $.segment_index)')
+      ),
+      jobQueueArn: jobQueue.jobQueueArn,
+      containerOverrides: {
+        environment: {
+          VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
+          SEGMENT_INDEX: sfn.JsonPath.stringAt('States.Format(\'{}\', $.segment_index)'),
+        },
+      },
+    });
+
+    // Catch errors on individual transition jobs
+    const transitionJobWithCatch = transitionJob.addCatch(new sfn.Pass(this, 'TransitionJobFailed', {
+      result: sfn.Result.fromObject({ status: 'FAILED' }),
+    }), { resultPath: '$.error' });
+
+    const transitionMap = new sfn.Map(this, 'TransitionMap', {
+      itemsPath: '$.manifestResult.transitionSegments',
+      maxConcurrency: 10,
+      resultPath: '$.transitionResults',
+    });
+    transitionMap.itemProcessor(transitionJobWithCatch);
+
+    // Step 5: Concatenate Batch Job
+    const concatJob = new tasks.BatchSubmitJob(this, 'ConcatJob', {
+      jobDefinitionArn: concatJobDef.jobDefinitionArn,
+      jobName: sfn.JsonPath.format('concat-{}', sfn.JsonPath.stringAt('$.video_id')),
+      jobQueueArn: jobQueue.jobQueueArn,
+      containerOverrides: {
+        environment: {
+          VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
+        },
+      },
+      resultPath: '$.concatResult',
+    });
+
+    // Step 6: Postprocess Batch Job
+    const postprocessJob = new tasks.BatchSubmitJob(this, 'PostprocessJob', {
+      jobDefinitionArn: postprocessJobDef.jobDefinitionArn,
+      jobName: sfn.JsonPath.format('postprocess-{}', sfn.JsonPath.stringAt('$.video_id')),
+      jobQueueArn: jobQueue.jobQueueArn,
+      containerOverrides: {
+        environment: {
+          VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
+          SCHEDULE_TIME: sfn.JsonPath.stringAt('$.schedule_time'),
+        },
+      },
+      resultPath: '$.postprocessResult',
+    });
+
+    // Chain the state machine
+    const definition = prepJob
+      .next(readManifest)
+      .next(visualMap)
+      .next(transitionMap)
+      .next(concatJob)
+      .next(postprocessJob);
+
+    const stateMachine = new sfn.StateMachine(this, 'VideoStateMachine', {
+      stateMachineName: 'iris-flow-video-pipeline',
+      definitionBody: sfn.DefinitionBody.fromChainable(definition),
+      timeout: cdk.Duration.hours(2),
+      logs: {
+        destination: new logs.LogGroup(this, 'SfnLogGroup', {
+          logGroupName: '/iris-flow/state-machine',
+          retention: logs.RetentionDays.ONE_WEEK,
+          removalPolicy: cdk.RemovalPolicy.DESTROY,
+        }),
+        level: sfn.LogLevel.ERROR,
+      },
+    });
+
+    // Grant orchestrator Lambda permission to start executions
+    stateMachine.grantStartExecution(orchestratorFn);
+    orchestratorFn.addEnvironment('STATE_MACHINE_ARN', stateMachine.stateMachineArn);
+
+    // =============================================
+    // EventBridge: target Orchestrator Lambda (not ECS)
+    // =============================================
     const scheduleRule = new events.Rule(this, 'DailySchedule', {
       ruleName: 'iris-flow-daily-morning',
-      description: 'Trigger video generation at 6am EST daily - generates 2-5 random posts',
+      description: 'Trigger orchestrator Lambda at 6am EST daily',
       schedule: events.Schedule.cron({
         minute: '0',
-        hour: '11',  // 6am EST = 11:00 UTC (during EST, 10:00 UTC during EDT)
+        hour: '11', // 6am EST = 11:00 UTC
       }),
     });
 
-    // ECS Task target
-    scheduleRule.addTarget(
-      new targets.EcsTask({
-        cluster,
-        taskDefinition,
-        taskCount: 1,
-        subnetSelection: { subnetType: ec2.SubnetType.PUBLIC },
-        assignPublicIp: true,
-        securityGroups: [taskSecurityGroup],
-        platformVersion: ecs.FargatePlatformVersion.LATEST,
-        enableExecuteCommand: true,
-      })
-    );
+    scheduleRule.addTarget(new targets.LambdaFunction(orchestratorFn));
 
     // =====================
     // Outputs
@@ -270,12 +523,27 @@ export class IrisFlowStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, 'ClusterArn', {
       value: cluster.clusterArn,
-      description: 'ECS cluster ARN',
+      description: 'ECS cluster ARN (legacy — kept for rollback)',
     });
 
     new cdk.CfnOutput(this, 'SecretsArn', {
       value: apiSecrets.secretArn,
-      description: 'Secrets Manager ARN - update with API keys',
+      description: 'Secrets Manager ARN',
+    });
+
+    new cdk.CfnOutput(this, 'StateMachineArn', {
+      value: stateMachine.stateMachineArn,
+      description: 'Step Functions state machine ARN',
+    });
+
+    new cdk.CfnOutput(this, 'OrchestratorFnArn', {
+      value: orchestratorFn.functionArn,
+      description: 'Orchestrator Lambda ARN',
+    });
+
+    new cdk.CfnOutput(this, 'BatchJobQueueArn', {
+      value: jobQueue.jobQueueArn,
+      description: 'Batch job queue ARN',
     });
   }
 }

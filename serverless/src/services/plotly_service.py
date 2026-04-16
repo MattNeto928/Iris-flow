@@ -23,126 +23,268 @@ FRAMES_DIR = OUTPUT_DIR / "frames"
 VIDEOS_DIR = OUTPUT_DIR / "videos"
 
 
-PLOTLY_PROMPT = """You are an expert Python programmer specializing in Plotly for 3D visualization and animated plots.
-Generate a complete, self-contained Python script that creates stunning Plotly visualizations exported as frames.
+PLOTLY_PROMPT = """# Plotly Segment Generation
 
-CRITICAL DURATION REQUIREMENTS:
-- Target video duration: {duration} seconds
-- Frame rate: 30 FPS
-- EXACT frame count required: {frames} frames
-- You MUST generate EXACTLY {frames} PNG files, no more, no less
-- Frame naming: frame_00000.png, frame_00001.png, etc. (5-digit zero-padded)
+Plotly segments create cinematic 3D scientific visualizations. Claude generates a **complete Python script** that exports exactly `N = int(duration * 30)` PNG frames at 1080×1920 using Plotly + Kaleido, with smooth camera orbits and dark aesthetic.
 
-VIDEO FORMAT: VERTICAL (9:16 for Shorts/Reels/TikTok)
-- Output resolution: 1080x1920 pixels (portrait)
-- Use width=1080, height=1920 in fig.write_image()
+## Mandatory Script Structure
 
-**PLOTLY + KALEIDO BEST PRACTICES:**
-1. Use `plotly.graph_objects` for fine-grained control
-2. Export frames with `fig.write_image(path, engine="kaleido")`
-3. For 3D: Use `go.Surface`, `go.Scatter3d`, `go.Mesh3d`
-4. For animations: Update figure data in a loop, export each frame
-
-**CRITICAL - KALEIDO EXPORT:**
 ```python
 import plotly.graph_objects as go
-import plotly.io as pio
-pio.kaleido.scope.default_format = "png"
+import numpy as np
+import os
 
-# Export each frame
-fig.write_image(f"frame_{{i:05d}}.png", width=1080, height=1920, engine="kaleido")
+OUTPUT_DIR = os.environ.get('OUTPUT_DIR', '/tmp/frames')
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+DURATION = float(os.environ.get('DURATION', '8'))
+FPS = 30
+N_FRAMES = int(DURATION * FPS)
+
+# ── Easing ────────────────────────────────────────────────────────────────────
+def ease_in_out_cubic(t):
+    if t < 0.5: return 4 * t**3
+    return 1 - (-2*t + 2)**3 / 2
+
+# ── Build figure ONCE ─────────────────────────────────────────────────────────
+fig = go.Figure()
+
+# ... add traces here ...
+
+fig.update_layout(
+    width=1080,
+    height=1920,
+    paper_bgcolor='#0D0D0D',
+    plot_bgcolor='#0D0D0D',
+    margin=dict(l=20, r=20, t=80, b=20),
+    font=dict(family='Roboto, Helvetica Neue, sans-serif', color='#F5F5F5'),
+    scene=dict(
+        bgcolor='#0D0D0D',
+        xaxis=dict(gridcolor='#1A1A1A', zerolinecolor='#2A2A2A', showbackground=False),
+        yaxis=dict(gridcolor='#1A1A1A', zerolinecolor='#2A2A2A', showbackground=False),
+        zaxis=dict(gridcolor='#1A1A1A', zerolinecolor='#2A2A2A', showbackground=False),
+    ),
+)
+
+# ── Camera orbit path ─────────────────────────────────────────────────────────
+def camera_at(theta, phi=0.5, r=2.2):
+    \"\"\"Spherical → cartesian camera eye.\"\"\"
+    return dict(
+        x=r * np.sin(phi) * np.cos(theta),
+        y=r * np.sin(phi) * np.sin(theta),
+        z=r * np.cos(phi),
+    )
+
+# ── Frame loop ────────────────────────────────────────────────────────────────
+for frame_idx in range(N_FRAMES):
+    t = frame_idx / max(N_FRAMES - 1, 1)
+    t_e = ease_in_out_cubic(t)
+
+    # Update camera
+    theta = -np.pi/4 + t_e * (2 * np.pi / 3)  # orbit 120°
+    eye = camera_at(theta)
+    fig.update_layout(scene_camera=dict(eye=eye, up=dict(x=0, y=0, z=1)))
+
+    # Update data if needed (e.g. animated surface)
+    # fig.data[0].update(z=new_z_values)
+
+    fig.write_image(
+        os.path.join(OUTPUT_DIR, f'frame_{frame_idx:04d}.png'),
+        format='png',
+        engine='kaleido',
+        scale=1,
+    )
+
+print(f"Rendered {N_FRAMES} frames")
 ```
 
-**3D SURFACE EXAMPLE:**
+## Dark Theme — Complete Layout Template
+
 ```python
-import numpy as np
-import plotly.graph_objects as go
-
-x = np.linspace(-5, 5, 50)
-y = np.linspace(-5, 5, 50)
-X, Y = np.meshgrid(x, y)
-Z = np.sin(np.sqrt(X**2 + Y**2))
-
-fig = go.Figure(data=[go.Surface(z=Z, x=X, y=Y, colorscale='Viridis')])
-fig.update_layout(
-    scene=dict(
-        camera=dict(eye=dict(x=1.5, y=1.5, z=1.5))
+DARK_LAYOUT = dict(
+    paper_bgcolor='#0D0D0D',
+    plot_bgcolor='#0D0D0D',
+    font=dict(family='Roboto, Helvetica Neue, sans-serif', size=14, color='#F5F5F5'),
+    title=dict(
+        font=dict(size=28, color='#F5F5F5'),
+        x=0.5, xanchor='center',
+        y=0.97, yanchor='top',
     ),
-    paper_bgcolor='#1a1a2e',
-    font=dict(color='white')
+    scene=dict(
+        bgcolor='#0D0D0D',
+        xaxis=dict(
+            backgroundcolor='#0D0D0D',
+            gridcolor='#1E1E1E',
+            showbackground=True,
+            zerolinecolor='#2A2A2A',
+            tickfont=dict(color='#606060'),
+            title=dict(font=dict(color='#909090')),
+        ),
+        yaxis=dict(
+            backgroundcolor='#111111',
+            gridcolor='#1E1E1E',
+            showbackground=True,
+            zerolinecolor='#2A2A2A',
+            tickfont=dict(color='#606060'),
+            title=dict(font=dict(color='#909090')),
+        ),
+        zaxis=dict(
+            backgroundcolor='#0D0D0D',
+            gridcolor='#1E1E1E',
+            showbackground=True,
+            zerolinecolor='#2A2A2A',
+            tickfont=dict(color='#606060'),
+            title=dict(font=dict(color='#909090')),
+        ),
+        aspectmode='cube',  # or 'data', 'auto'
+    ),
+    margin=dict(l=20, r=20, t=80, b=20),
+    coloraxis_colorbar=dict(
+        thickness=12,
+        len=0.5,
+        x=0.92,       # right side, within frame
+        y=0.5,
+        tickfont=dict(color='#909090'),
+    ),
 )
 ```
 
-**ANIMATED CAMERA ROTATION (for 3D):**
+## 3D Trace Types
+
+### Surface Plot
 ```python
-for frame_num in range(TOTAL_FRAMES):
-    t = frame_num / TOTAL_FRAMES
-    angle = t * 2 * np.pi
-    camera = dict(
-        eye=dict(
-            x=2 * np.cos(angle),
-            y=2 * np.sin(angle),
-            z=1.5
-        )
-    )
-    fig.update_layout(scene_camera=camera)
-    fig.write_image(f"{{output_dir}}/frame_{{frame_num:05d}}.png", width=1080, height=1920, engine="kaleido")
+x = np.linspace(-3, 3, 80)
+y = np.linspace(-3, 3, 80)
+X, Y = np.meshgrid(x, y)
+Z = np.sin(np.sqrt(X**2 + Y**2)) * np.exp(-0.15 * (X**2 + Y**2))
+
+surf = go.Surface(
+    x=X, y=Y, z=Z,
+    colorscale='Plasma',       # or 'Viridis', 'Inferno', 'Magma', 'Turbo'
+    showscale=True,
+    opacity=1.0,
+    lighting=dict(ambient=0.5, diffuse=0.8, roughness=0.3, specular=0.5),
+    lightposition=dict(x=1000, y=1000, z=1000),
+    contours=dict(z=dict(show=True, color='rgba(255,255,255,0.15)', width=1)),
+)
+fig.add_trace(surf)
 ```
 
-**STYLE GUIDE:**
-- Use dark theme: paper_bgcolor='#1a1a2e', plot_bgcolor='#1a1a2e'
-- Use vibrant colorscales: 'Viridis', 'Plasma', 'Inferno', 'Turbo'
-- White text and labels
-- Smooth camera movements for 3D
-
-**REQUIRED TEMPLATE:**
+### Scatter3d (Points / Trails)
 ```python
-import sys
-import os
-import numpy as np
-import plotly.graph_objects as go
-import plotly.io as pio
-
-pio.kaleido.scope.default_format = "png"
-
-def main(output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    TOTAL_FRAMES = {frames}
-    
-    # Create your data
-    # ... data generation ...
-    
-    # Create figure
-    fig = go.Figure(data=[...])
-    
-    fig.update_layout(
-        paper_bgcolor='#1a1a2e',
-        plot_bgcolor='#1a1a2e',
-        font=dict(color='white', size=14),
-        showlegend=True,
-        margin=dict(l=20, r=20, t=60, b=20)
-    )
-    
-    for frame_num in range(TOTAL_FRAMES):
-        t = frame_num / TOTAL_FRAMES
-        
-        # Update figure for this frame
-        # ... animation logic ...
-        
-        fig.write_image(
-            os.path.join(output_dir, f"frame_{{frame_num:05d}}.png"),
-            width=1080, height=1920, engine="kaleido"
-        )
-    
-    print(f"Generated {{TOTAL_FRAMES}} frames")
-
-if __name__ == "__main__":
-    main(sys.argv[1])
+scatter = go.Scatter3d(
+    x=xs, y=ys, z=zs,
+    mode='lines+markers',
+    line=dict(color='#4FC3F7', width=2),
+    marker=dict(size=3, color=zs, colorscale='Plasma', opacity=0.8),
+)
 ```
 
-Description: {description}
+### Isosurface
+```python
+# Visualize a scalar field at a threshold
+iso = go.Isosurface(
+    x=X.flatten(), y=Y.flatten(), z=Z_vol.flatten(),
+    value=field.flatten(),
+    isomin=0.3, isomax=0.8,
+    surface_count=3,
+    colorscale='Viridis',
+    caps=dict(x_show=False, y_show=False, z_show=False),
+    opacity=0.7,
+)
+```
 
-GENERATE ONLY PYTHON CODE (no markdown, no explanation):
+## Camera Orbit Patterns
+
+```python
+# Full 360° orbit (constant elevation)
+theta = -np.pi/4 + t * 2 * np.pi
+eye = camera_at(theta, phi=0.55, r=2.2)
+
+# Orbit + elevation change (helical)
+theta = -np.pi/4 + t * np.pi
+phi = 0.3 + t * 0.4  # rising from 0.3 to 0.7
+eye = camera_at(theta, phi=phi, r=2.2)
+
+# Zoom in while orbiting
+r = 2.5 - t_e * 0.8  # zoom from 2.5 to 1.7
+theta = -np.pi/4 + t * np.pi / 2
+eye = camera_at(theta, phi=0.5, r=r)
+
+# Eased orbit — slow-in slow-out over 120°
+theta = -np.pi/4 + ease_in_out_cubic(t) * (2*np.pi/3)
+eye = camera_at(theta)
+```
+
+## Animated Surface (Data Changes Per Frame)
+
+```python
+x = np.linspace(-3, 3, 60)
+y = np.linspace(-3, 3, 60)
+X, Y = np.meshgrid(x, y)
+
+fig.add_trace(go.Surface(x=X, y=Y, z=np.zeros_like(X), colorscale='Plasma'))
+
+for frame_idx in range(N_FRAMES):
+    t_sec = frame_idx / FPS
+    Z = np.sin(np.sqrt(X**2 + Y**2) - t_sec * 2) * np.exp(-0.1*(X**2+Y**2))
+    fig.data[0].z = Z
+
+    # Update camera
+    theta = -np.pi/4 + (frame_idx/N_FRAMES) * np.pi
+    fig.update_layout(scene_camera=dict(
+        eye=camera_at(theta),
+        up=dict(x=0, y=0, z=1)
+    ))
+
+    fig.write_image(f'{OUTPUT_DIR}/frame_{frame_idx:04d}.png',
+                    engine='kaleido', scale=1)
+```
+
+## Colorscales for Dark Background
+
+Best Plotly colorscales on dark backgrounds (most → least recommended):
+1. `'Plasma'` — purple → orange → yellow (vibrant, high contrast)
+2. `'Inferno'` — black → purple → orange → yellow (dramatic)
+3. `'Magma'` — black → purple → pink → cream
+4. `'Viridis'` — purple → teal → yellow (perceptually uniform)
+5. `'Turbo'` — full rainbow, very vivid
+6. `'Hot'` — black → red → orange → white
+7. Custom: `[[0,'#0D0D0D'],[0.5,'#4FC3F7'],[1,'#FFD54F']]`
+
+## Colorbar Positioning (9:16 Vertical)
+
+Critical for vertical format — colorbar must not overlap the 3D scene:
+```python
+coloraxis_colorbar=dict(
+    thickness=10,
+    len=0.4,        # 40% of figure height
+    x=0.93,         # rightmost safe position
+    y=0.25,         # lower third (below scene center)
+    title=dict(text="", font=dict(size=11)),
+    tickfont=dict(size=11, color='#808080'),
+)
+```
+
+Or disable colorbar and use a simple title annotation instead:
+```python
+surf = go.Surface(..., showscale=False)
+fig.add_annotation(text="Amplitude", x=1.0, y=0.25, xref='paper', yref='paper',
+                   showarrow=False, font=dict(size=13, color='#909090'))
+```
+
+## Performance
+
+- Kaleido is slow (~0.5–2s per frame). For 8s at 30fps = 240 frames → ~2–8 minutes render time. This is expected.
+- Reduce surface resolution for animated surfaces: `resolution=(40,40)` instead of `(80,80)`
+- Never re-create `go.Figure()` per frame — update in-place
+- Use `fig.data[0].z = new_z` (direct attribute update) not `fig.update_traces(z=new_z)` — it's faster
+
+CRITICAL DYNAMIC REQUIREMENTS:
+- Target Duration: {duration} seconds
+- Exact frames required: {frames}
+- Description: {description}
+
+GENERATE ONLY PYTHON CODE. Be concise — use loops, helper functions, and avoid repeating similar code blocks. No markdown, no explanation:
 """
 
 
@@ -198,13 +340,19 @@ class PlotlyService:
         
         final_prompt = PLOTLY_PROMPT.replace("{description}", description).replace("{duration}", str(duration)).replace("{frames}", str(frames)) + error_context
         
+        self._last_prompt = final_prompt
+        
+        self._last_model = 'claude-opus-4-7'
+        
         message = client.messages.create(
-            model="claude-opus-4-5-20251101",
-            max_tokens=4096,
+            model="claude-opus-4-7",
+            max_tokens=16384,
             messages=[{"role": "user", "content": final_prompt}]
         )
         
         response_text = message.content[0].text
+        if message.stop_reason == "max_tokens":
+            raise RuntimeError("Code generation was truncated (hit max_tokens). The description may be too complex for a single segment.")
         
         # Clean markdown if present
         if "```python" in response_text:
@@ -227,10 +375,14 @@ class PlotlyService:
         
         logger.info(f"[Plotly] Running visualization...")
         
+        env = os.environ.copy()
+        env["OUTPUT_DIR"] = output_dir
+        env["DURATION"] = str(float(env.get("DURATION", "8")))
         process = await asyncio.create_subprocess_exec(
-            "python", str(script_path), output_dir,
+            "python", str(script_path),
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
         
         stdout, stderr = await process.communicate()
@@ -255,7 +407,7 @@ class PlotlyService:
         cmd = [
             "ffmpeg", "-y",
             "-framerate", str(fps),
-            "-i", f"{frames_dir}/frame_%05d.png",
+            "-i", f"{frames_dir}/frame_%04d.png",
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",

@@ -23,142 +23,207 @@ FRAMES_DIR = OUTPUT_DIR / "frames"
 VIDEOS_DIR = OUTPUT_DIR / "videos"
 
 
-GEO_PROMPT = """You are an expert Python programmer specializing in geographic visualization using cartopy and matplotlib.
-Generate a complete, self-contained Python script that creates animated map visualizations.
+GEO_PROMPT = """# Geo Segment Generation
 
-CRITICAL DURATION REQUIREMENTS:
-- Target video duration: {duration} seconds
-- Frame rate: 30 FPS
-- EXACT frame count required: {frames} frames
-- You MUST generate EXACTLY {frames} PNG files, no more, no less
-- Frame naming: frame_00000.png, frame_00001.png, etc. (5-digit zero-padded)
+Geo segments visualize geographic data and global phenomena. Claude generates a complete Python script producing `N = int(duration * 30)` frames at 1080×1920 using cartopy + matplotlib Agg.
 
-VIDEO FORMAT: VERTICAL (9:16 for Shorts/Reels/TikTok)
-- Output resolution: 1080x1920 pixels (portrait)
-- Use figsize=(6, 10.67) or similar vertical aspect ratio
+## Mandatory Structure
 
-**IMPORTANT: NO EXTERNAL DATA FILES**
-You do NOT have access to any external shapefiles or data files. You MUST:
-1. Use only cartopy's built-in features (coastlines, borders, ocean)
-2. Generate synthetic data programmatically
-3. Use cartopy.feature for built-in geographic features
-
-**CARTOPY BEST PRACTICES:**
 ```python
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
-import matplotlib.pyplot as plt
-
-# Create figure with projection
-fig = plt.figure(figsize=(6, 10.67))
-ax = fig.add_subplot(1, 1, 1, projection=ccrs.Orthographic(central_longitude=0, central_latitude=30))
-
-# Add features (NO external data needed!)
-ax.add_feature(cfeature.OCEAN, facecolor='#1a1a2e')
-ax.add_feature(cfeature.LAND, facecolor='#2d2d44')
-ax.add_feature(cfeature.COASTLINE, linewidth=0.5, edgecolor='#4a90d9')
-ax.add_feature(cfeature.BORDERS, linewidth=0.3, edgecolor='#666666')
-ax.set_global()
-```
-
-**AVAILABLE PROJECTIONS:**
-- `ccrs.Orthographic(central_longitude, central_latitude)` - 3D globe view
-- `ccrs.Robinson()` - Good for world maps
-- `ccrs.PlateCarree()` - Simple lat/lon
-- `ccrs.Mercator()` - Classic Mercator
-- `ccrs.Mollweide()` - Equal-area
-
-**ANIMATION IDEAS:**
-
-1. **Rotating Globe:**
-```python
-for frame_num in range(TOTAL_FRAMES):
-    t = frame_num / TOTAL_FRAMES
-    lon = -180 + t * 360  # Full rotation
-    ax = fig.add_subplot(1, 1, 1, projection=ccrs.Orthographic(central_longitude=lon, central_latitude=20))
-```
-
-2. **Projection Morphing (conceptual - show different projections):**
-Show different map projections in sequence with smooth transitions.
-
-3. **Great Circle Path:**
-```python
-import numpy as np
-from cartopy.geodesic import Geodesic
-
-# Plot great circle route
-start = (-74, 40.7)  # NYC
-end = (139.7, 35.7)  # Tokyo
-geod = Geodesic()
-path = geod.inverse(start, end)
-```
-
-4. **Simulated Data Visualization:**
-```python
-# Generate synthetic climate/population data
-lons = np.linspace(-180, 180, 100)
-lats = np.linspace(-90, 90, 50)
-LON, LAT = np.meshgrid(lons, lats)
-data = np.sin(np.radians(LAT) * 2) * np.cos(np.radians(LON) * 3)  # Fake pattern
-
-ax.contourf(LON, LAT, data, transform=ccrs.PlateCarree(), cmap='RdYlBu_r', levels=20)
-```
-
-**STYLE GUIDE:**
-- Dark ocean: '#0a0a14' or '#1a1a2e'
-- Land: '#2d2d44' or '#1e3a5f'
-- Coastlines: '#4a90d9' or cyan
-- Use vibrant colormaps for data: 'plasma', 'viridis', 'RdYlBu_r'
-
-**REQUIRED TEMPLATE:**
-```python
-import sys
-import os
-import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+import numpy as np
+import os
 
-def main(output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    TOTAL_FRAMES = {frames}
-    
-    for frame_num in range(TOTAL_FRAMES):
-        t = frame_num / TOTAL_FRAMES
-        
-        # Create figure with projection
-        fig = plt.figure(figsize=(6, 10.67))
-        
-        # Animation: e.g., rotating globe
-        central_lon = -180 + t * 360
-        ax = fig.add_subplot(1, 1, 1, projection=ccrs.Orthographic(
-            central_longitude=central_lon, central_latitude=20
-        ))
-        
-        # Add features
-        ax.add_feature(cfeature.OCEAN, facecolor='#0a0a14')
-        ax.add_feature(cfeature.LAND, facecolor='#1e3a5f')
-        ax.add_feature(cfeature.COASTLINE, linewidth=0.5, edgecolor='#4a90d9')
-        ax.set_global()
-        
-        fig.patch.set_facecolor('#0a0a14')
-        
-        plt.savefig(os.path.join(output_dir, f"frame_{{frame_num:05d}}.png"),
-                    dpi=180, bbox_inches='tight', pad_inches=0,
-                    facecolor='#0a0a14')
-        plt.close()
-    
-    print(f"Generated {{TOTAL_FRAMES}} frames")
+OUTPUT_DIR = os.environ.get('OUTPUT_DIR', '/tmp/frames')
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+DURATION = float(os.environ.get('DURATION', '8'))
+FPS = 30
+N_FRAMES = int(DURATION * FPS)
 
-if __name__ == "__main__":
-    main(sys.argv[1])
+plt.rcParams.update({
+    'font.family': 'sans-serif',
+    'font.sans-serif': ['Roboto', 'Helvetica Neue', 'DejaVu Sans'],
+})
+
+def ease_in_out_cubic(t):
+    if t < 0.5: return 4 * t**3
+    return 1 - (-2*t + 2)**3 / 2
 ```
 
-Description: {description}
+## Rotating Globe (Orthographic Projection)
 
-GENERATE ONLY PYTHON CODE (no markdown, no explanation):
+The most cinematic geo animation — Earth rotating slowly:
+
+```python
+# NOTE: Cartopy projections cannot be changed on an existing axes.
+# For rotation: recreate figure+axes each frame (cartopy requirement)
+# This is the correct pattern for globe rotation.
+
+LON_START = -30.0
+LON_TOTAL = 120.0  # total degrees to rotate
+
+for frame_idx in range({frames}):
+    t = frame_idx / max({frames} - 1, 1)
+    t_e = ease_in_out_cubic(t)
+    lon = LON_START + LON_TOTAL * t_e
+
+    fig = plt.figure(figsize=(9, 16), dpi=120)
+    fig.patch.set_facecolor('#050A14')
+
+    # Orthographic = globe view
+    proj = ccrs.Orthographic(central_longitude=lon, central_latitude=15)
+    ax = fig.add_subplot(1, 1, 1, projection=proj)
+    ax.set_facecolor('#050A14')
+
+    # Background space color
+    fig.patch.set_facecolor('#050A14')
+
+    # Globe outline
+    ax.add_feature(cfeature.OCEAN.with_scale('110m'),
+                   facecolor='#0A1628', zorder=0)
+    ax.add_feature(cfeature.LAND.with_scale('110m'),
+                   facecolor='#1A2E1A', edgecolor='#2A3A2A',
+                   linewidth=0.4, zorder=1)
+    ax.add_feature(cfeature.COASTLINE.with_scale('110m'),
+                   edgecolor='#3A5A3A', linewidth=0.6, zorder=2)
+    ax.add_feature(cfeature.BORDERS.with_scale('110m'),
+                   edgecolor='#2A3A2A', linewidth=0.3, zorder=2)
+    ax.add_feature(cfeature.LAKES.with_scale('110m'),
+                   facecolor='#0A1628', zorder=2)
+
+    # Globe boundary (circular clip)
+    ax.set_global()
+
+    # Optional: add night/day shading or data points
+    # ax.scatter([lon_data], [lat_data], transform=ccrs.PlateCarree(),
+    #            c=values, cmap='plasma', s=15, alpha=0.7, zorder=5)
+
+    # Title
+    fig.text(0.5, 0.93, "Title Text", ha='center', va='top',
+             fontsize=26, color='#F5F5F5', fontfamily='Roboto')
+
+    plt.tight_layout(pad=0.5)
+    fig.savefig(
+        os.path.join(OUTPUT_DIR, f'frame_{frame_idx:04d}.png'),
+        dpi=120, bbox_inches='tight', pad_inches=0,
+        facecolor='#050A14',
+    )
+    plt.close(fig)
+```
+
+## Dark Earth Aesthetic — Color Palette
+
+```python
+DEEP_OCEAN  = '#061020'   # deep ocean
+SHELF_OCEAN = '#0A1628'   # shallow ocean
+LAND        = '#1A2810'   # land (dark green-grey)
+HIGHLAND    = '#2A3018'   # mountains
+COAST_LINE  = '#3A5A3A'   # coastlines
+BORDER      = '#2A3020'   # country borders
+SPACE_BG    = '#050A14'   # space background for globe
+
+# Alternative: space/satellite night view
+NIGHT_OCEAN = '#040810'
+NIGHT_LAND  = '#0F1510'
+CITY_COLOR  = '#FFD54F'   # city lights color
+```
+
+## Choropleth Map (Static World + Animated Data)
+
+For data overlaid on a Mollweide/Robinson projection:
+
+```python
+# Use Robinson for world maps — minimal distortion, good for 9:16
+fig = plt.figure(figsize=(9, 16), dpi=120)
+fig.patch.set_facecolor('#0D0D0D')
+
+ax = fig.add_subplot(1, 1, 1,
+                      projection=ccrs.Robinson(central_longitude=0))
+ax.set_global()
+ax.set_facecolor('#0A1628')
+
+ax.add_feature(cfeature.OCEAN.with_scale('110m'), facecolor='#061020', zorder=0)
+ax.add_feature(cfeature.LAND.with_scale('110m'),  facecolor='#1A2810', zorder=1)
+ax.add_feature(cfeature.COASTLINE.with_scale('110m'),
+               edgecolor='#3A5A3A', linewidth=0.5, zorder=2)
+
+# Data points (e.g., earthquake locations)
+lons = np.random.uniform(-180, 180, 200)
+lats = np.random.uniform(-60, 70, 200)
+magnitudes = np.random.exponential(scale=2, size=200) + 2.0
+
+scatter = ax.scatter(lons, lats, c=magnitudes,
+                     transform=ccrs.PlateCarree(),
+                     cmap='plasma', vmin=2, vmax=8,
+                     s=magnitudes**2 * 3, alpha=0.7,
+                     linewidths=0.3, edgecolors='white',
+                     zorder=5)
+```
+
+## Zoom Into a Region
+
+```python
+# Animate zoom into a specific region using extent
+START_EXTENT = [-180, 180, -85, 85]   # global
+END_EXTENT   = [-15, 45, 35, 65]      # Europe
+
+for frame_idx in range({frames}):
+    t_e = ease_in_out_cubic(frame_idx / max({frames}-1, 1))
+
+    extent = [
+        START_EXTENT[0] + (END_EXTENT[0] - START_EXTENT[0]) * t_e,
+        START_EXTENT[1] + (END_EXTENT[1] - START_EXTENT[1]) * t_e,
+        START_EXTENT[2] + (END_EXTENT[2] - START_EXTENT[2]) * t_e,
+        START_EXTENT[3] + (END_EXTENT[3] - START_EXTENT[3]) * t_e,
+    ]
+
+    fig = plt.figure(figsize=(9, 16), dpi=120)
+    ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+    ax.set_extent(extent, crs=ccrs.PlateCarree())
+    # ... add features ...
+    fig.savefig(...)
+    plt.close(fig)
+```
+
+## Projection Reference for 9:16
+
+| Projection | Best for | Class |
+|-----------|----------|-------|
+| Orthographic | Globe rotation | `ccrs.Orthographic(lon, lat)` |
+| Robinson | World choropleth | `ccrs.Robinson()` |
+| Mollweide | Equal-area world | `ccrs.Mollweide()` |
+| LambertConformal | Regional (continents) | `ccrs.LambertConformal()` |
+| PlateCarree | Simple regional zoom | `ccrs.PlateCarree()` |
+| Mercator | City/country zoom | `ccrs.Mercator()` |
+
+## Important: Cartopy Figure Recreation
+
+Unlike matplotlib, **cartopy axes with a projection cannot be updated in place** when the projection itself must change (e.g., changing `central_longitude` for globe rotation). Always:
+1. Create a new `fig, ax` each frame
+2. Close with `plt.close(fig)` after saving
+3. This is ~2-3x slower but necessary for correct globe rotation
+
+For animations where the projection is FIXED (only data changes), you can initialize once and update:
+```python
+fig, ax = plt.subplots(subplot_kw={'projection': ccrs.Robinson()}, ...)
+scatter = ax.scatter(...)  # initialize
+for frame_idx in range({frames}):
+    scatter.set_offsets(new_data)   # update data only
+    fig.savefig(...)
+# Do NOT plt.close() inside the loop in this case
+```
+
+CRITICAL DYNAMIC REQUIREMENTS:
+- Target Duration: {duration} seconds
+- Exact frames required: {frames}
+- Description: {description}
+
+GENERATE ONLY PYTHON CODE. Be concise — use loops, helper functions, and avoid repeating similar code blocks. No markdown, no explanation:
 """
 
 
@@ -214,13 +279,19 @@ class GeoService:
         
         final_prompt = GEO_PROMPT.replace("{description}", description).replace("{duration}", str(duration)).replace("{frames}", str(frames)) + error_context
         
+        self._last_prompt = final_prompt
+        
+        self._last_model = 'claude-opus-4-7'
+        
         message = client.messages.create(
-            model="claude-opus-4-5-20251101",
-            max_tokens=4096,
+            model="claude-opus-4-7",
+            max_tokens=16384,
             messages=[{"role": "user", "content": final_prompt}]
         )
         
         response_text = message.content[0].text
+        if message.stop_reason == "max_tokens":
+            raise RuntimeError("Code generation was truncated (hit max_tokens). The description may be too complex for a single segment.")
         
         # Clean markdown if present
         if "```python" in response_text:
@@ -243,10 +314,14 @@ class GeoService:
         
         logger.info(f"[Geo] Running visualization...")
         
+        env = os.environ.copy()
+        env["OUTPUT_DIR"] = output_dir
+        env["DURATION"] = str(float(env.get("DURATION", "8")))
         process = await asyncio.create_subprocess_exec(
-            "python", str(script_path), output_dir,
+            "python", str(script_path),
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
         
         stdout, stderr = await process.communicate()
@@ -271,7 +346,7 @@ class GeoService:
         cmd = [
             "ffmpeg", "-y",
             "-framerate", str(fps),
-            "-i", f"{frames_dir}/frame_%05d.png",
+            "-i", f"{frames_dir}/frame_%04d.png",
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
