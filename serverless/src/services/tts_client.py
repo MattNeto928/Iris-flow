@@ -262,12 +262,22 @@ async def _call_gemini_tts(text: str, voice: str) -> bytes:
             timeout=TTS_TIMEOUT_SEC,
         )
     except asyncio.TimeoutError as e:
-        raise TTSTextResponseError(
-            f"Gemini TTS exceeded {TTS_TIMEOUT_SEC}s — treating as transient failure"
+        raise TTSRateLimitError(
+            f"Gemini TTS exceeded {TTS_TIMEOUT_SEC}s — retry with backoff"
         ) from e
     except Exception as e:
+        # Classify transients as rate-limit (longer backoff):
+        #   - 429 / RESOURCE_EXHAUSTED: quota
+        #   - 5xx / DEADLINE_EXCEEDED / UNAVAILABLE: Google server-side hiccup
+        # Anything else (4xx, malformed, auth) — re-raise immediately.
         msg = str(e).lower()
-        if "429" in msg or "resource_exhausted" in msg or "rate" in msg:
+        transient_markers = (
+            "429", "resource_exhausted", "rate",
+            "500", "502", "503", "504",
+            "deadline_exceeded", "deadline exceeded",
+            "unavailable", "server error", "internal error",
+        )
+        if any(tok in msg for tok in transient_markers):
             raise TTSRateLimitError(str(e)) from e
         raise
 
