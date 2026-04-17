@@ -145,10 +145,11 @@ async def job_prep():
     # Parallel TTS for all segments
     logger.info(f"[{video_id}] Generating TTS for all segments...")
 
-    # Gemini TTS preview: tts_client has built-in retry+backoff for 429 and
-    # text-instead-of-audio. TTS_CONCURRENCY env var is an escape hatch if we
-    # start tripping rate limits.
-    tts_concurrency = int(os.environ.get('TTS_CONCURRENCY', '6'))
+    # Gemini TTS preview has tight parallel-call limits. Observed under
+    # concurrency=6: silent HTTP-200 empty responses ("throttle"), then 504s.
+    # Concurrency=2 is the safe floor for the preview model. tts_client has
+    # retry+backoff for 429 and empty-response cases.
+    tts_concurrency = int(os.environ.get('TTS_CONCURRENCY', '2'))
     tts_semaphore = asyncio.Semaphore(tts_concurrency)
 
     async def generate_tts(seg, idx):

@@ -214,12 +214,19 @@ def _extract_pcm(response) -> bytes:
     except Exception as e:
         raise TTSTextResponseError(f"Malformed response: {e}")
 
-    # No audio parts — grab any text for the error message
+    # No audio parts. Grab any text for the error message.
     text_preview = ""
     try:
         text_preview = (response.text or "")[:200]
     except Exception:
         pass
+    # Observed: when the preview model throttles under parallel load, it
+    # returns HTTP 200 with no content parts and empty text — NOT a 429.
+    # Treat empty-text as a rate-limit so we get the longer backoff path.
+    if not text_preview:
+        raise TTSRateLimitError(
+            "Model returned empty response (likely silent throttling)"
+        )
     raise TTSTextResponseError(f"Model returned no audio parts. Text: {text_preview!r}")
 
 
