@@ -514,10 +514,11 @@ async def generate_segments_from_prompt(
 
     # Use streaming to avoid SDK timeout for large max_tokens
     response_text = ""
+    # NOTE: Opus 4.7 deprecated the `temperature` parameter (uses adaptive
+    # thinking instead). Passing it returns 400 invalid_request_error.
     with client.messages.stream(
         model="claude-opus-4-7",
         max_tokens=64000,
-        temperature=0.7,
         messages=[{"role": "user", "content": full_prompt}]
     ) as stream:
         for text in stream.text_stream:

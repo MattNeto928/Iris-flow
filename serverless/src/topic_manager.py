@@ -123,10 +123,10 @@ Return a JSON object with:
 Return ONLY the JSON object, no markdown."""
 
         try:
+            # Opus 4.7 deprecated `temperature` — uses adaptive thinking instead.
             response = anthropic_client.messages.create(
                 model="claude-opus-4-7",
                 max_tokens=2048,
-                temperature=0.9,
                 messages=[{"role": "user", "content": prompt}]
             )
 
