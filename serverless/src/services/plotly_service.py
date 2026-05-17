@@ -310,11 +310,11 @@ All camera orbits and animated quantities MUST use cosine easing, not linear int
 import numpy as np
 
 def ease(t):
-    """Cosine ease-in-out: smooth acceleration and deceleration."""
+    \"\"\"Cosine ease-in-out: smooth acceleration and deceleration.\"\"\"
     return 0.5 - 0.5 * np.cos(np.pi * t)
 
 def phase(t, start, end):
-    """Remap global t∈[0,1] to sub-window [start,end], eased."""
+    \"\"\"Remap global t in [0,1] to sub-window [start,end], eased.\"\"\"
     return ease(max(0.0, min(1.0, (t - start) / (end - start))))
 
 # Always apply:
