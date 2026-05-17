@@ -406,9 +406,8 @@ export class IrisFlowStack extends cdk.Stack {
     });
 
     // Step 5: Postprocess Batch Job
-    // SCHEDULE_TIME is intentionally omitted from containerOverrides — it's optional.
-    // job_postprocess() reads os.environ.get('SCHEDULE_TIME') and skips Metricool
-    // if unset. Pass it via the orchestrator input if you want a specific post time.
+    // The orchestrator Lambda always sets schedule_time on the execution input
+    // (random 30 min – 6 hr from now), so $.schedule_time is guaranteed present.
     const postprocessJob = new tasks.BatchSubmitJob(this, 'PostprocessJob', {
       jobDefinitionArn: postprocessJobDef.jobDefinitionArn,
       jobName: sfn.JsonPath.format('postprocess-{}', sfn.JsonPath.stringAt('$.video_id')),
@@ -416,6 +415,7 @@ export class IrisFlowStack extends cdk.Stack {
       containerOverrides: {
         environment: {
           VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
+          SCHEDULE_TIME: sfn.JsonPath.stringAt('$.schedule_time'),
         },
       },
       resultPath: '$.postprocessResult',

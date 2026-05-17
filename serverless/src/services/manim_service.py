@@ -330,15 +330,82 @@ ThreeDScene rules:
 
 ## Preventing Common Failures
 
-### Overlap Prevention
+### Text Width & Wrapping — THIS IS THE #1 FAILURE MODE
+
+**Manim does NOT auto-wrap Text.** If a string is wider than the safe zone, it spills off-screen. If you naively place multiple Text objects without `arrange()`, they overlap. Both look broken.
+
+**Hard rules — apply every time you create a Text or MathTex:**
+
+```python
+# 1. ALWAYS cap text width to the safe zone (max width 7.6 units = 2 * 3.8)
+SAFE_WIDTH = 7.0   # leave 0.3 unit margin on each side
+
+label = Text("This is some longer text here", font="Roboto", font_size=32)
+if label.width > SAFE_WIDTH:
+    label.scale_to_fit_width(SAFE_WIDTH)   # auto-shrinks proportionally
+```
+
+```python
+# 2. For multi-line text, break manually with \\n — never rely on auto-wrap
+title = Text(
+    "Why the electron cloud\\noscillates with the field",
+    font="Roboto", font_size=38, line_spacing=1.1, color=WARM_WHITE,
+)
+title.move_to(UP * 6)
+```
+
+```python
+# 3. NEVER place two free-floating Text objects with absolute coords.
+#    Use VGroup.arrange() so spacing is guaranteed:
+group = VGroup(
+    Text("Setup", font="Roboto", font_size=30, color=DIM_GREY),
+    MathTex(r"F = -k x - b \\dot{x}", font_size=44, color=ELECTRIC_BLUE),
+    Text("damped oscillator", font="Roboto", font_size=26, color=WARM_WHITE),
+).arrange(DOWN, buff=0.6, aligned_edge=LEFT)
+
+# Then scale + position the group as a whole
+if group.width > SAFE_WIDTH:
+    group.scale_to_fit_width(SAFE_WIDTH)
+group.move_to(ORIGIN)
+```
+
+```python
+# 4. For equations especially — they get LONG. Cap MathTex width too.
+eq = MathTex(r"\\langle \\psi | \\hat{H} | \\psi \\rangle = E \\langle \\psi | \\psi \\rangle",
+             font_size=46, color=ELECTRIC_BLUE)
+if eq.width > SAFE_WIDTH:
+    eq.scale_to_fit_width(SAFE_WIDTH)
+```
+
+```python
+# 5. After ANY placement, verify the bounding box is inside the safe zone:
+def fits(mobject) -> bool:
+    return (mobject.get_left()[0]   >= -3.8 and
+            mobject.get_right()[0]  <=  3.8 and
+            mobject.get_bottom()[1] >= -7.2 and
+            mobject.get_top()[1]    <=  7.2)
+
+# Sketch: if not fits(group): group.scale(0.85)
+```
+
+**Font size budget (with `Roboto`):**
+- Headers up to ~30 chars: `font_size=42` fits one line
+- Headers 30–50 chars: `font_size=32` or break with `\\n`
+- Body labels up to ~40 chars: `font_size=28`
+- Equations: start at `font_size=46`, drop to 36 if `scale_to_fit_width` kicks in
+- Footnotes / source labels: `font_size=22`
+
+**Never** put two text objects at the same y-coordinate without `arrange(RIGHT, buff=...)` — they will overlap.
+**Never** stack three `Write` animations without `LaggedStart` and `FadeOut` of the previous — they pile on top.
+
+### Overlap Prevention (general)
 ```python
 # Use VGroup with arrange for automatic spacing
 group = VGroup(label1, eq1, label2, eq2).arrange(DOWN, buff=0.6, aligned_edge=LEFT)
 group.move_to(ORIGIN)
 
-# Check bounds after positioning
-# If group.get_top()[1] > 7.0: shift down
-# If group.get_bottom()[1] < -7.0: shift up or reduce font
+# Fade out the previous group BEFORE introducing the next, to prevent stacking
+self.play(FadeOut(group), rate_func=ease_in_cubic, run_time=0.8)
 
 # next_to with generous buff
 subtitle.next_to(title, DOWN, buff=0.5)
