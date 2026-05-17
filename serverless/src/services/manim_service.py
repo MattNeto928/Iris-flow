@@ -549,9 +549,9 @@ class ManimService:
         logger.info(f"[Manim] Rendering scene: {scene_name}...")
 
         # Vertical resolution 1080×1920 @ 30fps.
-        # -W/-H override quality-preset resolution; script also sets config.pixel_width/height.
+        # -r WIDTH,HEIGHT is the correct Manim CE 0.19 flag (NOT -W/-H, which don't exist).
         # -qh (high quality) avoids lossy downscaling from low/medium presets.
-        cmd = f"manim -W 1080 -H 1920 --fps 30 -qh --media_dir {OUTPUT_DIR} {script_path} {scene_name}"
+        cmd = f"manim -r 1080,1920 --fps 30 -qh --media_dir {OUTPUT_DIR} {script_path} {scene_name}"
         
         process = await asyncio.create_subprocess_shell(
             cmd,
