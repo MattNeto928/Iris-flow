@@ -447,14 +447,18 @@ export class IrisFlowStack extends cdk.Stack {
     orchestratorFn.addEnvironment('STATE_MACHINE_ARN', stateMachine.stateMachineArn);
 
     // =============================================
-    // EventBridge: target Orchestrator Lambda (not ECS)
+    // EventBridge: 4× daily orchestrator trigger
+    // Fires at 11:00, 16:00, 20:00, 00:00 UTC = 6am, 11am, 3pm, 7pm EST.
+    // Each invocation generates ONE video and picks a random posting time
+    // in the next 30 min – 6 hr, so posts spread organically across the day.
     // =============================================
     const scheduleRule = new events.Rule(this, 'DailySchedule', {
       ruleName: 'iris-flow-daily-morning',
-      description: 'Trigger orchestrator Lambda at 6am EST daily',
+      description: 'Trigger orchestrator Lambda 4× daily (6am, 11am, 3pm, 7pm EST)',
+      enabled: true,
       schedule: events.Schedule.cron({
         minute: '0',
-        hour: '11', // 6am EST = 11:00 UTC
+        hour: '0,11,16,20', // 4× daily, UTC
       }),
     });
 
