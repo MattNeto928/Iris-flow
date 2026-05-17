@@ -391,11 +391,11 @@ All animated quantities that aren't using Manim's built-in rate_funcs should use
 import numpy as np
 
 def ease(t: float) -> float:
-    """Cosine ease-in-out: 0→1 smoothly. Never use linear for parameter animation."""
+    \"\"\"Cosine ease-in-out: 0->1 smoothly. Never use linear for parameter animation.\"\"\"
     return 0.5 - 0.5 * np.cos(np.pi * t)
 
 def phase(t: float, start: float, end: float) -> float:
-    """Remap t∈[0,1] to the sub-window [start,end], clamped."""
+    \"\"\"Remap t in [0,1] to the sub-window [start,end], clamped.\"\"\"
     return ease(max(0.0, min(1.0, (t - start) / (end - start))))
 ```
 
