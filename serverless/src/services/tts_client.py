@@ -8,8 +8,11 @@ Cross-segment consistency comes from three levers:
   2. temperature=0.6 — lowers prosody variance between parallel renders.
   3. Voice=Algenib — "Gravelly" deep-baritone, the lowest timbre in Gemini's
      catalogue. Closest to the "documentary narrator" register.
-Inline bracket tags are passed through a whitelist; [fast]/[slow]/[short pause]
-are the primary pace levers within a segment.
+Inline bracket tags are passed through a whitelist; [fast]/[slow]/[curious]
+are the primary pace/tone levers within a segment. Pause-class tags ([short pause],
+[long pause], [beat], [breath], [silence], [pause]) are explicitly stripped — they
+produce literal dead air in Algenib's WAV output, confirmed by iris-local CONTRACT.md.
+Use commas and periods for prosody instead.
 
 Post-hoc pacing: Gemini has no speed knob, so we apply `atempo` in ffmpeg.
 BASE_ATEMPO=1.08 lands the default output at ~160 WPM (Muller's explanatory
@@ -98,11 +101,11 @@ Pace:
 VERY BRISK — the tempo of a confident host on the second take, slightly
 hurried, every syllable clipped short. Around 170 words per minute. Do NOT
 drag. Do NOT linger on commas. Do NOT stretch vowels. Tight sentence
-transitions. Sentences flow into each other with minimal breath. The only
-pauses are the ones explicitly marked [short pause] or [long pause]; those
-land AFTER the operative word, not between clauses for breathing room.
-Use [fast] on setup clauses. Default energy: a fast-talking expert who is
-excited to get to the point.
+transitions. Sentences flow into each other with minimal breath. Use commas
+and short sentences for natural breath points — do NOT use [short pause] or
+[long pause] (those produce literal dead air and are stripped).
+Use [fast] on setup clauses. Use [slow] or [thoughtful] for key reveals.
+Default energy: a fast-talking expert who is excited to get to the point.
 
 Accent:
 Neutral North American English with a faint Canadian-Australian hybrid
@@ -122,20 +125,26 @@ Trustworthy, curious, never condescending. Treats the viewer as smart.
 {transcript}
 """
 
+# Tags that produce literal dead air (silence) in Algenib's WAV — stripped pre-call.
+# Confirmed by iris-local CONTRACT.md: "pause-class tags produce dead air".
+# Use commas and sentence-ending periods for prosody instead.
+DEAD_AIR_TAGS: frozenset[str] = frozenset({
+    "short pause", "long pause", "pause", "pause short", "pause long",
+    "beat", "breath", "silence",
+})
+
 # Whitelisted audio tags. Anything outside this set is dropped before sending
-# so the model never reads an invented tag literally. Expanded per the Google
-# cookbook's documented working set for anchor-style narration.
+# so the model never reads an invented tag literally. DEAD_AIR_TAGS are stripped
+# separately (see _sanitize_bracket_tags) and are NOT in this whitelist.
 GEMINI_TAG_WHITELIST = {
-    # Pacing (primary pace control, per Google Cloud docs)
+    # Pacing (primary pace control)
     "fast", "slow", "very fast", "very slowly",
-    # Pauses
-    "short pause", "long pause", "pause", "pause short", "pause long", "beat",
-    # Register / tone
+    # Register / tone (2 per video max — Algenib at 1.0x already has natural pacing)
     "serious", "curious", "curiosity", "thoughtful", "calm", "gentle",
     # Emotional (use sparingly — one per 30s max)
     "amazed", "awe", "wonder", "surprised", "excited", "emphatic",
-    # Non-verbal
-    "whisper", "whispers", "breath",
+    # Non-verbal (whisper only — breath is stripped as DEAD_AIR_TAG)
+    "whisper", "whispers",
 }
 
 # Minimum valid audio duration in seconds. Under this we treat the response as
@@ -185,9 +194,18 @@ def _validate_pcm(pcm_bytes: bytes) -> None:
 
 
 def _sanitize_bracket_tags(text: str) -> str:
-    """Keep whitelisted bracket tags; drop unknown ones (so they're not read literally)."""
+    """
+    Strip dead-air tags and unknown tags; preserve whitelisted tags.
+
+    Dead-air tags ([short pause], [long pause], [beat], [breath], etc.) produce
+    literal silence in Algenib's WAV output — iris-local CONTRACT.md confirmed.
+    Use commas/periods for prosody instead.
+    """
     def keep_or_drop(match: re.Match) -> str:
         tag = match.group(1).strip().lower()
+        if tag in DEAD_AIR_TAGS:
+            logger.info(f"[TTS] Stripping dead-air tag (produces silence): [{tag}]")
+            return ""
         if tag in GEMINI_TAG_WHITELIST:
             return match.group(0)
         logger.info(f"[TTS] Dropping unknown bracket tag: [{tag}]")
@@ -356,12 +374,25 @@ async def generate_voiceover(
     # speed=1.12 ⇒ 1.15 (clamped); speed=0.96 ⇒ 1.037. This bumps the floor
     # without losing per-segment variation.
     atempo = max(ATEMPO_MIN, min(ATEMPO_MAX, float(speed) * BASE_ATEMPO))
+    # Filter chain:
+    #   silenceremove — trim leading silence (Algenib sometimes starts with 80-200ms
+    #                   of dead air, especially after stripping dead-air tags).
+    #                   stop_periods=0 means only the leading edge is trimmed.
+    #   atempo        — speed adjustment (clamped to [ATEMPO_MIN, ATEMPO_MAX])
+    #   apad          — add 0.3s tail so the last word doesn't clip at cut point
+    af_chain = (
+        "silenceremove=start_periods=1"
+        ":start_silence=0.08"
+        ":start_threshold=-50dB"
+        f",atempo={atempo:.3f}"
+        ",apad=pad_dur=0.3"
+    )
     try:
         result = subprocess.run(
             [
                 "ffmpeg", "-y",
                 "-i", str(raw_path),
-                "-af", f"atempo={atempo:.3f},apad=pad_dur=0.3",
+                "-af", af_chain,
                 "-c:a", "pcm_s16le",
                 "-ar", str(SAMPLE_RATE),
                 "-ac", str(CHANNELS),

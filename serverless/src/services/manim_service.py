@@ -27,6 +27,33 @@ MANIM_PROMPT = """# Manim Segment Generation
 
 Manim segments produce 3Blue1Brown-style mathematical and scientific animations. The output is a rendered MP4 at 1080x1920 (9:16 vertical). Every generated script must be cinematic, fluid, and educational — no snapping, no jitter, no overcrowding.
 
+## CRITICAL: Scene Class Name
+
+**The scene class MUST be named `MainScene`.** This is non-negotiable — the render command hardcodes this name.
+
+```python
+class MainScene(MovingCameraScene):   # ← always MainScene
+    def construct(self):
+        ...
+```
+
+For 3D scenes: `class MainScene(ThreeDScene):` — still `MainScene`.
+
+## When to Use Manim (Engine Role)
+
+Manim renders segments whose core content is **an equation, derivation, formula step-through, or symbolic manipulation**. Manim renders real LaTeX via `MathTex`.
+
+**Use manim when:**
+- The viewer needs to READ an equation to understand the segment
+- You are deriving a result step by step
+- You need `TransformMatchingTex` to morph one equation into another
+- The segment has 3D geometry AND overlaid equations simultaneously (use ThreeDScene)
+
+**Do NOT use manim for:**
+- Pure physical motion or particle simulations → use matplotlib
+- 3D geometry without equations → use matplotlib
+- High-quality continuous 3D surfaces → use plotly
+
 ## Scene Configuration (Always Required)
 
 ```python
@@ -45,6 +72,7 @@ import numpy as np
 config.pixel_width = 1080
 config.pixel_height = 1920
 config.frame_rate = 30
+config.background_color = "#0D0D0D"
 # Coordinate space: x ∈ [-4.5, 4.5], y ∈ [-8, 8]
 # Safe content zone: x ∈ [-3.8, 3.8], y ∈ [-7.2, 7.2]
 ```
@@ -54,7 +82,7 @@ config.frame_rate = 30
 Always use `MovingCameraScene` as the base class — it enables cinematic camera control even when no camera movement is planned.
 
 ```python
-class MyScene(MovingCameraScene):
+class MainScene(MovingCameraScene):
     def construct(self):
         ...
 ```
@@ -221,10 +249,10 @@ self.play(ReplacementTransform(old_obj, new_obj), rate_func=smooth, run_time=1.5
 self.play(Indicate(eq[0][3:6], color=SOFT_GOLD, scale_factor=1.3), run_time=1.0)
 ```
 
-## Camera — Cinematic Movement
+## Camera — Cinematic Movement (MovingCameraScene)
 
 ```python
-class MyScene(MovingCameraScene):
+class MainScene(MovingCameraScene):
     def construct(self):
         # Zoom in to a detail
         self.play(
@@ -255,6 +283,50 @@ Camera rules:
 - Always ease in and out of camera moves (`rate_func=smooth`)
 - Never cut camera abruptly — always animate
 - After a zoom, wait at least 1.5s before the next camera move
+
+## ThreeDScene — When Equations Meet 3D Geometry
+
+Use `ThreeDScene` only when the segment needs BOTH 3D spatial visualization AND overlaid equations simultaneously. If there are no equations, use matplotlib instead.
+
+```python
+class MainScene(ThreeDScene):
+    def construct(self):
+        # Initial camera angle: phi = elevation from top, theta = azimuth
+        self.set_camera_orientation(phi=65*DEGREES, theta=-80*DEGREES)
+
+        # Slow continuous ambient orbit — cinematic feel
+        self.begin_ambient_camera_rotation(rate=0.03)   # radians/s, keep 0.02–0.05
+
+        # 3D geometry
+        sphere = Sphere(radius=1.5, fill_opacity=0.12, color=ELECTRIC_BLUE)
+        axes = ThreeDAxes(
+            x_range=[-3, 3], y_range=[-3, 3], z_range=[-3, 3],
+            axis_config={"color": DIM_GREY, "stroke_width": 1.5},
+        )
+        self.play(Create(axes), FadeIn(sphere), rate_func=ease_out_cubic, run_time=2.0)
+
+        # Equations fixed to screen (not tumbling in 3D space)
+        eq = MathTex(r"\nabla \cdot \mathbf{E} = \frac{\rho}{\varepsilon_0}",
+                     font_size=42, color=ELECTRIC_BLUE)
+        eq.to_corner(UP + LEFT, buff=0.6)
+        self.add_fixed_in_frame_mobjects(eq)   # ← critical: screen-fixed overlay
+        self.play(FadeIn(eq, shift=DOWN*0.2), rate_func=ease_out_cubic, run_time=1.5)
+
+        self.wait(3.0)
+        self.stop_ambient_camera_rotation()
+
+        # Smooth camera reframe
+        self.move_camera(phi=80*DEGREES, theta=-45*DEGREES, run_time=3.0, rate_func=smooth)
+        self.wait(2.0)
+```
+
+ThreeDScene rules:
+- **`add_fixed_in_frame_mobjects()`** — ALWAYS use for equations, labels, or any text overlay. Without this, text tumbles in 3D space.
+- **`begin_ambient_camera_rotation(rate=0.03)`** — adds cinematic life; stop with `stop_ambient_camera_rotation()` if you need a specific final angle.
+- **`move_camera(phi, theta, run_time, rate_func)`** — for deliberate reframes.
+- Prefer `phi=60–75°` for a natural elevation; `theta` controls azimuth.
+- Keep 3D geometry simple — ThreeDScene render time is expensive. Save high-resolution meshes for plotly.
+- If a segment is purely equations (no 3D geometry at all), use `MovingCameraScene` instead.
 
 ## Preventing Common Failures
 
@@ -311,34 +383,66 @@ self.add(curve)
 self.play(k.animate.set_value(3.0), rate_func=smooth, run_time=4.0)
 ```
 
+## Cosine Easing (Iris-local Rule)
+
+All animated quantities that aren't using Manim's built-in rate_funcs should use cosine easing:
+
+```python
+import numpy as np
+
+def ease(t: float) -> float:
+    """Cosine ease-in-out: 0→1 smoothly. Never use linear for parameter animation."""
+    return 0.5 - 0.5 * np.cos(np.pi * t)
+
+def phase(t: float, start: float, end: float) -> float:
+    """Remap t∈[0,1] to the sub-window [start,end], clamped."""
+    return ease(max(0.0, min(1.0, (t - start) / (end - start))))
+```
+
+Use these when animating custom parameters in `UpdateFromAlphaFunc` or `ValueTracker`-driven updaters.
+
+**Never use linear interpolation for any parameter that moves through a visible arc** — it looks mechanical. Always ease.
+
 ## Standard Scene Structure
 
 ```python
-class EducationalScene(MovingCameraScene):
+class MainScene(MovingCameraScene):
     def construct(self):
         # 1. Configure
         self.camera.frame.set(frame_width=9)
 
-        # 2. Title reveal
-        title = Text("Topic Title", font="Roboto", font_size=44, color=WARM_WHITE)
-        title.move_to(UP * 6.5)
-        self.play(FadeIn(title, shift=DOWN*0.3), rate_func=ease_out_cubic, run_time=1.5)
-        self.wait(1.0)
+        # 2. Motivation line (WHY before WHAT — pedagogical rule)
+        # The voiceover opens with context; the visual confirms it.
 
         # 3. Main visual (one clear focal element at a time)
-        ...
+        eq = MathTex(r"F = ma", font_size=56, color=ELECTRIC_BLUE)
+        eq.move_to(ORIGIN)
+        self.play(FadeIn(eq, shift=UP*0.3), rate_func=ease_out_cubic, run_time=1.5)
+        self.wait(1.5)
 
-        # 4. Build up with LaggedStart
-        ...
+        # 4. Build up step by step with LaggedStart
+        self.play(
+            LaggedStart(
+                FadeIn(label1, shift=UP*0.2),
+                FadeIn(label2, shift=UP*0.2),
+                lag_ratio=0.3,
+            ),
+            rate_func=smooth, run_time=2.0,
+        )
+        self.wait(1.5)
 
-        # 5. Cinematic camera move to emphasize
-        ...
+        # 5. Cinematic camera move to emphasize a detail
+        self.play(
+            self.camera.animate.set(frame_width=5).move_to(eq.get_center()),
+            rate_func=smooth, run_time=2.5,
+        )
+        self.wait(1.5)
 
         # 6. Hold final state
         self.wait(2.0)
 
-        # 7. Fade everything out (optional, for clean transitions)
-        self.play(FadeOut(VGroup(*self.mobjects)), run_time=1.5)
+        # 7. Fade out
+        self.play(FadeOut(VGroup(*self.mobjects)), rate_func=ease_in_cubic, run_time=1.5)
 ```
 
 CRITICAL DYNAMIC REQUIREMENTS:
@@ -435,17 +539,19 @@ class ManimService:
         
         return response_text
     
-    async def _render(self, script: str, video_id: str, scene_name: str = "ExplanationScene") -> str:
+    async def _render(self, script: str, video_id: str, scene_name: str = "MainScene") -> str:
         """Render Manim scene."""
         script_path = SCRIPTS_DIR / f"{video_id}.py"
-        
+
         with open(script_path, "w") as f:
             f.write(script)
-        
+
         logger.info(f"[Manim] Rendering scene: {scene_name}...")
-        
-        # Vertical resolution: 1080x1920
-        cmd = f"manim -r 1080,1920 --fps 30 -qm --media_dir {OUTPUT_DIR} {script_path} {scene_name}"
+
+        # Vertical resolution 1080×1920 @ 30fps.
+        # -W/-H override quality-preset resolution; script also sets config.pixel_width/height.
+        # -qh (high quality) avoids lossy downscaling from low/medium presets.
+        cmd = f"manim -W 1080 -H 1920 --fps 30 -qh --media_dir {OUTPUT_DIR} {script_path} {scene_name}"
         
         process = await asyncio.create_subprocess_shell(
             cmd,

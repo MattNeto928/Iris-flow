@@ -97,7 +97,6 @@ WORKDIR /app
 
 # Copy source code
 COPY src/ ./src/
-COPY iris-flow-plugin-staged/ ./iris-flow-plugin/
 
 # Set Python path and environment
 ENV PYTHONPATH=/app

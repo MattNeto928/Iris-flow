@@ -299,10 +299,9 @@ export class IrisFlowStack extends cdk.Stack {
       });
     };
 
-    // 5 Batch Job Definitions
+    // 4 Batch Job Definitions (transition removed — title_cards handled inline in job_visual)
     const prepJobDef = createJobDef('PrepJobDef', 'prep', 2, 4096, 15);
     const visualJobDef = createJobDef('VisualJobDef', 'visual', 4, 16384, 30);
-    const transitionJobDef = createJobDef('TransitionJobDef', 'transition', 2, 4096, 10);
     const concatJobDef = createJobDef('ConcatJobDef', 'concatenate', 4, 8192, 15);
     const postprocessJobDef = createJobDef('PostprocessJobDef', 'postprocess', 1, 2048, 10);
 
@@ -393,35 +392,7 @@ export class IrisFlowStack extends cdk.Stack {
     });
     visualMap.itemProcessor(visualJobWithCatch);
 
-    // Step 4: Transition Map (parallel Batch jobs)
-    const transitionJob = new tasks.BatchSubmitJob(this, 'TransitionJob', {
-      jobDefinitionArn: transitionJobDef.jobDefinitionArn,
-      jobName: sfn.JsonPath.format('transition-{}-{}',
-        sfn.JsonPath.stringAt('$.video_id'),
-        sfn.JsonPath.stringAt('States.Format(\'{}\', $.segment_index)')
-      ),
-      jobQueueArn: jobQueue.jobQueueArn,
-      containerOverrides: {
-        environment: {
-          VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
-          SEGMENT_INDEX: sfn.JsonPath.stringAt('States.Format(\'{}\', $.segment_index)'),
-        },
-      },
-    });
-
-    // Catch errors on individual transition jobs
-    const transitionJobWithCatch = transitionJob.addCatch(new sfn.Pass(this, 'TransitionJobFailed', {
-      result: sfn.Result.fromObject({ status: 'FAILED' }),
-    }), { resultPath: '$.error' });
-
-    const transitionMap = new sfn.Map(this, 'TransitionMap', {
-      itemsPath: '$.manifestResult.transitionSegments',
-      maxConcurrency: 10,
-      resultPath: '$.transitionResults',
-    });
-    transitionMap.itemProcessor(transitionJobWithCatch);
-
-    // Step 5: Concatenate Batch Job
+    // Step 4: Concatenate Batch Job
     const concatJob = new tasks.BatchSubmitJob(this, 'ConcatJob', {
       jobDefinitionArn: concatJobDef.jobDefinitionArn,
       jobName: sfn.JsonPath.format('concat-{}', sfn.JsonPath.stringAt('$.video_id')),
@@ -434,7 +405,10 @@ export class IrisFlowStack extends cdk.Stack {
       resultPath: '$.concatResult',
     });
 
-    // Step 6: Postprocess Batch Job
+    // Step 5: Postprocess Batch Job
+    // SCHEDULE_TIME is intentionally omitted from containerOverrides — it's optional.
+    // job_postprocess() reads os.environ.get('SCHEDULE_TIME') and skips Metricool
+    // if unset. Pass it via the orchestrator input if you want a specific post time.
     const postprocessJob = new tasks.BatchSubmitJob(this, 'PostprocessJob', {
       jobDefinitionArn: postprocessJobDef.jobDefinitionArn,
       jobName: sfn.JsonPath.format('postprocess-{}', sfn.JsonPath.stringAt('$.video_id')),
@@ -442,17 +416,15 @@ export class IrisFlowStack extends cdk.Stack {
       containerOverrides: {
         environment: {
           VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
-          SCHEDULE_TIME: sfn.JsonPath.stringAt('$.schedule_time'),
         },
       },
       resultPath: '$.postprocessResult',
     });
 
-    // Chain the state machine
+    // Chain the state machine: prep → read manifest → parallel visuals → concat → postprocess
     const definition = prepJob
       .next(readManifest)
       .next(visualMap)
-      .next(transitionMap)
       .next(concatJob)
       .next(postprocessJob);
 
