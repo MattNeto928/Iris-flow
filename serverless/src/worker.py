@@ -365,9 +365,7 @@ async def job_concatenate():
     Download all segment.mp4 files, crossfade concatenate, add background music.
     Upload final.mp4.
     """
-    from src.video_utils import (
-        concatenate_videos, add_background_music, get_random_background_music
-    )
+    from src.video_utils import concatenate_videos
 
     video_id = os.environ['VIDEO_ID']
     manifest = _load_manifest(video_id)
@@ -402,14 +400,10 @@ async def job_concatenate():
     logger.info(f"[{video_id}] Concatenating {len(segment_paths)} segments...")
     final_path = concatenate_videos(segment_paths, video_id)
 
-    # Add background music
-    try:
-        music_path = get_random_background_music(video_id)
-        if music_path:
-            logger.info(f"[{video_id}] Adding background music...")
-            final_path = add_background_music(final_path, music_path, video_id)
-    except Exception as e:
-        logger.error(f"[{video_id}] Failed to add background music (proceeding without): {e}")
+    # NOTE: We no longer bake background music into the MP4 here. Trending
+    # audio is now attached at publish time by Metricool (TikTok via
+    # `tiktokData.autoAddMusic`; Instagram via manual-publish workflow).
+    # See serverless/src/metricool_client.py.
 
     # Upload final video to jobs prefix and to permanent storage
     _upload(final_path, f"{prefix}/final.mp4")
