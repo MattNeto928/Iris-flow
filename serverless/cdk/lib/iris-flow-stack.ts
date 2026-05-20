@@ -178,6 +178,11 @@ export class IrisFlowStack extends cdk.Stack {
         TOPICS_TABLE: topicsTable.tableName,
         TOPIC_QUEUE_URL: topicQueue.queueUrl,
         AWS_REGION: this.region,
+        // Audio attachment knobs read by serverless/src/metricool_client.py
+        METRICOOL_DEFAULT_AUDIO_NAME: 'Scientific-Nipsey',
+        METRICOOL_TIKTOK_AUTO_ADD_MUSIC: 'true',
+        METRICOOL_SHOW_REEL_ON_FEED: 'true',
+        METRICOOL_INSTAGRAM_MANUAL_FOR_AUDIO: 'false',
       },
       secrets: {
         GOOGLE_AI_API_KEY: ecs.Secret.fromSecretsManager(apiSecrets, 'GOOGLE_AI_API_KEY'),
@@ -241,6 +246,11 @@ export class IrisFlowStack extends cdk.Stack {
       TOPICS_TABLE: topicsTable.tableName,
       TOPIC_QUEUE_URL: topicQueue.queueUrl,
       AWS_REGION: this.region,
+      // Audio attachment knobs read by serverless/src/metricool_client.py
+      METRICOOL_DEFAULT_AUDIO_NAME: 'Scientific-Nipsey',
+      METRICOOL_TIKTOK_AUTO_ADD_MUSIC: 'true',
+      METRICOOL_SHOW_REEL_ON_FEED: 'true',
+      METRICOOL_INSTAGRAM_MANUAL_FOR_AUDIO: 'false',
     };
 
     // Shared secrets for Batch jobs
