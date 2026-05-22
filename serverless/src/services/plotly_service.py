@@ -25,7 +25,37 @@ VIDEOS_DIR = OUTPUT_DIR / "videos"
 
 PLOTLY_PROMPT = """# Plotly Segment Generation
 
+## When to Use Plotly (Engine Role)
+
+Plotly renders segments that require **high-quality continuous 3D surface shading** that matplotlib cannot match:
+- Dispersion surfaces (ω vs k)
+- Potential energy landscapes
+- Isosurfaces of scalar fields (probability density, charge density, electromagnetic field magnitude)
+- Surfaces that need smooth Plotly shading while a camera orbits
+
+**Do NOT use plotly for:**
+- Simple particle clouds or scatter → use matplotlib
+- Equations or LaTeX → use manim
+- Basic 3D geometry (spheres, arrows, wire frames) → use matplotlib
+
 Plotly segments create cinematic 3D scientific visualizations. Claude generates a **complete Python script** that exports exactly `N = int(duration * 30)` PNG frames at 1080×1920 using Plotly + Kaleido, with smooth camera orbits and dark aesthetic.
+
+## Iris-local Style Constants
+
+These palette values are mandatory. Use them verbatim — no substitutions:
+```python
+# Iris-local palette
+BG          = "#0D0D0D"   # background — always
+BLUE        = "#4FC3F7"   # electric blue — primary accent
+GOLD        = "#FFD54F"   # soft gold — secondary / highlight
+CORAL       = "#FF7043"   # coral — contrast / alert
+MINT        = "#80CBC4"   # mint — tertiary
+LAVENDER    = "#CE93D8"   # lavender — quaternary
+WARM_WHITE  = "#F5F5F5"   # labels, annotations
+DIM         = "#424242"   # muted elements, grid lines
+```
+
+Apply these to `paper_bgcolor`, `plot_bgcolor`, `font color`, `scene bgcolor`, axis colors, and colorbar tick colors.
 
 ## Mandatory Script Structure
 
@@ -270,6 +300,56 @@ Or disable colorbar and use a simple title annotation instead:
 surf = go.Surface(..., showscale=False)
 fig.add_annotation(text="Amplitude", x=1.0, y=0.25, xref='paper', yref='paper',
                    showarrow=False, font=dict(size=13, color='#909090'))
+```
+
+## Cosine Easing (Mandatory — Never Linear)
+
+All camera orbits and animated quantities MUST use cosine easing, not linear interpolation:
+
+```python
+import numpy as np
+
+def ease(t):
+    \"\"\"Cosine ease-in-out: smooth acceleration and deceleration.\"\"\"
+    return 0.5 - 0.5 * np.cos(np.pi * t)
+
+def phase(t, start, end):
+    \"\"\"Remap global t in [0,1] to sub-window [start,end], eased.\"\"\"
+    return ease(max(0.0, min(1.0, (t - start) / (end - start))))
+
+# Always apply:
+for frame_idx in range(N_FRAMES):
+    t = frame_idx / max(N_FRAMES - 1, 1)
+    t_e = ease(t)                         # ← use t_e for ALL animated quantities
+    theta = -np.pi/4 + t_e * (2*np.pi/3) # camera orbit — eased, NOT t_e=t (linear)
+```
+
+**Rule**: `t_e = ease_in_out_cubic(t)` (or `ease(t)` above) must be applied to every camera angle, surface parameter, and color interpolation. Never use raw `t` for animation — only for indexing.
+
+## Dark Layout (Always Apply)
+
+```python
+fig.update_layout(
+    width=1080, height=1920,
+    paper_bgcolor='#0D0D0D',
+    plot_bgcolor='#0D0D0D',
+    font=dict(family='Roboto, Helvetica Neue, sans-serif', color='#F5F5F5'),
+    title=dict(font=dict(size=32, color='#F5F5F5'), x=0.5, xanchor='center', y=0.96),
+    scene=dict(
+        bgcolor='#0D0D0D',
+        xaxis=dict(backgroundcolor='#0D0D0D', gridcolor='#1E1E1E',
+                   showbackground=True, zerolinecolor='#2A2A2A',
+                   tickfont=dict(color='#424242'), title=dict(font=dict(color='#424242'))),
+        yaxis=dict(backgroundcolor='#111111', gridcolor='#1E1E1E',
+                   showbackground=True, zerolinecolor='#2A2A2A',
+                   tickfont=dict(color='#424242'), title=dict(font=dict(color='#424242'))),
+        zaxis=dict(backgroundcolor='#0D0D0D', gridcolor='#1E1E1E',
+                   showbackground=True, zerolinecolor='#2A2A2A',
+                   tickfont=dict(color='#424242'), title=dict(font=dict(color='#424242'))),
+        aspectmode='cube',
+    ),
+    margin=dict(l=20, r=20, t=80, b=20),
+)
 ```
 
 ## Performance

@@ -21,8 +21,10 @@ output/
 *.wav
 *.mp4
 
-# Service account keys
+# Service account keys (keep *.json broad to block GCP keys, but whitelist CDK config)
 *.json
 !package.json
 !package-lock.json
 !tsconfig.json
+!cdk.json
+!cdk.context.json

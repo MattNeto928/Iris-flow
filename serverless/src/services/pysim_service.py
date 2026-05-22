@@ -24,441 +24,265 @@ FRAMES_DIR = OUTPUT_DIR / "frames"
 VIDEOS_DIR = OUTPUT_DIR / "videos"
 
 
-PYSIM_PROMPT = """# PySim Segment Generation
+PYSIM_PROMPT = """# Matplotlib Segment Generation
 
-PySim segments generate scientific simulations as PNG frame sequences compiled into MP4 by FFmpeg. Claude generates a **complete, self-contained Python script** that produces exactly `N = int(duration * 30)` frames saved as `frame_0000.png`, `frame_0001.png`, etc.
+Generate a complete, self-contained Python script that produces exactly N = int(duration * 30) frames
+saved as frame_0000.png, frame_0001.png, etc. into OUTPUT_DIR (from environment variable).
 
-## Mandatory Script Structure
+## DEFAULT: 3D FIRST
 
+**Always use mpl_toolkits.mplot3d when the topic has any spatial geometry.**
+3D is the default. 2D is the exception (use only for 2D-native content like waveforms,
+histograms, or 2D field maps where the third dimension adds nothing).
+
+3D setup that MUST appear in every 3D script:
 ```python
 import matplotlib
-matplotlib.use('Agg')  # MUST be before any other matplotlib import
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 — registers projection
 import numpy as np
 import os
 
-# ── Output setup ──────────────────────────────────────────────────────────────
+BG = '#0D0D0D'; BLUE = '#4FC3F7'; GOLD = '#FFD54F'; CORAL = '#FF7043'
+MINT = '#80CBC4'; LAVENDER = '#CE93D8'; WARM_WHITE = '#F5F5F5'; DIM = '#424242'
+
 OUTPUT_DIR = os.environ.get('OUTPUT_DIR', '/tmp/frames')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 DURATION = float(os.environ.get('DURATION', '8'))
 FPS = 30
 N_FRAMES = int(DURATION * FPS)
 
-# ── Global style ──────────────────────────────────────────────────────────────
-plt.rcParams.update({
-    'font.family': 'sans-serif',
-    'font.sans-serif': ['Roboto', 'Helvetica Neue', 'DejaVu Sans'],
-    'text.color': '#F5F5F5',
-    'axes.facecolor': '#0D0D0D',
-    'figure.facecolor': '#0D0D0D',
-    'axes.edgecolor': '#2A2A2A',
-    'grid.color': '#1E1E1E',
-    'grid.linewidth': 0.5,
-})
+W, H = 1080, 1920
 
-# ── Figure — fixed at 1080×1920 ───────────────────────────────────────────────
-fig, ax = plt.subplots(figsize=(9, 16), dpi=120)  # 9*120=1080, 16*120=1920
-fig.patch.set_facecolor('#0D0D0D')
-ax.set_facecolor('#0D0D0D')
+def ease(t):
+    t = np.clip(t, 0.0, 1.0)
+    return 0.5 - 0.5 * np.cos(np.pi * t)
 
-# ── Axis limits — SET ONCE, NEVER INSIDE THE FRAME LOOP ──────────────────────
-XLIM = (-5, 5)
-YLIM = (-8.5, 8.5)
-ax.set_xlim(XLIM)
-ax.set_ylim(YLIM)
-ax.set_aspect('equal')
-ax.axis('off')  # or configure ticks/spines explicitly
-
-# ── Initialize simulation state ───────────────────────────────────────────────
-# ... all state variables here ...
-
-# ── Initialize artists (create once, update in loop) ──────────────────────────
-# e.g. scatter = ax.scatter([], [], c=[], s=[], cmap='plasma', vmin=0, vmax=1)
-# e.g. line, = ax.plot([], [], color='#4FC3F7', lw=2)
-
-# ── Easing utilities ──────────────────────────────────────────────────────────
-def ease_in_out_cubic(t):
-    \"\"\"t in [0,1] → eased value in [0,1]\"\"\"
-    if t < 0.5:
-        return 4 * t**3
-    return 1 - (-2*t + 2)**3 / 2
-
-def lerp(a, b, t):
-    return a + (b - a) * t
-
-# ── Frame loop ────────────────────────────────────────────────────────────────
-for frame_idx in range({frames}):
-    t = frame_idx / max({frames} - 1, 1)  # normalized time [0, 1]
-    t_eased = ease_in_out_cubic(t)
-
-    # Update simulation state (vectorized, no Python loops)
-    # ...
-
-    # Update artist data — NEVER call plt.cla() or ax.clear()
-    # scatter.set_offsets(positions)
-    # scatter.set_array(colors)
-    # line.set_data(x_data, y_data)
-
-    # Save frame
-    fig.savefig(
-        os.path.join(OUTPUT_DIR, f'frame_{frame_idx:04d}.png'),
-        dpi=120,
-        bbox_inches='tight',
-        pad_inches=0,
-        facecolor=fig.get_facecolor(),
-    )
-
-plt.close(fig)
-print(f"Rendered {{N_FRAMES}} frames to {{OUTPUT_DIR}}")
-```
-
-## The Golden Rule: Never Recreate Artists
-
-The most common source of jitter is recreating matplotlib artists inside the frame loop. Always initialize once, update with `set_data` / `set_offsets` / `set_array`.
-
-```python
-# WRONG — causes flicker/jitter
-for frame in range(N_FRAMES):
-    ax.clear()           # ← NEVER
-    ax.scatter(x, y)     # ← NEVER create inside loop
-    ax.set_xlim(...)     # ← NEVER reset limits inside loop
-
-# RIGHT — initialize once, update properties only
-scatter = ax.scatter(x0, y0, c=colors, s=sizes, cmap='plasma', vmin=0, vmax=1)
-for frame in range(N_FRAMES):
-    # Update positions and colors via set_* methods
-    scatter.set_offsets(np.column_stack([new_x, new_y]))
-    scatter.set_array(new_colors)
-```
-
-## Axis Limits — Fixed Forever
-
-Set axis limits ONCE before the frame loop. They must never change mid-animation (causes zoom jitter):
-
-```python
-# Set based on the maximum extent of the simulation
-# Add 15% padding beyond the maximum coordinate
-ax.set_xlim(-X_MAX * 1.15, X_MAX * 1.15)
-ax.set_ylim(-Y_MAX * 1.15, Y_MAX * 1.15)
-```
-
-## Easing — Smooth Parameter Changes
-
-All parameter transitions must use easing, not linear interpolation:
-
-```python
-def ease_in_out_cubic(t):
-    if t < 0.5: return 4 * t**3
-    return 1 - (-2*t + 2)**3 / 2
-
-def ease_out_expo(t):
-    return 1 - 2**(-10 * t) if t > 0 else 0
-
-# Phase-based easing (multiple phases in one animation)
-def phase_ease(t, start, end):
-    \"\"\"Remap global t to [0,1] within a time window.\"\"\"
+def phase(t, start, end):
     if t <= start: return 0.0
     if t >= end: return 1.0
-    return ease_in_out_cubic((t - start) / (end - start))
+    return ease((t - start) / (end - start))
 
-# Example: zoom in from t=0→0.3, hold t=0.3→0.7, zoom out t=0.7→1.0
-zoom = lerp(1.0, 2.5, phase_ease(t, 0.0, 0.3)) \
-     + lerp(2.5, 2.5, phase_ease(t, 0.3, 0.7) - phase_ease(t, 0.0, 0.3)) \
-     + lerp(2.5, 1.0, phase_ease(t, 0.7, 1.0))
+fig = plt.figure(figsize=(W/100, H/100), dpi=100, facecolor=BG)
+ax = fig.add_subplot(111, projection='3d', facecolor=BG)
+ax.set_axis_off()
+ax.set_xlim(-2, 2); ax.set_ylim(-2, 2); ax.set_zlim(-2, 2)
+ax.set_box_aspect((1, 1, 1.6))  # ALWAYS — keeps 3D box un-squashed in 9:16
 ```
 
-## Dark Aesthetic Palette
+Two rules that prevent the most common 3D failures:
+1. `set_box_aspect((1, 1, 1.6))` — without this the 3D box looks crushed in portrait format
+2. `ax.set_axis_off()` or set pane facecolors to `(0.05, 0.05, 0.05, 1)` — default grey panes look terrible on #0D0D0D
+
+## The Artist Golden Rule
+
+Build ALL artists ONCE before the frame loop. Update them inside the loop with set_* methods.
+NEVER call ax.clear() inside the loop for non-surface content.
 
 ```python
-BG          = '#0D0D0D'
-PANEL_BG    = '#121212'
-ELECTRIC    = '#4FC3F7'   # primary data / curves
-GOLD        = '#FFD54F'   # highlight / key value
-CORAL       = '#FF7043'   # secondary data
-MINT        = '#80CBC4'   # tertiary
-LAVENDER    = '#CE93D8'   # quaternary
-WARM_WHITE  = '#F5F5F5'   # text
-DIM_GREY    = '#424242'   # secondary text / grid
+# RIGHT — build once, update in loop
+sc_electrons = ax.scatter(base[:, 0], base[:, 1], base[:, 2],
+                          s=22, c=BLUE, alpha=0.80, depthshade=False)
+for i in range(N_FRAMES):
+    new_pos = base.copy(); new_pos[:, 2] += disp_z
+    sc_electrons._offsets3d = (new_pos[:, 0], new_pos[:, 1], new_pos[:, 2])
+    fig.savefig(f"{OUTPUT_DIR}/frame_{i:04d}.png", facecolor=BG, dpi=100)
 
-# Good colormaps on dark backgrounds
-# 'plasma', 'inferno', 'magma', 'viridis', 'twilight', 'cool', 'hot'
+# WRONG — causes flicker
+for i in range(N_FRAMES):
+    ax.clear()         # NEVER
+    ax.scatter(...)    # NEVER recreate inside loop
 ```
 
-## Text and Labels
+EXCEPTION: `plot_surface` cannot be updated in place — use `surf.remove(); surf = ax.plot_surface(...)`
+for morphing surfaces. Keep surface morphs to ≤ 60 grid resolution to stay fast.
+
+## Easing — Always
+
+Every animated quantity uses the `ease()` or `phase()` helpers. No raw linear interpolation.
 
 ```python
-# Title — top of frame, always
-ax.text(0, 8.0, "Simulation Title",
-        ha='center', va='top',
-        fontsize=22, color=WARM_WHITE, fontweight='bold',
-        fontfamily='Roboto')
+# Camera sweep
+azim = -55 + 90 * ease(t)      # ease full segment
+elev = 18 + 5 * np.sin(2*np.pi*t)  # gentle bob
 
-# Annotation — never overlap with data
-ax.text(-4.5, -7.5, f"t = {{sim_time:.2f}}s",
-        ha='left', va='bottom',
-        fontsize=14, color=DIM_GREY, fontfamily='Roboto')
-
-# Use ax.transAxes for fixed screen-space text (doesn't move with data)
-ax.text(0.5, 0.97, "Title",
-        transform=ax.transAxes,
-        ha='center', va='top',
-        fontsize=22, color=WARM_WHITE)
+# Multi-phase: label fades in 5%→15%, main motion 15%→80%
+label_alpha = phase(t, 0.05, 0.15)
+motion_progress = phase(t, 0.15, 0.80)
 ```
 
-## Vectorized Simulation Patterns
+## Iris-local 3D Pattern Library
 
-### Particle System
+These are the high-frequency physical patterns. Use them directly when applicable.
+
+### Pattern 1: Driven Oscillator (resonance sweep)
+Bead on a spring whose drive frequency sweeps from 0.3ω₀ → 1.7ω₀. Shows resonance blowup.
 ```python
-N = 200  # number of particles
-pos = np.random.uniform(-4, 4, (N, 2))
-vel = np.random.randn(N, 2) * 0.1
-mass = np.random.uniform(0.5, 2.0, N)
+omega0 = 2.0 * np.pi; gamma = 0.55; F0 = 5.5; dt = 1.0/FPS
+z = 0.0; vz = 0.0; phase_acc = 0.0; trail = []
 
-scatter = ax.scatter(pos[:, 0], pos[:, 1],
-                     c=mass, cmap='plasma', s=20,
-                     vmin=mass.min(), vmax=mass.max(),
-                     alpha=0.85, linewidths=0)
+def spring_path(z_bead, n_pts=140, n_coils=9, radius=0.34):
+    s = np.linspace(0, 1, n_pts)
+    z = 3.0 + (z_bead - 3.0) * s
+    envelope = np.sin(np.pi * s) ** 0.55
+    angle = 2*np.pi*n_coils*s
+    return radius*envelope*np.cos(angle), radius*envelope*np.sin(angle), z
 
-for frame_idx in range({frames}):
-    t = frame_idx / ({frames} - 1)
-    # Vectorized update — no Python loop over particles
-    pos += vel * (1.0 / FPS)
-    # Boundary: wrap or bounce
-    vel[pos > 4.5] *= -1
-    vel[pos < -4.5] *= -1
-    pos = np.clip(pos, -4.5, 4.5)
+ax.set_xlim(-2,2); ax.set_ylim(-2,2); ax.set_zlim(-3.6,3.6)
+ax.set_box_aspect((1,1,1.6))
+ax.scatter([0],[0],[3.0], s=140, c=DIM, marker='s', depthshade=False)
+sx0, sy0, sz0 = spring_path(0)
+spring_line, = ax.plot(sx0, sy0, sz0, color=BLUE, lw=2.6, alpha=0.92)
+bead = ax.scatter([0],[0],[0], s=420, c=GOLD, edgecolors=WARM_WHITE, lw=1.5, depthshade=False)
+trail_sc = ax.scatter([],[],[], s=70, c=[], cmap='plasma', vmin=0, vmax=1, depthshade=False, alpha=0.85)
 
-    scatter.set_offsets(pos)
-    fig.savefig(...)
+for i in range(N_FRAMES):
+    gt = i / max(N_FRAMES-1, 1)
+    omega = omega0 * (0.3 + 1.4 * ease(gt))
+    phase_acc += omega * dt
+    F = F0 * np.cos(phase_acc)
+    a = -omega0**2 * z - gamma*vz + F
+    vz += a*dt; z += vz*dt
+    z = np.clip(z, -2.9, 2.9)
+    sx,sy,sz = spring_path(z)
+    spring_line.set_data(sx,sy); spring_line.set_3d_properties(sz)
+    bead._offsets3d = ([0],[0],[z])
+    trail.append(z); trail = trail[-36:]
+    if len(trail)>1:
+        tz=np.array(trail); trail_sc._offsets3d=(np.zeros_like(tz),np.zeros_like(tz),tz)
+        trail_sc.set_array(np.linspace(0.05,0.95,len(tz)))
+    ax.view_init(elev=14+4*np.sin(2*np.pi*gt), azim=25+75*ease(gt))
+    fig.savefig(f"{OUTPUT_DIR}/frame_{i:04d}.png", facecolor=BG, dpi=100)
 ```
 
-### Wave Equation
+### Pattern 2: Electron Sea Sloshing (LSP / nanoparticle)
+Gold nanoparticle: static ion cloud (GOLD scatter) + oscillating electron cloud (BLUE scatter).
+Shows induced dipole as charge separation under an oscillating E-field.
 ```python
-x = np.linspace(-4.5, 4.5, 400)
-line, = ax.plot(x, np.zeros_like(x), color=ELECTRIC, lw=2.5, alpha=0.9)
-fill = ax.fill_between(x, np.zeros_like(x), alpha=0.15, color=ELECTRIC)
+rng = np.random.default_rng(7); R = 0.95; Npart = 360
+pts = []
+while len(pts) < Npart:
+    c = rng.uniform(-1,1,(Npart*2,3)); ok = c[np.linalg.norm(c,axis=1)<=1][:Npart-len(pts)]
+    pts.extend(ok.tolist())
+base = np.array(pts) * R
 
-for frame_idx in range({frames}):
-    t_sec = frame_idx / FPS
-    y = np.sin(2 * np.pi * (x - t_sec * 1.5)) * np.exp(-0.1 * x**2)
-    line.set_ydata(y)
-    # Update fill: remove old, add new (fill_between must be recreated)
-    # Alternative: use imshow or contourf for wave fields
-    fig.savefig(...)
+u=np.linspace(0,2*np.pi,40); v=np.linspace(0,np.pi,20)
+ax.plot_wireframe(R*np.outer(np.cos(u),np.sin(v)),
+                  R*np.outer(np.sin(u),np.sin(v)),
+                  R*np.outer(np.ones_like(u),np.cos(v)), color=DIM, alpha=0.30, lw=0.6)
+sc_ions = ax.scatter(base[:,0],base[:,1],base[:,2], s=18,c=GOLD,alpha=0.55,depthshade=False)
+sc_e    = ax.scatter(base[:,0],base[:,1],base[:,2], s=22,c=BLUE,alpha=0.80,depthshade=False)
+
+for i in range(N_FRAMES):
+    t = i/max(N_FRAMES-1,1); e=ease(t)
+    disp_z = -0.30 * np.sin(2*np.pi*2.0*t) * (0.4+0.6*e)
+    np_ = base.copy(); np_[:,2] += disp_z
+    sc_e._offsets3d = (np_[:,0], np_[:,1], np_[:,2])
+    ax.view_init(elev=18+5*np.sin(2*np.pi*t), azim=-55+90*e)
+    fig.savefig(f"{OUTPUT_DIR}/frame_{i:04d}.png", facecolor=BG, dpi=100)
 ```
 
-### 3D Matplotlib Rotation
+### Pattern 3: Rotating camera around an object (azim sweep)
 ```python
-from mpl_toolkits.mplot3d import Axes3D
-
-fig = plt.figure(figsize=(9, 16), dpi=120)
-ax = fig.add_subplot(111, projection='3d')
-fig.patch.set_facecolor('#0D0D0D')
-ax.set_facecolor('#0D0D0D')
-
-# Plot once
-X, Y = np.meshgrid(np.linspace(-3, 3, 60), np.linspace(-3, 3, 60))
-Z = np.sin(np.sqrt(X**2 + Y**2))
-surf = ax.plot_surface(X, Y, Z, cmap='plasma', alpha=0.9,
-                        linewidth=0, antialiased=True)
-
-# Rotate per frame — set_xlim NOT needed, view_init only
-for frame_idx in range({frames}):
-    t = frame_idx / ({frames} - 1)
-    azim = -60 + ease_in_out_cubic(t) * 120  # rotate 120° total
-    ax.view_init(elev=30, azim=azim)
-    fig.savefig(...)
+azim_start, azim_end = -45, 45
+for i in range(N_FRAMES):
+    t = i/(N_FRAMES-1); te = ease(t)
+    azim = azim_start + (azim_end - azim_start)*te
+    elev = 18 + 6*np.sin(2*np.pi*t)  # gentle bob
+    ax.view_init(elev=elev, azim=azim)
+    fig.savefig(f"{OUTPUT_DIR}/frame_{i:04d}.png", facecolor=BG, dpi=100)
+# Sweep no more than ~120° per segment — more disorients.
 ```
 
-### Flow Field + Tracer Particles (premium science-viz look)
-
-Stream plot as a static base, then particles that actually follow the field lines on top. This is the pattern that makes videos look research-grade vs. toy:
-
+### Pattern 4: Vector field in 3D (electric/magnetic field, fluid)
 ```python
-from scipy.interpolate import RegularGridInterpolator
-
-# Vector field — example: rotational flow with sink
-grid = np.linspace(-4, 4, 40)
-X, Y = np.meshgrid(grid, grid)
-U = -Y - 0.2 * X  # flow field components
-V =  X - 0.2 * Y
-
-# Draw static streamlines (slim, low alpha — they're context)
-ax.streamplot(X, Y, U, V, color='#1E1E1E', density=1.6, linewidth=0.6, arrowsize=0)
-
-# Interpolators so particles read the field continuously
-fu = RegularGridInterpolator((grid, grid), U.T, bounds_error=False, fill_value=0.0)
-fv = RegularGridInterpolator((grid, grid), V.T, bounds_error=False, fill_value=0.0)
-
-# Particles
-N = 300
-pts = np.random.uniform(-4, 4, (N, 2))
-trails = np.zeros((N, 8, 2))  # last 8 positions per particle for trail fade
-trails[:] = pts[:, None, :]
-
-scatter = ax.scatter(pts[:, 0], pts[:, 1], s=14, c='#4FC3F7', alpha=0.9, linewidths=0)
-# Trail lines — use LineCollection for efficiency
-from matplotlib.collections import LineCollection
-trail_lines = LineCollection([], colors='#4FC3F7', linewidths=1.2, alpha=0.4)
-ax.add_collection(trail_lines)
-
-DT = 0.08
-for frame_idx in range({frames}):
-    # Step particles along the field
-    vx = fu(pts); vy = fv(pts)
-    pts += np.stack([vx, vy], axis=1) * DT
-    # Respawn particles that left the box
-    out = (np.abs(pts[:, 0]) > 4.2) | (np.abs(pts[:, 1]) > 4.2)
-    pts[out] = np.random.uniform(-4, 4, (out.sum(), 2))
-    # Shift trails
-    trails = np.roll(trails, -1, axis=1); trails[:, -1, :] = pts
-    scatter.set_offsets(pts)
-    trail_lines.set_segments(trails)
-    fig.savefig(...)
+g = np.linspace(-1.5,1.5,8)  # 8x8x8 grid max — more = visual mush
+Xg,Yg,Zg = np.meshgrid(g,g,g)
+# Example: dipole field
+r2 = Xg**2+Yg**2+Zg**2+0.1
+U = 3*Xg*Zg/r2**2.5; V = 3*Yg*Zg/r2**2.5; W = (3*Zg**2-r2)/r2**2.5
+ax.quiver(Xg,Yg,Zg,U,V,W, length=0.25, normalize=True, color=BLUE, alpha=0.6)
+# Animate by rotating camera, not by re-quivering (re-quiver is slow)
+for i in range(N_FRAMES):
+    ax.view_init(elev=20+10*ease(i/(N_FRAMES-1)), azim=-60+120*ease(i/(N_FRAMES-1)))
+    fig.savefig(f"{OUTPUT_DIR}/frame_{i:04d}.png", facecolor=BG, dpi=100)
 ```
 
-### Manifold / Parametric Surface Reveal
-
-A surface that gradually "un-crumples" from a flat disc to its target shape. Great for visualizing non-trivial geometry (Möbius, torus, hyperbolic paraboloid):
-
+### Pattern 5: Surface morph between two functions
 ```python
-# Parametric sphere → torus morph
-U_, V_ = np.meshgrid(np.linspace(0, 2*np.pi, 80), np.linspace(0, np.pi, 40))
-R, r = 2.0, 0.7
-
-for frame_idx in range({frames}):
-    t = ease_in_out_cubic(frame_idx / ({frames} - 1))
-    # Blend: at t=0 a sphere, at t=1 a torus
-    sphere_x = R * np.sin(V_) * np.cos(U_)
-    sphere_y = R * np.sin(V_) * np.sin(U_)
-    sphere_z = R * np.cos(V_)
-    torus_x = (R + r * np.cos(V_ * 2)) * np.cos(U_)
-    torus_y = (R + r * np.cos(V_ * 2)) * np.sin(U_)
-    torus_z = r * np.sin(V_ * 2)
-    Xm = (1 - t) * sphere_x + t * torus_x
-    Ym = (1 - t) * sphere_y + t * torus_y
-    Zm = (1 - t) * sphere_z + t * torus_z
-    # Use ax.clear() ONLY for 3D surfaces since plot_surface can't be updated in place
-    ax.clear()
-    ax.set_facecolor('#0D0D0D'); ax.set_axis_off()
-    ax.plot_surface(Xm, Ym, Zm, cmap='plasma', alpha=0.92, linewidth=0)
-    ax.view_init(elev=20 + 20*t, azim=-40 + 180*t)
-    fig.savefig(...)
+X,Y = np.meshgrid(np.linspace(-3,3,60), np.linspace(-3,3,60))
+Za = np.sin(np.sqrt(X**2+Y**2)); Zb = X**2-Y**2
+# plot_surface must be removed+redrawn for morphs
+surf = ax.plot_surface(X,Y,Za, cmap='plasma', linewidth=0, antialiased=True)
+for i in range(N_FRAMES):
+    a = ease(i/(N_FRAMES-1)); Z = (1-a)*Za + a*Zb
+    surf.remove()
+    surf = ax.plot_surface(X,Y,Z, cmap='plasma', linewidth=0, antialiased=True)
+    ax.view_init(elev=20+20*a, azim=-40+120*ease(i/(N_FRAMES-1)))
+    fig.savefig(f"{OUTPUT_DIR}/frame_{i:04d}.png", facecolor=BG, dpi=100)
 ```
 
-Note: 3D surfaces are the ONE exception to the "never use ax.clear()" rule, because `plot_surface` doesn't support in-place data update. Limit 3D surface scenes to short clips for this reason.
+### Pattern 6: Index ellipsoid morph (birefringence, crystal optics)
+```python
+u_ = np.linspace(0,2*np.pi,60); v_ = np.linspace(0,np.pi,30)
+a0,b0,c0 = 1.0,1.0,1.0   # sphere start
+a1,b1,c1 = 1.6,0.8,1.0   # uniaxial ellipsoid end
+surf = None
+for i in range(N_FRAMES):
+    te = ease(i/(N_FRAMES-1))
+    a,b,c = a0+(a1-a0)*te, b0+(b1-b0)*te, c0+(c1-c0)*te
+    sx = a*np.outer(np.cos(u_),np.sin(v_))
+    sy = b*np.outer(np.sin(u_),np.sin(v_))
+    sz = c*np.outer(np.ones_like(u_),np.cos(v_))
+    if surf: surf.remove()
+    surf = ax.plot_surface(sx,sy,sz, cmap='viridis', alpha=0.75, linewidth=0)
+    ax.view_init(elev=20, azim=-45+90*te)
+    fig.savefig(f"{OUTPUT_DIR}/frame_{i:04d}.png", facecolor=BG, dpi=100)
+```
 
-### Heatmap + Moving Indicator (dual layer)
+### Pattern 7: Glow / Bloom (cheap visual lift for any 3D line)
+```python
+# Layer same curve at increasing widths + decreasing alpha — fakes bloom
+xs, ys, zs = trajectory_x, trajectory_y, trajectory_z
+for lw, a in [(12, 0.06), (7, 0.14), (4, 0.28), (1.5, 1.0)]:
+    ax.plot3D(xs, ys, zs, color=BLUE, lw=lw, alpha=a)
+```
 
-Live data often reads better as a heatmap with a cursor indicating the current value — like a research dashboard:
+## 2D: Only When Geometry Is Truly 2D
+
+Use standard 2D axes only for: waveforms vs time, spectra, 2D field maps (imshow),
+histograms, 2D phase portraits. Setup:
 
 ```python
-# Example: wave equation on a 2D grid
-N = 128
-u = np.zeros((N, N)); v = np.zeros((N, N))
-# Seed a pulse
-u[N//2, N//2] = 5.0
-im = ax.imshow(u, cmap='magma', vmin=-1, vmax=1,
-               extent=[-4, 4, -4, 4], origin='lower', interpolation='bilinear')
-# Add contours for extra richness (computed each frame)
-contour_set = [None]
-# Cursor marker (bright dot tracking peak)
-cursor = ax.scatter([0], [0], s=200, c='#FFD54F',
-                    edgecolors='#FFFFFF', linewidths=2, zorder=5)
-
-C = 0.3  # wave speed
-for frame_idx in range({frames}):
-    # Simple 2D wave update
-    lap = (np.roll(u, 1, 0) + np.roll(u, -1, 0) +
-           np.roll(u, 1, 1) + np.roll(u, -1, 1) - 4*u)
-    v += C * lap
-    u += v * 0.5
-    u *= 0.997  # damping
-    im.set_data(u)
-    # Move cursor to highest-amplitude point
-    iy, ix = np.unravel_index(np.argmax(np.abs(u)), u.shape)
-    cursor.set_offsets([[ix * 8/N - 4, iy * 8/N - 4]])
-    fig.savefig(...)
+fig = plt.figure(figsize=(W/100, H/100), dpi=100, facecolor=BG)
+ax = fig.add_subplot(111)
+ax.set_facecolor(BG); ax.set_axis_off()
+ax.set_xlim(-5,5); ax.set_ylim(-8.5,8.5)
+# Build artists once, update in loop with set_data/set_ydata/set_offsets
 ```
 
-### Multi-Panel Composite (data-dashboard aesthetic)
-
-For topics that have multiple facets (stats + time series + spatial distribution), use a GridSpec layout. Mobile safe only if you keep panels chunky:
+## Text overlays (both 2D and 3D)
 
 ```python
-import matplotlib.gridspec as gridspec
-
-fig = plt.figure(figsize=(9, 16), dpi=120)
-fig.patch.set_facecolor('#0D0D0D')
-gs = gridspec.GridSpec(3, 1, height_ratios=[3, 2, 2], hspace=0.35)
-
-ax_big = fig.add_subplot(gs[0]);  ax_big.set_facecolor('#0D0D0D')
-ax_mid = fig.add_subplot(gs[1]);  ax_mid.set_facecolor('#0D0D0D')
-ax_sm  = fig.add_subplot(gs[2]);  ax_sm.set_facecolor('#0D0D0D')
-
-# Each sub-axis has its own artists — initialize ONCE, update in loop
-# Never call plt.subplots inside the loop
+# Title — placed with fig.text for 3D (axes text gets clipped by 3D view)
+fig.text(0.5, 0.93, "Segment Title", ha='center', color=WARM_WHITE,
+         fontsize=30, fontweight='bold', family='DejaVu Sans')
+fig.text(0.5, 0.88, "subtitle or equation hint", ha='center',
+         color=BLUE, fontsize=20, family='DejaVu Sans')
+# Fade-in label
+label = fig.text(0.10, 0.55, "label text", color=BLUE, fontsize=18,
+                 family='DejaVu Sans', alpha=0.0)
+# In loop:
+label.set_alpha(phase(t, 0.05, 0.15))
 ```
-
-### Glow / Bloom Fake (cheap visual lift)
-
-Matplotlib has no native bloom, but layering the same artist at increasing line widths + decreasing alpha fakes it convincingly:
-
-```python
-# Draw the same curve 4 times — widest+faintest first, crispest last
-for lw, a in [(14, 0.08), (9, 0.14), (5, 0.24), (2, 1.0)]:
-    ax.plot(x, y, color='#4FC3F7', lw=lw, alpha=a, solid_capstyle='round')
-```
-
-Apply this to any "hero" line (main data curve, highlighted trajectory) for immediate premium-look. Works in the frame loop — update each layer via `set_data`.
-
-## Positioning — Safe Coordinate Bounds
-
-For a figure with `xlim=(-5,5)`, `ylim=(-8.5, 8.5)`:
-- Data region: keep within x∈[-4.5,4.5], y∈[-7.5,7.5]
-- Title text: y = 8.0 (top, inside axes)
-- Time/info text: y = -7.8, x = -4.5 (bottom-left)
-- Legend: use `ax.legend(loc='upper right', bbox_to_anchor=(0.98, 0.98))`
-
-Never use `tight_layout()` inside the frame loop — call it once before the loop if needed.
-
-## Choosing the Right Pattern
-
-Pick the simulation pattern that actually SERVES the concept — don't default to particles for every topic. Good choices:
-
-| Topic shape | Pattern |
-|-------------|---------|
-| "Something flows / circulates" | Flow Field + Tracer Particles |
-| "Shape A becomes shape B" | Manifold / Parametric Morph |
-| "Wave or propagation on a medium" | Heatmap + Moving Indicator |
-| "Compare multiple angles of one thing" | Multi-Panel Composite |
-| "A single trajectory with dramatic motion" | Particle + Glow layering |
-| "Pattern emerges from simple rules" | Vectorized cellular update + imshow |
-| "Distribution shifts over time" | Animated histogram / density curve |
-
-Avoid: a lone scattered cloud of dots floating aimlessly. Always give motion a REASON (field, gradient, rule, interaction).
-
-## The "Not AI Slop" Checklist
-
-Before submitting, verify:
-1. **Motion has causation** — every moving thing is moving because of a rule, field, or interaction, not just a sine wave on position.
-2. **At least one element uses glow layering** for visual punch.
-3. **Easing is applied** — no raw linear interpolation on any transform.
-4. **Color is restricted** — 2-3 accent colors max per scene, everything else is greyscale background.
-5. **One focal point per frame** — the viewer's eye should know exactly where to look.
-6. **Data is real or physically plausible** — not hand-waved constants picked for prettiness.
-
-## Reference Files
-
-- `references/simulations.md` — Particle gravity, orbital mechanics, fluid flow, wave PDE patterns
 
 CRITICAL DYNAMIC REQUIREMENTS:
 - Target Duration: {duration} seconds
 - Exact frames required: {frames}
 - Description: {description}
 
-GENERATE ONLY PYTHON CODE. Be concise — use loops, helper functions, and avoid repeating similar code blocks. No markdown, no explanation:
+GENERATE ONLY PYTHON CODE. No markdown, no explanation. Use the patterns above directly.
 """
 
 

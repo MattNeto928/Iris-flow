@@ -1,8 +1,14 @@
 """
 Batch Worker Entrypoint - Routes by JOB_TYPE env var.
 
-JOB_TYPE values: prep, visual, transition, concatenate, postprocess
+JOB_TYPE values: prep, visual, concatenate, postprocess
 All jobs read inputs from S3 and write outputs to S3.
+
+Segment engines (3 total):
+  matplotlib  → PysimService   (physics sims, 3D geometry, particle clouds)
+  manim       → ManimService   (equations, LaTeX derivations, ThreeDScene)
+  plotly      → PlotlyService  (continuous 3D surfaces, isosurfaces)
+  title_card  → inline FFmpeg  (2-3s dark card, no code generation)
 """
 
 import os
@@ -38,25 +44,13 @@ for d in [AUDIO_DIR, VIDEO_DIR, COMBINED_DIR]:
 
 
 # ============================================================
-# Service registry — maps segment type to (module, class_name)
+# Service registry — 3 engines + title_card (inline, no service)
 # ============================================================
 SERVICE_MAP = {
-    "pysim": ("src.services.pysim_service", "PysimService"),
-    "mesa": ("src.services.pysim_service", "PysimService"),
-    "pymunk": ("src.services.pysim_service", "PysimService"),
-    "manim": ("src.services.manim_service", "ManimService"),
-    "animation": ("src.services.veo_service", "VeoService"),
-    "simpy": ("src.services.simpy_service", "SimpyService"),
-    "plotly": ("src.services.plotly_service", "PlotlyService"),
-    "networkx": ("src.services.networkx_service", "NetworkxService"),
-    "audio": ("src.services.audio_service", "AudioService"),
-    "stats": ("src.services.stats_service", "StatsService"),
-    "fractal": ("src.services.fractal_service", "FractalService"),
-    "geo": ("src.services.geo_service", "GeoService"),
-    "chem": ("src.services.chem_service", "ChemService"),
-    "astro": ("src.services.astro_service", "AstroService"),
-    "grok": ("src.services.grok_service", "GrokService"),
-    "remotion": ("src.services.remotion_service", "RemotionService"),
+    "matplotlib": ("src.services.pysim_service", "PysimService"),
+    "manim":      ("src.services.manim_service",  "ManimService"),
+    "plotly":     ("src.services.plotly_service", "PlotlyService"),
+    # "title_card" is handled inline in job_visual — no service needed
 }
 
 
@@ -65,11 +59,76 @@ def _get_service(segment_type: str):
     import importlib
     entry = SERVICE_MAP.get(segment_type)
     if not entry:
-        raise ValueError(f"Unknown segment type: {segment_type}")
+        raise ValueError(
+            f"Unknown segment type: '{segment_type}'. "
+            f"Valid types: {list(SERVICE_MAP.keys())} + title_card (inline)"
+        )
     module_path, class_name = entry
     mod = importlib.import_module(module_path)
     cls = getattr(mod, class_name)
     return cls()
+
+
+async def _render_title_card(text: str, duration: float, video_id: str, segment_index: int) -> str:
+    """
+    Render a title card: centered concept label on #0D0D0D background.
+    Uses FFmpeg drawtext — no Claude API call, no script generation.
+
+    Args:
+        text: The concept name to display (from segment.description).
+        duration: Card duration in seconds (typically 2-3s).
+    Returns:
+        Path to rendered MP4.
+    """
+    output_path = str(VIDEO_DIR / f"titlecard_{video_id}_{segment_index:02d}.mp4")
+
+    # Escape text for FFmpeg drawtext (single quotes, colons, backslashes)
+    safe_text = text.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+
+    # Prefer Roboto Light; fall back to DejaVu if not present
+    font_candidates = [
+        "/app/fonts/Roboto-Light.ttf",
+        "/usr/share/fonts/truetype/roboto/Roboto-Light.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    font_path = next((p for p in font_candidates if Path(p).exists()), None)
+    fontfile_arg = f":fontfile={font_path}" if font_path else ""
+
+    drawtext = (
+        f"drawtext=text='{safe_text}'"
+        f"{fontfile_arg}"
+        f":fontsize=52"
+        f":fontcolor=#F5F5F5"
+        f":x=(w-text_w)/2"
+        f":y=(h-text_h)/2"
+        f":line_spacing=12"
+    )
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-t", str(duration),
+        "-f", "lavfi",
+        "-i", "color=c=0x0D0D0D:s=1080x1920:r=30",
+        "-vf", drawtext,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-preset", "fast",
+        "-crf", "23",
+        output_path,
+    ]
+
+    logger.info(f"[{video_id}] Rendering title card: '{text}' ({duration}s)")
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        raise RuntimeError(f"Title card FFmpeg failed: {stderr.decode()}")
+
+    return output_path
 
 
 def _s3_key_prefix(video_id: str) -> str:
@@ -240,46 +299,37 @@ async def job_visual():
     duration = seg['duration']
     seg_type = seg['type']
     description = seg['description']
-    metadata = seg.get('metadata', {})
 
-    # Prefix description for mesa/pymunk variants
-    if seg_type == "mesa":
-        description = f"Agent-based simulation using Mesa library: {description}"
-    elif seg_type == "pymunk":
-        description = f"2D physics simulation using Pymunk library: {description}"
+    # Title cards are rendered inline — no Claude API call needed
+    if seg_type == "title_card":
+        video_path = await _render_title_card(description, duration, video_id, segment_index)
+    else:
+        # Retry loop with previous_error feedback for generative engines
+        max_retries = 3
+        last_error = None
+        video_path = None
 
-    # Retry loop with previous_error feedback
-    max_retries = 3
-    last_error = None
-    video_path = None
-
-    for attempt in range(max_retries):
-        try:
-            service = _get_service(seg_type)
-
-            if seg_type in ("animation", "grok"):
-                video_path = await service.generate(
-                    description=description,
-                    duration=duration,
-                    metadata=metadata,
-                )
-            else:
+        for attempt in range(max_retries):
+            try:
+                service = _get_service(seg_type)
                 video_path = await service.generate(
                     description=description,
                     duration=duration,
                     previous_error=last_error if attempt > 0 else None,
                 )
 
-            if not video_path:
-                raise RuntimeError(f"Visual generation returned None for {seg_type}")
-            break
+                if not video_path:
+                    raise RuntimeError(f"Visual generation returned None for {seg_type}")
+                break
 
-        except Exception as e:
-            last_error = str(e)
-            if attempt < max_retries - 1:
-                logger.warning(f"[{video_id}] Visual seg {segment_index} attempt {attempt+1} failed: {e}")
-            else:
-                raise
+            except Exception as e:
+                last_error = str(e)
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"[{video_id}] Visual seg {segment_index} attempt {attempt+1} failed: {e}"
+                    )
+                else:
+                    raise
 
     # Match duration
     video_path = match_duration(video_path, duration)
@@ -298,63 +348,6 @@ async def job_visual():
     _upload(lastframe_path, f"{prefix}/segments/seg_{segment_index:02d}_lastframe.png")
 
     logger.info(f"[{video_id}] Visual segment {segment_index} complete")
-
-
-# ============================================================
-# JOB: transition
-# ============================================================
-async def job_transition():
-    """
-    Render a single transition segment.
-    Downloads manifest + audio + previous segment's lastframe.
-    Delegates composition to video_utils.compose_transition (single source of truth).
-    """
-    from src.video_utils import compose_transition
-
-    video_id = os.environ['VIDEO_ID']
-    segment_index = int(os.environ['SEGMENT_INDEX'])
-
-    manifest = _load_manifest(video_id)
-    seg = manifest['segments'][segment_index]
-    prefix = _s3_key_prefix(video_id)
-
-    # Download audio (required for transitions)
-    audio_path = None
-    if seg.get('audio_s3_key'):
-        audio_path = str(AUDIO_DIR / f"seg_{segment_index:02d}.wav")
-        _download(seg['audio_s3_key'], audio_path)
-
-    if not audio_path:
-        raise RuntimeError("Transition segment must have voiceover audio")
-
-    duration = seg['duration']
-
-    # Download previous segment's lastframe
-    last_frame_path = None
-    for j in range(segment_index - 1, -1, -1):
-        prev_seg = manifest['segments'][j]
-        if prev_seg['type'] != 'transition':
-            lf_key = f"{prefix}/segments/seg_{j:02d}_lastframe.png"
-            lf_local = str(OUTPUT_DIR / f"prev_lastframe_{video_id}_{segment_index}.png")
-            try:
-                _download(lf_key, lf_local)
-                last_frame_path = lf_local
-            except Exception as e:
-                logger.warning(f"[{video_id}] Could not download lastframe for seg {j}: {e}")
-            break
-
-    # Generate black frame if no last frame available
-    if not last_frame_path:
-        from PIL import Image
-        import numpy as np
-        img = Image.fromarray(np.zeros((1920, 1080, 3), dtype=np.uint8))
-        last_frame_path = str(OUTPUT_DIR / f"black_frame_{video_id}_{segment_index}.png")
-        img.save(last_frame_path)
-
-    output_path = compose_transition(last_frame_path, audio_path, duration, video_id, segment_index)
-
-    _upload(output_path, f"{prefix}/segments/seg_{segment_index:02d}.mp4")
-    logger.info(f"[{video_id}] Transition segment {segment_index} complete")
 
 
 # ============================================================
@@ -501,7 +494,6 @@ async def job_postprocess():
 JOB_DISPATCH = {
     "prep": job_prep,
     "visual": job_visual,
-    "transition": job_transition,
     "concatenate": job_concatenate,
     "postprocess": job_postprocess,
 }
