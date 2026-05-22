@@ -32,13 +32,13 @@ class MetricoolClient:
 
         # Trending-audio configuration.
         #
-        # TikTok: Metricool exposes `tiktokData.autoAddMusic`. When True, the
-        # Metricool backend attaches a random track from TikTok's Top-100
-        # trending commercial library at publish time. Requires a Business
-        # TikTok account; personal accounts get random snippets at best.
-        # Default ON because the whole point is replacing our baked-in music.
+        # TikTok: `tiktokData.autoAddMusic` is REJECTED by Metricool for video
+        # posts (HTTP 400: "Cannot enable autoAddMusic in posts with videos.
+        # Only applies for images and carousels."). Since our pipeline only
+        # publishes videos, the field is omitted unless explicitly forced via
+        # env. The default is therefore False / unset.
         self.tiktok_auto_add_music = os.getenv(
-            "METRICOOL_TIKTOK_AUTO_ADD_MUSIC", "true"
+            "METRICOOL_TIKTOK_AUTO_ADD_MUSIC", "false"
         ).strip().lower() in ("1", "true", "yes", "on")
 
         # Instagram: Meta's Graph API has NO field for selecting a trending
@@ -161,16 +161,21 @@ class MetricoolClient:
                 # Top-level autoPublish must also be false for IG manual flow.
                 post_data["autoPublish"] = False
         if "tiktok" in networks:
-            post_data["tiktokData"] = {
+            tiktok_data: dict = {
                 "disableComment": False,
                 "disableDuet": False,
                 "disableStitch": False,
                 "privacyOption": "PUBLIC_TO_EVERYONE",
                 "title": tiktok_title,
-                # `autoAddMusic`: Metricool picks a track from TikTok's
-                # Top-100 trending commercial library at publish time.
-                "autoAddMusic": self.tiktok_auto_add_music,
             }
+            # `autoAddMusic`: Metricool's API only accepts this for IMAGE and
+            # CAROUSEL posts. For VIDEO posts (our entire pipeline) Metricool
+            # rejects the payload with HTTP 400. Only include the field if
+            # the operator explicitly enables it via env (intended for future
+            # image/carousel support).
+            if self.tiktok_auto_add_music:
+                tiktok_data["autoAddMusic"] = True
+            post_data["tiktokData"] = tiktok_data
         if "youtube" in networks:
             post_data["youtubeData"] = {
                 "title": youtube_title,
