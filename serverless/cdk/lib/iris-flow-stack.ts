@@ -248,7 +248,7 @@ export class IrisFlowStack extends cdk.Stack {
       AWS_REGION: this.region,
       // Audio attachment knobs read by serverless/src/metricool_client.py
       METRICOOL_DEFAULT_AUDIO_NAME: 'Scientific-Nipsey',
-      METRICOOL_TIKTOK_AUTO_ADD_MUSIC: 'true',
+      METRICOOL_TIKTOK_AUTO_ADD_MUSIC: 'false',  // Metricool rejects this for video posts
       METRICOOL_SHOW_REEL_ON_FEED: 'true',
       METRICOOL_INSTAGRAM_MANUAL_FOR_AUDIO: 'false',
     };
