@@ -441,10 +441,12 @@ async def job_postprocess():
         concat_output = json.load(f)
     video_url = concat_output['video_url']
 
-    # Generate caption
-    logger.info(f"[{video_id}] Generating caption...")
-    caption = await generate_caption(prompt)
-    youtube_title = prompt[:97] + '...' if len(prompt) > 100 else prompt
+    # Generate caption + title (single API call, returns {title, caption})
+    logger.info(f"[{video_id}] Generating caption + title...")
+    cap_data = await generate_caption(prompt)
+    caption = cap_data["caption"]
+    youtube_title = cap_data["title"][:97]
+    logger.info(f"[{video_id}] title='{youtube_title}'  caption_first40='{caption[:40]}'")
 
     # Schedule to Metricool
     dry_run = os.environ.get('DRY_RUN', 'false').lower() == 'true'

@@ -178,16 +178,37 @@ User's prompt:
 """
 
 
-CAPTION_PROMPT = """Write a social media caption for a short-form STEM educational video about: {topic}
+CAPTION_PROMPT = """You are writing the title and caption for a TikTok / Instagram Reel / YouTube Short about this topic:
 
-Requirements:
-- 2-3 sentences max
-- Conversational but substantive — treat the viewer as intelligent
-- End with 3-5 relevant hashtags
-- No emojis beyond the hashtags section
-- Focus on the surprising or counterintuitive aspect of the topic
+{topic}
 
-Return only the caption text."""
+Write the way a smart human creator writes, not the way an AI writes.
+
+HARD RULES (violating any one of these makes the post unusable):
+- NO em dashes ( — ) anywhere. Use commas or periods.
+- NO en dashes ( – ). Use a regular hyphen ( - ) only when joining words like "well-known".
+- NO "dive into", "fascinating", "let's explore", "uncover", "unpack", "delve", "journey", "buckle up", "mind-blowing", "wild".
+- NO "did you know" / "ever wondered" openers.
+- NO meta references to the video itself ("in this video", "today we look at").
+- NO mention of "Iris Flow", "AI", or any tool/brand name.
+- NO ellipses ( ... ).
+- NO emojis anywhere in the title or caption text. Hashtags only.
+
+TITLE (used as YouTube + TikTok title):
+- Under 80 characters.
+- Concrete, specific noun phrase. Name the phenomenon, person, or number.
+- No clickbait fluff like "you wont believe" or "shocking".
+- Examples of the right tone: "Why bees make hexagons", "Bayes rule, decoded in 60 seconds", "Lorenz attractor: order from a butterfly".
+
+CAPTION:
+- 1-2 short sentences, under 220 chars total before hashtags.
+- Open with a concrete claim or surprising fact about the actual topic. Mention a number, a name, or a specific phenomenon. Be SPECIFIC.
+- The second sentence (if any) is the "but here's the twist" line, the part that makes a viewer want to watch.
+- Tone: a sharp graduate student texting a friend who is curious about science. Confident, no filler.
+- Then a blank line, then 4-6 hashtags. Hashtags should be specific to the topic (not just generic #science #stem). Include a couple broad ones at the end.
+
+OUTPUT FORMAT (must parse as JSON, no markdown fences, no commentary):
+{{"title": "...", "caption": "...\\n\\n#tag1 #tag2 #tag3 #tag4"}}"""
 
 
 async def generate_segments_from_prompt(
@@ -254,8 +275,23 @@ async def generate_segments_from_prompt(
     return segments, full_prompt, model
 
 
-async def generate_caption(topic: str) -> str:
-    """Generate a social media caption for the video."""
+def _strip_em_dashes(text: str) -> str:
+    """Belt-and-braces: remove em/en dashes even if the model slips."""
+    return (
+        text.replace("—", ", ")
+            .replace("–", ", ")
+            .replace("...", ".")
+            .replace("…", ".")
+    )
+
+
+async def generate_caption(topic: str) -> dict:
+    """Generate {title, caption} for the video as a dict.
+
+    Backwards-compat shim: callers that expected a plain string can still
+    use `(await generate_caption(...))['caption']`.
+    """
+    import json as _json
     prompt = CAPTION_PROMPT.format(topic=topic)
     model = "claude-opus-4-7"
     message = client.messages.create(
@@ -263,4 +299,21 @@ async def generate_caption(topic: str) -> str:
         max_tokens=512,
         messages=[{"role": "user", "content": prompt}]
     )
-    return message.content[0].text.strip()
+    raw = message.content[0].text.strip()
+    # Sometimes Claude wraps in markdown fences; strip them.
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.startswith("json\n"):
+            raw = raw[5:]
+        raw = raw.strip()
+    try:
+        data = _json.loads(raw)
+        title = _strip_em_dashes(data.get("title", "").strip())
+        caption = _strip_em_dashes(data.get("caption", "").strip())
+    except Exception:
+        # Fallback: treat entire response as caption, derive title heuristically.
+        cleaned = _strip_em_dashes(raw)
+        caption = cleaned
+        # Take first sentence (up to 80 chars) as title.
+        title = cleaned.split(".")[0].strip()[:80]
+    return {"title": title, "caption": caption}
