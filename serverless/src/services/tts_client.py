@@ -340,52 +340,106 @@ async def generate_voiceover(
         f"[TTS] Gemini {MODEL_ID} | voice={resolved_voice} | {len(prepared)} chars"
     )
 
-    pcm = None
-    last_err = None
-    for attempt in range(5):
-        try:
-            pcm = await _call_gemini_tts(prepared, resolved_voice)
-            break
-        except TTSRateLimitError as e:
-            last_err = e
-            wait = min(60.0, (2 ** attempt) * 2 + random.uniform(0, 2))
-            logger.warning(
-                f"[TTS] 429/rate-limit (try {attempt + 1}/5) — retry in {wait:.1f}s"
-            )
-            await asyncio.sleep(wait)
-        except TTSTextResponseError as e:
-            last_err = e
-            wait = min(30.0, (2 ** attempt) + random.uniform(0, 1.5))
-            logger.warning(
-                f"[TTS] text-instead-of-audio (try {attempt + 1}/5) — retry in {wait:.1f}s: {e}"
-            )
-            await asyncio.sleep(wait)
-
-    if pcm is None:
-        raise RuntimeError(f"TTS failed after 5 attempts: {last_err}")
-
-    # Write raw WAV, then apply atempo + tail pad in a single ffmpeg pass.
-    wav_bytes = _pcm_to_wav(pcm)
-    raw_path = output_path.with_suffix(".raw.wav")
-    raw_path.write_bytes(wav_bytes)
-
-    # Multiply the incoming per-segment speed by the global BASE_ATEMPO, then
-    # clamp to [ATEMPO_MIN, ATEMPO_MAX]. Example: segment speed=1.0 ⇒ 1.08;
-    # speed=1.12 ⇒ 1.15 (clamped); speed=0.96 ⇒ 1.037. This bumps the floor
-    # without losing per-segment variation.
+    # Speed factor applied in post (clamped). Used both for the wav and for the
+    # expected-duration estimate below.
     atempo = max(ATEMPO_MIN, min(ATEMPO_MAX, float(speed) * BASE_ATEMPO))
-    # Filter chain:
-    #   silenceremove — trim leading silence (Algenib sometimes starts with 80-200ms
-    #                   of dead air, especially after stripping dead-air tags).
-    #                   stop_periods=0 means only the leading edge is trimmed.
-    #   atempo        — speed adjustment (clamped to [ATEMPO_MIN, ATEMPO_MAX])
-    #   apad          — add 0.3s tail so the last word doesn't clip at cut point
+
+    # Anomaly guard: Algenib occasionally emits the full line and then several
+    # seconds of dead air, or stalls mid-utterance. Leading/trailing silence is
+    # stripped in _post_process_wav, but an internal gap survives and would leave
+    # the rendered video frozen + silent. Estimate the healthy length from the
+    # script (~14.5 chars/s for Algenib) and re-roll the whole call if the
+    # measured clip runs far longer than that.
+    expected_dur = max(1.0, len(prepared) / 14.5 / atempo)
+    anomaly_ceiling = expected_dur * 1.8 + 4.0
+
+    last_err = None
+    duration = None
+    GEN_ATTEMPTS = 5
+    for gen_attempt in range(GEN_ATTEMPTS):
+        # --- obtain PCM (own retry loop for transient API errors) ---
+        pcm = None
+        for attempt in range(5):
+            try:
+                pcm = await _call_gemini_tts(prepared, resolved_voice)
+                break
+            except TTSRateLimitError as e:
+                last_err = e
+                wait = min(60.0, (2 ** attempt) * 2 + random.uniform(0, 2))
+                logger.warning(
+                    f"[TTS] 429/rate-limit (try {attempt + 1}/5) — retry in {wait:.1f}s"
+                )
+                await asyncio.sleep(wait)
+            except TTSTextResponseError as e:
+                last_err = e
+                wait = min(30.0, (2 ** attempt) + random.uniform(0, 1.5))
+                logger.warning(
+                    f"[TTS] text-instead-of-audio (try {attempt + 1}/5) — retry in {wait:.1f}s: {e}"
+                )
+                await asyncio.sleep(wait)
+
+        if pcm is None:
+            raise RuntimeError(f"TTS failed after 5 attempts: {last_err}")
+
+        # Write raw WAV and measure it BEFORE trimming. The raw length is the
+        # glitch signature: a healthy clip raws at ~expected_dir*atempo seconds,
+        # but when Algenib truncates the script and pads the rest with dead air
+        # (or stalls mid-utterance) the raw runs many seconds longer. We must
+        # decide on the raw length — trimming the tail would otherwise hand back
+        # a clean-but-incomplete clip (speech cut off early), which is worse than
+        # a re-roll.
+        wav_bytes = _pcm_to_wav(pcm)
+        raw_path = output_path.with_suffix(".raw.wav")
+        raw_path.write_bytes(wav_bytes)
+        raw_duration = await get_audio_duration(str(raw_path))
+
+        is_last = gen_attempt == GEN_ATTEMPTS - 1
+        if raw_duration > anomaly_ceiling and not is_last:
+            logger.warning(
+                f"[TTS] raw clip {raw_duration:.1f}s >> expected ~{expected_dur:.1f}s "
+                f"(ceiling {anomaly_ceiling:.1f}s) — Algenib likely truncated the "
+                f"script + padded dead air; re-rolling ({gen_attempt + 1}/{GEN_ATTEMPTS})"
+            )
+            raw_path.unlink(missing_ok=True)
+            continue
+
+        # Healthy (or final attempt): trim leading/trailing silence + atempo.
+        _post_process_wav(raw_path, output_path, atempo)
+        duration = await get_audio_duration(str(output_path))
+        if raw_duration > anomaly_ceiling:
+            logger.warning(
+                f"[TTS] raw clip still {raw_duration:.1f}s after {GEN_ATTEMPTS} tries "
+                f"— accepting trimmed {duration:.1f}s clip"
+            )
+        break
+
+    logger.info(f"[TTS] Done: {output_path} ({duration:.2f}s)")
+
+    return str(output_path), duration
+
+
+def _post_process_wav(raw_path: Path, output_path: Path, atempo: float) -> None:
+    """Trim leading AND trailing silence, then apply tempo, into output_path.
+
+    Filter chain (the areverse sandwich trims both ends without touching the
+    pauses *between* sentences):
+      1. silenceremove        — drop leading dead air (Algenib often starts with
+                                80-200ms of silence, worse after tag-stripping).
+      2. areverse             — flip so the original tail is now the head.
+      3. silenceremove        — drop the (now-leading) original trailing silence,
+                                keeping 0.30s so the last word never clips. This
+                                is the fix for Gemini's occasional multi-second
+                                dead-air tail that otherwise inflates the clip
+                                length and leaves the video frozen + silent.
+      4. areverse             — flip back to forward order.
+      5. atempo               — speed (clamped to [ATEMPO_MIN, ATEMPO_MAX]).
+    """
     af_chain = (
-        "silenceremove=start_periods=1"
-        ":start_silence=0.08"
-        ":start_threshold=-50dB"
+        "silenceremove=start_periods=1:start_silence=0.08:start_threshold=-50dB"
+        ",areverse"
+        ",silenceremove=start_periods=1:start_silence=0.30:start_threshold=-50dB"
+        ",areverse"
         f",atempo={atempo:.3f}"
-        ",apad=pad_dur=0.3"
     )
     try:
         result = subprocess.run(
@@ -407,13 +461,8 @@ async def generate_voiceover(
         else:
             raw_path.unlink(missing_ok=True)
     except FileNotFoundError:
-        logger.warning("[TTS] ffmpeg not found — using raw WAV without atempo/tail-pad")
+        logger.warning("[TTS] ffmpeg not found — using raw WAV without trim/atempo")
         raw_path.replace(output_path)
-
-    duration = await get_audio_duration(str(output_path))
-    logger.info(f"[TTS] Done: {output_path} ({duration:.2f}s)")
-
-    return str(output_path), duration
 
 
 def _looks_like_legacy_id(voice: str) -> bool:
