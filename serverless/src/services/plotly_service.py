@@ -422,10 +422,10 @@ class PlotlyService:
         
         self._last_prompt = final_prompt
         
-        self._last_model = 'claude-opus-4-7'
+        self._last_model = 'claude-opus-4-8'
         
         message = client.messages.create(
-            model="claude-opus-4-7",
+            model="claude-opus-4-8",
             max_tokens=16384,
             messages=[{"role": "user", "content": final_prompt}]
         )

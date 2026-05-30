@@ -228,7 +228,7 @@ async def generate_segments_from_prompt(
     )
     full_prompt = SEGMENT_GENERATION_PROMPT + prompt + duration_hint
 
-    model = "claude-opus-4-7"
+    model = "claude-opus-4-8"
     message = client.messages.create(
         model=model,
         max_tokens=8192,
@@ -293,7 +293,7 @@ async def generate_caption(topic: str) -> dict:
     """
     import json as _json
     prompt = CAPTION_PROMPT.format(topic=topic)
-    model = "claude-opus-4-7"
+    model = "claude-opus-4-8"
     message = client.messages.create(
         model=model,
         max_tokens=512,
