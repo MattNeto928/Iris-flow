@@ -19,8 +19,13 @@ logger = logging.getLogger(__name__)
 sqs = boto3.client('sqs')
 sfn = boto3.client('stepfunctions')
 
-TOPIC_QUEUE_URL = os.environ['TOPIC_QUEUE_URL']
+# QUEUE_URL / TARGET_DURATION / EXEC_PREFIX generalize this Lambda so the SAME
+# code drives both the STEM pipeline and the story pipeline — only the env differs.
+# TOPIC_QUEUE_URL is kept as a fallback so the original STEM deployment is unchanged.
+TOPIC_QUEUE_URL = os.environ.get('QUEUE_URL') or os.environ['TOPIC_QUEUE_URL']
 STATE_MACHINE_ARN = os.environ['STATE_MACHINE_ARN']
+TARGET_DURATION = int(os.environ.get('TARGET_DURATION', '90'))
+EXEC_PREFIX = os.environ.get('EXEC_PREFIX', 'iris-flow')
 
 # Random scheduling window: post anywhere from MIN_DELAY_MIN to MAX_DELAY_MIN
 # minutes from now. With EventBridge firing 4× daily, this spreads posts
@@ -67,14 +72,14 @@ def handler(event, context):
 
     execution_input = {
         'video_id': video_id,
-        'topic': topic,                  # empty string → prep job uses TopicManager
-        'target_duration': 90,           # seconds
+        'topic': topic,                  # empty string → prep job uses its TopicManager
+        'target_duration': TARGET_DURATION,
         'schedule_time': schedule_time,  # ISO-8601 UTC, passed to postprocess
     }
 
     sfn.start_execution(
         stateMachineArn=STATE_MACHINE_ARN,
-        name=f'iris-flow-{video_id}',
+        name=f'{EXEC_PREFIX}-{video_id}',
         input=json.dumps(execution_input),
     )
 

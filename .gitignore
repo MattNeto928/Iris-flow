@@ -28,3 +28,16 @@ output/
 !tsconfig.json
 !cdk.json
 !cdk.context.json
+
+# Local dev secrets and environments
+.env.local
+.env.*.local
+
+# CDK synth output
+serverless/cdk/cdk.out/
+
+# Local dev workspace (30GB of rendered videos + its own .env)
+iris-local/
+
+# Music library (large media)
+*.mp3

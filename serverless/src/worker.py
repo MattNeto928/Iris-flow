@@ -33,13 +33,20 @@ logger = logging.getLogger(__name__)
 s3 = boto3.client('s3', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
 VIDEO_BUCKET = os.environ.get('VIDEO_BUCKET_NAME')
 
+# PIPELINE selects the content style. "stem" (default) = manim/matplotlib/plotly
+# educational segments. "story" = gemini-3.1-flash-image illustrated origin stories.
+# Set per Batch job definition in CDK; prep/visual branch on it, concat/postprocess
+# are identical for both pipelines.
+PIPELINE = os.environ.get('PIPELINE', 'stem')
+
 # Local working directories
 OUTPUT_DIR = Path("/app/output")
 AUDIO_DIR = OUTPUT_DIR / "audio"
 VIDEO_DIR = OUTPUT_DIR / "videos"
 COMBINED_DIR = OUTPUT_DIR / "combined"
+IMAGE_DIR = OUTPUT_DIR / "images"
 
-for d in [AUDIO_DIR, VIDEO_DIR, COMBINED_DIR]:
+for d in [AUDIO_DIR, VIDEO_DIR, COMBINED_DIR, IMAGE_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 
@@ -171,6 +178,9 @@ async def job_prep():
     Generate segments via Claude + TTS for all segments.
     Uploads audio files + manifest.json to S3.
     """
+    if PIPELINE == 'story':
+        return await job_prep_story()
+
     video_id = os.environ['VIDEO_ID']
     topic = os.environ.get('TOPIC')  # JSON string or None
     target_duration = int(os.environ.get('TARGET_DURATION', '90'))
@@ -279,6 +289,9 @@ async def job_visual():
     Downloads manifest + audio, renders visual, combines, extracts last frame.
     Uploads segment.mp4 + lastframe.png.
     """
+    if PIPELINE == 'story':
+        return await job_visual_story()
+
     from src.video_utils import (
         get_duration, match_duration, combine_audio_video, extract_last_frame
     )
@@ -348,6 +361,148 @@ async def job_visual():
     _upload(lastframe_path, f"{prefix}/segments/seg_{segment_index:02d}_lastframe.png")
 
     logger.info(f"[{video_id}] Visual segment {segment_index} complete")
+
+
+# ============================================================
+# JOB: prep (story pipeline)
+# ============================================================
+async def job_prep_story():
+    """
+    Story pipeline prep: write the origin-story script (Claude), synthesize all
+    voiceovers (same TTS as STEM), and SEQUENTIALLY render one illustration per
+    beat with gemini-3.1-flash-image — each frame chained off the previous one for
+    visual continuity. Uploads audio + images + manifest.
+
+    Images are rendered here (not in the parallel visual Map) precisely BECAUSE the
+    continuity chain is sequential: frame N needs frame N-1 as its reference. The
+    visual Map then only composes clips (ffmpeg), so it stays fully parallel.
+    """
+    video_id = os.environ['VIDEO_ID']
+    topic = os.environ.get('TOPIC')  # JSON string or empty
+    target_duration = int(os.environ.get('TARGET_DURATION', '75'))
+
+    from src.services.story_client import generate_story
+    from src.services.image_service import ImageService
+    from src.services.tts_client import generate_voiceover
+    from src.story_topic_manager import StoryTopicManager
+
+    if not topic:
+        tm = StoryTopicManager()
+        topic_data = await tm.get_topic()
+        prompt = topic_data['prompt']
+        category = topic_data.get('category', 'origin_story')
+    else:
+        topic_data = json.loads(topic)
+        prompt = topic_data.get('prompt', topic_data.get('topic', ''))
+        category = topic_data.get('category', 'origin_story')
+
+    logger.info(f"[{video_id}] Generating story script: {prompt[:80]}")
+    style_anchor, beats, _model = await generate_story(prompt, target_duration=target_duration)
+    logger.info(f"[{video_id}] Story → {len(beats)} beats")
+
+    # --- TTS for all beats (same mechanism + concurrency floor as STEM) ---
+    tts_concurrency = int(os.environ.get('TTS_CONCURRENCY', '2'))
+    tts_sem = asyncio.Semaphore(tts_concurrency)
+
+    async def gen_tts(beat):
+        async with tts_sem:
+            return await generate_voiceover(
+                text=beat.voiceover.text,
+                voice=beat.voiceover.voice,
+                speed=beat.voiceover.speed,
+            )
+
+    logger.info(f"[{video_id}] Synthesizing {len(beats)} voiceovers...")
+    tts_results = await asyncio.gather(*[gen_tts(b) for b in beats])
+
+    # --- Sequential image generation with reference chaining ---
+    logger.info(f"[{video_id}] Rendering {len(beats)} illustrations (chained for continuity)...")
+    img_service = ImageService()
+    image_paths = []
+    prev_image = None
+    for i, beat in enumerate(beats):
+        out = str(IMAGE_DIR / f"beat_{i:02d}.png")
+        await img_service.generate(
+            image_prompt=beat.image_prompt,
+            style_anchor=style_anchor,
+            out_path=out,
+            reference_image_path=prev_image,
+        )
+        image_paths.append(out)
+        prev_image = out
+
+    # --- Upload + manifest ---
+    prefix = _s3_key_prefix(video_id)
+    manifest_segments = []
+    for i, (beat, (audio_path, duration)) in enumerate(zip(beats, tts_results)):
+        audio_s3_key = f"{prefix}/audio/seg_{i:02d}.wav"
+        _upload(audio_path, audio_s3_key)
+        image_s3_key = f"{prefix}/images/beat_{i:02d}.png"
+        _upload(image_paths[i], image_s3_key)
+        manifest_segments.append({
+            "index": i,
+            "type": "story",
+            "title": beat.title,
+            "description": beat.image_prompt,
+            "duration": duration,
+            "audio_s3_key": audio_s3_key,
+            "image_s3_key": image_s3_key,
+            "voiceover": {
+                "text": beat.voiceover.text,
+                "voice": beat.voiceover.voice,
+                "speed": beat.voiceover.speed,
+            },
+            "metadata": {},
+        })
+
+    manifest = {
+        "video_id": video_id,
+        "pipeline": "story",
+        "prompt": prompt,
+        "category": category,
+        "style_anchor": style_anchor,
+        "target_duration": target_duration,
+        "segments": manifest_segments,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    manifest_path = str(OUTPUT_DIR / "manifest.json")
+    with open(manifest_path, 'w') as f:
+        json.dump(manifest, f, indent=2)
+    _upload(manifest_path, f"{prefix}/manifest.json")
+    logger.info(f"[{video_id}] Story prep complete: {len(manifest_segments)} beats")
+
+
+# ============================================================
+# JOB: visual (story pipeline)
+# ============================================================
+async def job_visual_story():
+    """
+    Compose one story beat into a clip: download its pre-rendered illustration +
+    voiceover, run the eased Ken Burns + audio composer, upload seg.mp4. No code
+    generation and no API calls — pure ffmpeg, so the Map fans out fast.
+
+    Unlike the STEM visual job we do NOT extract a last frame: there are no
+    transition segments to chain off it, so it would be dead weight (and an
+    avoidable failure mode). concatenate only consumes seg_NN.mp4.
+    """
+    from src.video_utils import compose_story_clip
+
+    video_id = os.environ['VIDEO_ID']
+    segment_index = int(os.environ['SEGMENT_INDEX'])
+
+    manifest = _load_manifest(video_id)
+    seg = manifest['segments'][segment_index]
+    prefix = _s3_key_prefix(video_id)
+
+    audio_path = str(AUDIO_DIR / f"seg_{segment_index:02d}.wav")
+    _download(seg['audio_s3_key'], audio_path)
+
+    image_path = str(IMAGE_DIR / f"beat_{segment_index:02d}.png")
+    _download(seg['image_s3_key'], image_path)
+
+    clip_path = compose_story_clip(image_path, audio_path, video_id, segment_index)
+    _upload(clip_path, f"{prefix}/segments/seg_{segment_index:02d}.mp4")
+    logger.info(f"[{video_id}] Story beat {segment_index} composed")
 
 
 # ============================================================

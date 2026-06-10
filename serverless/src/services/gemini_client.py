@@ -228,14 +228,14 @@ async def generate_segments_from_prompt(
     )
     full_prompt = SEGMENT_GENERATION_PROMPT + prompt + duration_hint
 
-    model = "claude-opus-4-8"
+    model = "claude-fable-5"
     message = client.messages.create(
         model=model,
-        max_tokens=8192,
+        max_tokens=16384,
         messages=[{"role": "user", "content": full_prompt}]
     )
 
-    response_text = message.content[0].text
+    response_text = "".join(_b.text for _b in message.content if getattr(_b,"type",None)=="text")
 
     # Extract JSON
     try:
@@ -293,13 +293,13 @@ async def generate_caption(topic: str) -> dict:
     """
     import json as _json
     prompt = CAPTION_PROMPT.format(topic=topic)
-    model = "claude-opus-4-8"
+    model = "claude-fable-5"
     message = client.messages.create(
         model=model,
-        max_tokens=512,
+        max_tokens=2048,
         messages=[{"role": "user", "content": prompt}]
     )
-    raw = message.content[0].text.strip()
+    raw = "".join(_b.text for _b in message.content if getattr(_b,"type",None)=="text").strip()
     # Sometimes Claude wraps in markdown fences; strip them.
     if raw.startswith("```"):
         raw = raw.strip("`")

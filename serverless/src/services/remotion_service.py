@@ -123,7 +123,7 @@ export const Root: React.FC = () => {
         prompt = REMOTION_PROMPT.format(skill_content=skill_content).replace("{description}", description).replace("{duration}", str(duration))
         
         self._last_prompt = prompt
-        self._last_model = 'claude-opus-4-8'
+        self._last_model = 'claude-fable-5'
 
         logger.info(f"[Remotion] Requesting TSX from Claude...")
         message = client.messages.create(
@@ -131,7 +131,7 @@ export const Root: React.FC = () => {
             # TSX/JSX is verbose; 8k was hitting the ceiling on moderately complex
             # scenes (causing "Expected identifier but found end of file" esbuild
             # errors at ~line 815). 16k matches the other code-gen services.
-            max_tokens=16000,
+            max_tokens=16384,
             messages=[{"role": "user", "content": prompt}]
         )
 
@@ -145,7 +145,7 @@ export const Root: React.FC = () => {
                 "animation or break it into multiple segments."
             )
 
-        code = message.content[0].text
+        code = "".join(_b.text for _b in message.content if getattr(_b,"type",None)=="text")
         if "```tsx" in code:
             code = code.split("```tsx")[1].split("```")[0].strip()
         elif "```typescript" in code:

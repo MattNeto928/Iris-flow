@@ -125,12 +125,12 @@ Return ONLY the JSON object, no markdown."""
         try:
             # Opus 4.7 deprecated `temperature` — uses adaptive thinking instead.
             response = anthropic_client.messages.create(
-                model="claude-opus-4-8",
-                max_tokens=2048,
+                model="claude-fable-5",
+                max_tokens=4096,
                 messages=[{"role": "user", "content": prompt}]
             )
 
-            text = response.content[0].text.strip()
+            text = "".join(_b.text for _b in response.content if getattr(_b,"type",None)=="text").strip()
             logger.info(f"Claude topic response (first 200 chars): {text[:200]}")
             
             result = None

@@ -87,6 +87,15 @@ export class IrisFlowStack extends cdk.Stack {
       retentionPeriod: cdk.Duration.days(14),
     });
 
+    // Separate queue for the storytelling pipeline (origin stories). Same shape
+    // of messages ({prompt, category, ...}); kept distinct so the two pipelines
+    // never drain each other's topics.
+    const storyQueue = new sqs.Queue(this, 'StoryQueue', {
+      queueName: 'iris-flow-story-queue',
+      visibilityTimeout: cdk.Duration.minutes(30),
+      retentionPeriod: cdk.Duration.days(14),
+    });
+
     // =====================
     // Secrets Manager
     // =====================
@@ -208,6 +217,7 @@ export class IrisFlowStack extends cdk.Stack {
     jobsTable.grantReadWriteData(batchJobRole);
     topicsTable.grantReadWriteData(batchJobRole);
     topicQueue.grantConsumeMessages(batchJobRole);
+    storyQueue.grantConsumeMessages(batchJobRole);
     apiSecrets.grantRead(batchJobRole);
 
     // Batch Execution Role
@@ -245,6 +255,7 @@ export class IrisFlowStack extends cdk.Stack {
       JOBS_TABLE: jobsTable.tableName,
       TOPICS_TABLE: topicsTable.tableName,
       TOPIC_QUEUE_URL: topicQueue.queueUrl,
+      STORY_QUEUE_URL: storyQueue.queueUrl,
       AWS_REGION: this.region,
       // Audio attachment knobs read by serverless/src/metricool_client.py
       METRICOOL_DEFAULT_AUDIO_NAME: 'Scientific-Nipsey',
@@ -271,6 +282,8 @@ export class IrisFlowStack extends cdk.Stack {
       vcpu: number,
       memoryMiB: number,
       timeoutMinutes: number,
+      jobDefName: string = `iris-flow-${jobType}`,
+      extraEnv: { [key: string]: string } = {},
     ): batch.EcsJobDefinition => {
       const container = new batch.EcsFargateContainerDefinition(this, `${logicalId}Container`, {
         image: ecs.ContainerImage.fromEcrRepository(ecrRepo, 'latest'),
@@ -281,10 +294,11 @@ export class IrisFlowStack extends cdk.Stack {
         environment: {
           ...batchEnvVars,
           JOB_TYPE: jobType,
+          ...extraEnv,
         },
         secrets: batchSecrets,
         logging: ecs.LogDrivers.awsLogs({
-          streamPrefix: `iris-flow-${jobType}`,
+          streamPrefix: jobDefName,
           logRetention: logs.RetentionDays.ONE_WEEK,
         }),
         assignPublicIp: true,
@@ -292,7 +306,7 @@ export class IrisFlowStack extends cdk.Stack {
       });
 
       return new batch.EcsJobDefinition(this, logicalId, {
-        jobDefinitionName: `iris-flow-${jobType}`,
+        jobDefinitionName: jobDefName,
         container,
         timeout: cdk.Duration.minutes(timeoutMinutes),
         retryAttempts: 3,
@@ -309,11 +323,27 @@ export class IrisFlowStack extends cdk.Stack {
       });
     };
 
-    // 4 Batch Job Definitions (transition removed — title_cards handled inline in job_visual)
+    // 4 STEM Batch Job Definitions (transition removed — title_cards handled inline in job_visual)
     const prepJobDef = createJobDef('PrepJobDef', 'prep', 2, 4096, 15);
     const visualJobDef = createJobDef('VisualJobDef', 'visual', 4, 16384, 30);
     const concatJobDef = createJobDef('ConcatJobDef', 'concatenate', 4, 8192, 15);
     const postprocessJobDef = createJobDef('PostprocessJobDef', 'postprocess', 1, 2048, 10);
+
+    // 4 STORY Batch Job Definitions (PIPELINE=story selects the image-sequence path).
+    // story-prep needs a longer timeout: it renders every illustration SEQUENTIALLY
+    // (reference-chained for continuity) before the parallel compose Map runs.
+    // story-visual is pure ffmpeg (compose a still + voiceover) so it is light.
+    const STORY_ENV = { PIPELINE: 'story' };
+    const storyPrepJobDef = createJobDef('StoryPrepJobDef', 'prep', 2, 4096, 25, 'iris-story-prep', STORY_ENV);
+    // 2 vCPU (not 4): a full 10-clip Map at 4 vCPU each would need 40 vCPU against
+    // the 32 maxvCpus cap and could not fully fan out. 8 GB is for the 4x-supersample
+    // zoompan buffer in compose_story_clip, not for CPU.
+    const storyVisualJobDef = createJobDef('StoryVisualJobDef', 'visual', 2, 8192, 15, 'iris-story-visual', STORY_ENV);
+    // 16 GB (vs STEM concat's 8 GB): story videos have more beats (10-13), and the
+    // all-at-once xfade+acrossfade filtergraph in concatenate_videos decodes every
+    // 1080x1920 input simultaneously — 11 inputs OOM-killed an 8 GB container.
+    const storyConcatJobDef = createJobDef('StoryConcatJobDef', 'concatenate', 4, 16384, 15, 'iris-story-concatenate', STORY_ENV);
+    const storyPostprocessJobDef = createJobDef('StoryPostprocessJobDef', 'postprocess', 1, 2048, 10, 'iris-story-postprocess', STORY_ENV);
 
     // =============================================
     // NEW: Lambda Functions
@@ -349,112 +379,158 @@ export class IrisFlowStack extends cdk.Stack {
     videoBucket.grantRead(readManifestFn);
 
     // =============================================
-    // NEW: Step Functions State Machine
+    // NEW: Step Functions State Machine(s)
+    //
+    // The pipeline shape is IDENTICAL for both content styles:
+    //   prep → read manifest → parallel visual Map → concatenate → postprocess
+    // Only the Batch job definitions differ (STEM segments vs. story images).
+    // buildVideoPipeline factors this so STEM and story stay byte-for-byte in sync.
+    // idPrefix='' preserves the original STEM logical IDs (no resource churn).
     // =============================================
+    interface PipelineJobDefs {
+      prep: batch.EcsJobDefinition;
+      visual: batch.EcsJobDefinition;
+      concat: batch.EcsJobDefinition;
+      postprocess: batch.EcsJobDefinition;
+    }
 
-    // Step 1: Prep Batch Job
-    const prepJob = new tasks.BatchSubmitJob(this, 'PrepJob', {
-      jobDefinitionArn: prepJobDef.jobDefinitionArn,
-      jobName: sfn.JsonPath.format('prep-{}', sfn.JsonPath.stringAt('$.video_id')),
-      jobQueueArn: jobQueue.jobQueueArn,
-      containerOverrides: {
-        environment: {
-          VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
-          TARGET_DURATION: sfn.JsonPath.stringAt('States.Format(\'{}\', $.target_duration)'),
-          TOPIC: sfn.JsonPath.stringAt('$.topic'),
+    const buildVideoPipeline = (
+      idPrefix: string,
+      stateMachineName: string,
+      logGroupName: string,
+      jobDefs: PipelineJobDefs,
+    ): sfn.StateMachine => {
+      // Step 1: Prep Batch Job
+      const prepJob = new tasks.BatchSubmitJob(this, `${idPrefix}PrepJob`, {
+        jobDefinitionArn: jobDefs.prep.jobDefinitionArn,
+        jobName: sfn.JsonPath.format('prep-{}', sfn.JsonPath.stringAt('$.video_id')),
+        jobQueueArn: jobQueue.jobQueueArn,
+        containerOverrides: {
+          environment: {
+            VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
+            TARGET_DURATION: sfn.JsonPath.stringAt('States.Format(\'{}\', $.target_duration)'),
+            TOPIC: sfn.JsonPath.stringAt('$.topic'),
+          },
         },
-      },
-      resultPath: '$.prepResult',
-    });
+        resultPath: '$.prepResult',
+      });
 
-    // Step 2: Read Manifest Lambda
-    const readManifest = new tasks.LambdaInvoke(this, 'ReadManifest', {
-      lambdaFunction: readManifestFn,
-      payloadResponseOnly: true,
-      resultPath: '$.manifestResult',
-    });
+      // Step 2: Read Manifest Lambda (pipeline-agnostic — returns all segment indexes)
+      const readManifest = new tasks.LambdaInvoke(this, `${idPrefix}ReadManifest`, {
+        lambdaFunction: readManifestFn,
+        payloadResponseOnly: true,
+        resultPath: '$.manifestResult',
+      });
 
-    // Step 3: Visual Map (parallel Batch jobs)
-    const visualJob = new tasks.BatchSubmitJob(this, 'VisualJob', {
-      jobDefinitionArn: visualJobDef.jobDefinitionArn,
-      jobName: sfn.JsonPath.format('visual-{}-{}',
-        sfn.JsonPath.stringAt('$.video_id'),
-        sfn.JsonPath.stringAt('States.Format(\'{}\', $.segment_index)')
-      ),
-      jobQueueArn: jobQueue.jobQueueArn,
-      containerOverrides: {
-        environment: {
-          VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
-          SEGMENT_INDEX: sfn.JsonPath.stringAt('States.Format(\'{}\', $.segment_index)'),
+      // Step 3: Visual Map (parallel Batch jobs)
+      const visualJob = new tasks.BatchSubmitJob(this, `${idPrefix}VisualJob`, {
+        jobDefinitionArn: jobDefs.visual.jobDefinitionArn,
+        jobName: sfn.JsonPath.format('visual-{}-{}',
+          sfn.JsonPath.stringAt('$.video_id'),
+          sfn.JsonPath.stringAt('States.Format(\'{}\', $.segment_index)')
+        ),
+        jobQueueArn: jobQueue.jobQueueArn,
+        containerOverrides: {
+          environment: {
+            VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
+            SEGMENT_INDEX: sfn.JsonPath.stringAt('States.Format(\'{}\', $.segment_index)'),
+          },
         },
-      },
-    });
+      });
 
-    // Catch errors on individual visual jobs so one failure doesn't kill the pipeline
-    const visualJobWithCatch = visualJob.addCatch(new sfn.Pass(this, 'VisualJobFailed', {
-      result: sfn.Result.fromObject({ status: 'FAILED' }),
-    }), { resultPath: '$.error' });
+      // Catch errors on individual visual jobs so one failure doesn't kill the pipeline
+      const visualJobWithCatch = visualJob.addCatch(new sfn.Pass(this, `${idPrefix}VisualJobFailed`, {
+        result: sfn.Result.fromObject({ status: 'FAILED' }),
+      }), { resultPath: '$.error' });
 
-    const visualMap = new sfn.Map(this, 'VisualMap', {
-      itemsPath: '$.manifestResult.visualSegments',
-      maxConcurrency: 10,
-      resultPath: '$.visualResults',
-    });
-    visualMap.itemProcessor(visualJobWithCatch);
+      const visualMap = new sfn.Map(this, `${idPrefix}VisualMap`, {
+        itemsPath: '$.manifestResult.visualSegments',
+        maxConcurrency: 10,
+        resultPath: '$.visualResults',
+      });
+      visualMap.itemProcessor(visualJobWithCatch);
 
-    // Step 4: Concatenate Batch Job
-    const concatJob = new tasks.BatchSubmitJob(this, 'ConcatJob', {
-      jobDefinitionArn: concatJobDef.jobDefinitionArn,
-      jobName: sfn.JsonPath.format('concat-{}', sfn.JsonPath.stringAt('$.video_id')),
-      jobQueueArn: jobQueue.jobQueueArn,
-      containerOverrides: {
-        environment: {
-          VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
+      // Step 4: Concatenate Batch Job
+      const concatJob = new tasks.BatchSubmitJob(this, `${idPrefix}ConcatJob`, {
+        jobDefinitionArn: jobDefs.concat.jobDefinitionArn,
+        jobName: sfn.JsonPath.format('concat-{}', sfn.JsonPath.stringAt('$.video_id')),
+        jobQueueArn: jobQueue.jobQueueArn,
+        containerOverrides: {
+          environment: {
+            VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
+          },
         },
-      },
-      resultPath: '$.concatResult',
-    });
+        resultPath: '$.concatResult',
+      });
 
-    // Step 5: Postprocess Batch Job
-    // The orchestrator Lambda always sets schedule_time on the execution input
-    // (random 30 min – 6 hr from now), so $.schedule_time is guaranteed present.
-    const postprocessJob = new tasks.BatchSubmitJob(this, 'PostprocessJob', {
-      jobDefinitionArn: postprocessJobDef.jobDefinitionArn,
-      jobName: sfn.JsonPath.format('postprocess-{}', sfn.JsonPath.stringAt('$.video_id')),
-      jobQueueArn: jobQueue.jobQueueArn,
-      containerOverrides: {
-        environment: {
-          VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
-          SCHEDULE_TIME: sfn.JsonPath.stringAt('$.schedule_time'),
+      // Step 5: Postprocess Batch Job
+      // The orchestrator Lambda always sets schedule_time on the execution input
+      // (random 30 min – 6 hr from now), so $.schedule_time is guaranteed present.
+      const postprocessJob = new tasks.BatchSubmitJob(this, `${idPrefix}PostprocessJob`, {
+        jobDefinitionArn: jobDefs.postprocess.jobDefinitionArn,
+        jobName: sfn.JsonPath.format('postprocess-{}', sfn.JsonPath.stringAt('$.video_id')),
+        jobQueueArn: jobQueue.jobQueueArn,
+        containerOverrides: {
+          environment: {
+            VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
+            SCHEDULE_TIME: sfn.JsonPath.stringAt('$.schedule_time'),
+          },
         },
-      },
-      resultPath: '$.postprocessResult',
-    });
+        resultPath: '$.postprocessResult',
+      });
 
-    // Chain the state machine: prep → read manifest → parallel visuals → concat → postprocess
-    const definition = prepJob
-      .next(readManifest)
-      .next(visualMap)
-      .next(concatJob)
-      .next(postprocessJob);
+      const definition = prepJob
+        .next(readManifest)
+        .next(visualMap)
+        .next(concatJob)
+        .next(postprocessJob);
 
-    const stateMachine = new sfn.StateMachine(this, 'VideoStateMachine', {
-      stateMachineName: 'iris-flow-video-pipeline',
-      definitionBody: sfn.DefinitionBody.fromChainable(definition),
-      timeout: cdk.Duration.hours(2),
-      logs: {
-        destination: new logs.LogGroup(this, 'SfnLogGroup', {
-          logGroupName: '/iris-flow/state-machine',
-          retention: logs.RetentionDays.ONE_WEEK,
-          removalPolicy: cdk.RemovalPolicy.DESTROY,
-        }),
-        level: sfn.LogLevel.ERROR,
-      },
-    });
+      return new sfn.StateMachine(this, `${idPrefix}VideoStateMachine`, {
+        stateMachineName,
+        definitionBody: sfn.DefinitionBody.fromChainable(definition),
+        timeout: cdk.Duration.hours(2),
+        logs: {
+          destination: new logs.LogGroup(this, `${idPrefix}SfnLogGroup`, {
+            logGroupName,
+            retention: logs.RetentionDays.ONE_WEEK,
+            removalPolicy: cdk.RemovalPolicy.DESTROY,
+          }),
+          level: sfn.LogLevel.ERROR,
+        },
+      });
+    };
 
-    // Grant orchestrator Lambda permission to start executions
+    // STEM pipeline (idPrefix='' keeps the original logical IDs → no replacement)
+    const stateMachine = buildVideoPipeline(
+      '', 'iris-flow-video-pipeline', '/iris-flow/state-machine',
+      { prep: prepJobDef, visual: visualJobDef, concat: concatJobDef, postprocess: postprocessJobDef },
+    );
     stateMachine.grantStartExecution(orchestratorFn);
     orchestratorFn.addEnvironment('STATE_MACHINE_ARN', stateMachine.stateMachineArn);
+
+    // STORY pipeline
+    const storyStateMachine = buildVideoPipeline(
+      'Story', 'iris-story-pipeline', '/iris-flow/story-state-machine',
+      { prep: storyPrepJobDef, visual: storyVisualJobDef, concat: storyConcatJobDef, postprocess: storyPostprocessJobDef },
+    );
+
+    // Story orchestrator Lambda — same code as the STEM orchestrator, different env.
+    const storyOrchestratorFn = new lambda_.Function(this, 'StoryOrchestratorFn', {
+      functionName: 'iris-story-orchestrator',
+      runtime: lambda_.Runtime.PYTHON_3_12,
+      handler: 'orchestrator.handler',
+      code: lambda_.Code.fromAsset('../src/lambdas'),
+      timeout: cdk.Duration.minutes(2),
+      memorySize: 256,
+      environment: {
+        QUEUE_URL: storyQueue.queueUrl,
+        STATE_MACHINE_ARN: storyStateMachine.stateMachineArn,
+        TARGET_DURATION: '75',     // story videos target 60-90s
+        EXEC_PREFIX: 'iris-story',
+      },
+    });
+    storyQueue.grantConsumeMessages(storyOrchestratorFn);
+    storyStateMachine.grantStartExecution(storyOrchestratorFn);
 
     // =============================================
     // EventBridge: 4× daily orchestrator trigger
@@ -474,9 +550,33 @@ export class IrisFlowStack extends cdk.Stack {
 
     scheduleRule.addTarget(new targets.LambdaFunction(orchestratorFn));
 
+    // Story schedule — 4× daily, OFFSET ~2h from the STEM trigger so the two
+    // pipelines don't hit the Gemini / Anthropic APIs at the same instant.
+    // Fires at 02:00, 13:00, 18:00, 22:00 UTC.
+    const storyScheduleRule = new events.Rule(this, 'StoryDailySchedule', {
+      ruleName: 'iris-story-daily',
+      description: 'Trigger story orchestrator Lambda 4× daily (offset from STEM)',
+      enabled: true,
+      schedule: events.Schedule.cron({
+        minute: '0',
+        hour: '2,13,18,22', // 4× daily, UTC, offset from STEM's 0,11,16,20
+      }),
+    });
+    storyScheduleRule.addTarget(new targets.LambdaFunction(storyOrchestratorFn));
+
     // =====================
     // Outputs
     // =====================
+    new cdk.CfnOutput(this, 'StoryQueueUrl', {
+      value: storyQueue.queueUrl,
+      description: 'SQS queue URL for story topic input',
+    });
+
+    new cdk.CfnOutput(this, 'StoryStateMachineArn', {
+      value: storyStateMachine.stateMachineArn,
+      description: 'Story Step Functions state machine ARN',
+    });
+
     new cdk.CfnOutput(this, 'VideoBucketName', {
       value: videoBucket.bucketName,
       description: 'S3 bucket for video assets',

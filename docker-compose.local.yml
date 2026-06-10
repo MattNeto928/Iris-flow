@@ -1,0 +1,30 @@
+services:
+  iris-flow:
+    # Use the pre-built production image (built via serverless/build-and-push.sh).
+    # To rebuild locally: docker build --platform linux/amd64 -f serverless/docker/Dockerfile -t iris-flow-generator serverless/
+    image: iris-flow-generator:latest
+    platform: linux/amd64
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount serverless source for live code changes
+      - ./serverless/src:/app/src
+      # Mount local runner/server scripts
+      - ./local:/app/local
+      # Mount output directory for accessing generated videos
+      - ./output:/app/output
+      # Mount skills for prompts
+      - ./iris-flow-plugin:/app/iris-flow-plugin
+      # Mount local background music library
+      - ./frontend/mp3:/app/music:ro
+      # Mount GCP service account key for TTS
+      - ./gen-lang-client-0142432606-c78dd6841ded.json:/app/gcp-sa-key.json:ro
+    env_file:
+      - .env.local
+    environment:
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+      - DRY_RUN=true
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-sa-key.json
+    command: >
+      bash -c "apt-get update && apt-get install -y curl git libgeos-dev libproj-dev ffmpeg && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs && pip install fastapi uvicorn[standard] cartopy geopandas shapely --quiet pexpect && uvicorn local.server:app --host 0.0.0.0 --port 8000 --reload --reload-dir src --reload-dir local --reload-dir iris-flow-plugin"

@@ -334,15 +334,15 @@ class SimpyService:
         
         self._last_prompt = final_prompt
         
-        self._last_model = 'claude-opus-4-8'
+        self._last_model = 'claude-fable-5'
         
         message = client.messages.create(
-            model="claude-opus-4-8",
+            model="claude-fable-5",
             max_tokens=16384,
             messages=[{"role": "user", "content": final_prompt}]
         )
         
-        response_text = message.content[0].text
+        response_text = "".join(_b.text for _b in message.content if getattr(_b,"type",None)=="text")
         if message.stop_reason == "max_tokens":
             raise RuntimeError("Code generation was truncated (hit max_tokens). The description may be too complex for a single segment.")
         

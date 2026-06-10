@@ -203,6 +203,104 @@ def compose_transition(
     return str(output_path)
 
 
+def compose_story_clip(
+    image_path: str,
+    audio_path: str,
+    video_id: str,
+    segment_index: int,
+    lead_in: float = 0.35,
+    tail_hold: float = 0.45,
+) -> str:
+    """Compose one storytelling beat: slow eased Ken Burns over a still illustration
+    with the narration baked in.
+
+    Differs from compose_transition in two ways that matter for the clip-art
+    image-sequence look:
+      - COVER-FILL (force_original_aspect_ratio=increase + center crop) so the
+        near-9:16 image fills 1080x1920 with NO letterbox bars (the images have a
+        white background; black bars would look broken).
+      - Audio gets a small `lead_in` of silence so the first word never starts on
+        the hard cut, and the image holds for `tail_hold` after the voiceover ends
+        so the last word doesn't clip and the cut has a beat to breathe.
+
+    Determinism: zoom direction alternates by segment_index; horizontal drift
+    direction is MD5-seeded by (video_id, segment_index) so re-renders match.
+    """
+    VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = VIDEO_DIR / f"{video_id}_seg{segment_index}_story.mp4"
+
+    audio_dur = get_duration(audio_path)
+    W, H, FPS = 1080, 1920, 30
+
+    # Frame-quantize the clip length. Two reasons:
+    #  1. The video MUST be an exact integer number of frames at FPS or it desyncs
+    #     from the audio (the old code let the looped image default to 25fps while
+    #     zoompan retagged 30fps, so the picture ran 25/30 as long as the narration).
+    #  2. concat's xfade offsets then land on exact frame boundaries, so the
+    #     crossfades don't accumulate audio/video drift across beats.
+    raw_dur = lead_in + audio_dur + tail_hold
+    total_frames = max(int(round(raw_dur * FPS)), 1)
+    duration = total_frames / FPS
+
+    # Gentle 4% push/pull — eased, no snap (matches the no-jitter house style).
+    MAX_ZOOM = 1.04
+    zoom_rate = (MAX_ZOOM - 1.0) / total_frames
+    if segment_index % 2 == 0:
+        z_expr = f"'min(1.0+on*{zoom_rate:.6f},{MAX_ZOOM})'"      # push in
+    else:
+        z_expr = f"'max({MAX_ZOOM}-on*{zoom_rate:.6f},1.0)'"      # pull back
+
+    seed_bytes = hashlib.md5(f"{video_id}:{segment_index}:story".encode()).digest()
+    pan_dir = 1 if seed_bytes[0] & 1 else -1
+    pan_rate_px = pan_dir * 10.0 / total_frames
+
+    delay_ms = int(lead_in * 1000)
+
+    # SUPERSAMPLE the source before zoompan. zoompan truncates its crop origin to
+    # integer *input* pixels every frame; at output resolution that snapping reads
+    # as jitter, especially on the hard edges of clip-art. Pre-scaling the image to
+    # SS× the output size shrinks each step to 1/SS of an output pixel, so the
+    # zoom/pan is smooth. The pan rate is multiplied by SS to keep the same on-
+    # screen drift (x is now in the SS× input coordinate system).
+    SS = 4
+    bw, bh = W * SS, H * SS
+    filter_complex = (
+        "[0:v]"
+        f"scale={bw}:{bh}:force_original_aspect_ratio=increase,"
+        f"crop={bw}:{bh},"
+        "setsar=1,"
+        f"zoompan=z={z_expr}:"
+        f"x='iw/2-(iw/zoom/2)+on*{pan_rate_px * SS:.6f}':"
+        "y='ih/2-(ih/zoom/2)':"
+        f"d=1:s={W}x{H}:fps={FPS},"
+        "format=yuv420p"
+        "[outv];"
+        # apad a touch beyond tail_hold; the output -t trims both streams to the
+        # exact frame-aligned duration so audio fully covers the video.
+        f"[1:a]adelay={delay_ms}|{delay_ms},apad=pad_dur={tail_hold + 0.2}[outa]"
+    )
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-loop", "1", "-framerate", str(FPS), "-t", f"{duration:.4f}", "-i", image_path,
+        "-i", audio_path,
+        "-filter_complex", filter_complex,
+        "-map", "[outv]",
+        "-map", "[outa]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "23",
+        "-r", str(FPS),
+        "-c:a", "aac", "-b:a", "192k",
+        "-t", f"{duration:.4f}",
+        str(output_path),
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Story clip composition failed: {result.stderr}")
+
+    return str(output_path)
+
+
 def extract_last_frame(video_path: str, video_id: str, segment_index: int) -> str:
     """Extract the last frame from a video."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
