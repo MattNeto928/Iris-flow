@@ -118,6 +118,16 @@ for frame_idx in range(N_FRAMES):
 print(f"Rendered {N_FRAMES} frames")
 ```
 
+## COMPOSITION — fill the 9:16 frame
+
+The surface/model must dominate the 1080x1920 canvas, not float small in the middle:
+- Keep margins tight: `margin=dict(l=0, r=0, t=70, b=0)`.
+- Make the 3D scene occupy the whole frame via its domain:
+  `scene=dict(domain=dict(x=[0,1], y=[0.04, 0.96]), ...)`.
+- Pull the camera in so the object is large: a closer `eye` (smaller radius, e.g. r≈1.7-2.0
+  in `camera_at`) enlarges the subject. Pick a radius where the surface nearly fills the frame.
+- Use `aspectmode='cube'` (or 'data') so the object isn't squashed, and a bold colorscale.
+
 ## 3D Trace Types
 
 ### Surface Plot

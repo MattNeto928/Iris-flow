@@ -73,6 +73,23 @@ Two rules that prevent the most common 3D failures:
 1. `set_box_aspect((1, 1, 1.6))` — without this the 3D box looks crushed in portrait format
 2. `ax.set_axis_off()` or set pane facecolors to `(0.05, 0.05, 0.05, 1)` — default grey panes look terrible on #0D0D0D
 
+## COMPOSITION — FILL THE 9:16 FRAME (this is what makes it look impressive)
+
+The single biggest "looks cheap" mistake is a tiny subject floating in a sea of black.
+The subject must FILL most of the 1080x1920 canvas. Apply ALL of these:
+- Remove figure padding so the axes use the whole canvas:
+  `fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=1.0)`
+- Set axis limits TIGHT around the actual data (the object should span ~80-90% of each
+  axis range), not a generic [-2,2] if the object only reaches 1.4.
+- Enlarge the 3D object in-frame. On matplotlib >= 3.6 use the zoom arg:
+  `ax.set_box_aspect((1, 1, 1.6), zoom=1.35)` (zoom > 1 enlarges; this is the easiest big win).
+  If unsure of the version, also pull the camera in with a lower `ax.dist` (e.g. `ax.dist = 7.5`,
+  default is 10) — smaller = more zoomed.
+- Use generous marker sizes and line widths (s=200-500 for focal bodies, lw=2.5-4) so the
+  subject reads on a phone.
+- Center the composition: the focal action should sit in the vertical middle of the frame,
+  with the title near the top (y~0.93) — never leave the entire bottom third empty.
+
 ## FRAME COUNT IS NON-NEGOTIABLE
 
 `DURATION` is injected via the environment and ALREADY equals this segment's length,

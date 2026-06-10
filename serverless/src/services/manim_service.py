@@ -94,6 +94,19 @@ The rendered frame is 1080×1920. In Manim's coordinate units:
 - **Never** use absolute coordinates without verifying they fit
 - Prefer `next_to`, `align_to`, `move_to` over raw coordinate placement
 
+### Fill the 9:16 frame (composition)
+A tiny diagram clustered in the top half with an empty bottom third looks cheap. Use the
+WHOLE safe zone, y ∈ [−7.2, 7.2]:
+- Make the primary visual large — scale it so it occupies a good share of the width
+  (`obj.scale_to_fit_width(6.5)` for the focal diagram), then `move_to(UP*1.5)` to sit it in
+  the upper-middle.
+- Distribute supporting equations/labels DOWN the frame with `VGroup(...).arrange(DOWN, buff=0.8)`
+  so they use the vertical space instead of bunching near the center.
+- Vertically balance the layout: roughly title near `UP*6.5`, main visual centered around
+  `UP*1.5`, equations around `DOWN*2` to `DOWN*4`. Avoid leaving the bottom third empty.
+- For `ThreeDScene`, keep the 3D object large in frame and overlay fixed equations low
+  (`eq.to_edge(DOWN, buff=0.8)`).
+
 When using `NumberPlane` or `Axes`, always set explicit ranges that keep the grid within safe bounds:
 ```python
 plane = NumberPlane(
