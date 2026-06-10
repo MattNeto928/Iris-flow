@@ -11,6 +11,12 @@ USER root
 # - tzdata: timezone support
 # - libsndfile1: audio file handling
 # - xvfb: virtual framebuffer for pygame/matplotlib
+# NOTE: Node.js/pnpm and Google Chrome were previously installed here for the
+# Remotion engine and Kaleido v1. Both are now removed: the live engines are
+# matplotlib/manim/plotly only (Remotion is not in worker.py's SERVICE_MAP), and
+# the pinned kaleido==0.2.1 bundles its own headless Chromium. Dropping them also
+# removes the build's dependency on deb.nodesource.com / npm registry / dl.google.com,
+# which are not reliably reachable from the build sandbox.
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     sox \
@@ -25,18 +31,6 @@ RUN apt-get update && apt-get install -y \
     curl \
     build-essential \
     g++ \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
-    && npm install -g pnpm \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Google Chrome for Kaleido
-RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
-    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list \
-    && apt-get update && apt-get install -y google-chrome-stable \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
-    && npm install -g pnpm \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python packages for the pipeline
@@ -86,17 +80,9 @@ RUN pip install --no-cache-dir \
     soundfile \
     mutagen
 
-# Pre-bake Remotion base app — write project files directly (no interactive scaffolding)
-RUN mkdir -p /app/output/remotion_projects/base_app/src && \
-    cd /app/output/remotion_projects/base_app && \
-    printf '{\n  "name": "iris-remotion","version":"1.0.0","private":true,\n  "scripts":{"build":"tsc","render":"remotion render"},\n  "dependencies":{\n    "remotion":"^4.0.0","@remotion/renderer":"^4.0.0","@remotion/cli":"^4.0.0","@remotion/three":"^4.0.0",\n    "three":"^0.160.0","@react-three/fiber":"^8.0.0","@react-three/drei":"^9.0.0",\n    "react":"^18.0.0","react-dom":"^18.0.0"\n  },\n  "devDependencies":{\n    "@types/react":"^18.0.0","@types/three":"^0.160.0","typescript":"^5.0.0"\n  }\n}\n' > package.json && \
-    printf '{"compilerOptions":{"target":"ES2020","module":"ESNext","moduleResolution":"bundler","jsx":"react-jsx","strict":false,"esModuleInterop":true,"skipLibCheck":true},"include":["src"]}\n' > tsconfig.json && \
-    printf 'import {registerRoot} from "remotion";\nimport {Root} from "./Root";\nregisterRoot(Root);\n' > src/index.ts && \
-    printf 'import React from "react";\nimport {Composition} from "remotion";\nimport Scene from "./Scene";\nexport const Root: React.FC = () => {\n  const durFrames = parseInt(process.env.REMOTION_DURATION || "240");\n  return (<><Composition id="MyComp" component={Scene} durationInFrames={durFrames} width={1080} height={1920} fps={30} /></>);\n};\n' > src/Root.tsx && \
-    printf 'import React from "react";\nimport {AbsoluteFill,useCurrentFrame} from "remotion";\nexport default function Scene(){const frame=useCurrentFrame();return <AbsoluteFill style={{backgroundColor:"#0D0D0D"}}/>}\n' > src/Scene.tsx && \
-    npm install && \
-    npm install @remotion/three three @react-three/fiber @react-three/drei && \
-    npm install --save-dev @types/three
+# (Remotion base app pre-bake removed: Remotion is dead code — not in
+# worker.py's SERVICE_MAP — and its npm install needs registry egress the
+# build sandbox lacks. Live engines are matplotlib/manim/plotly only.)
 
 # Set working directory
 WORKDIR /app
