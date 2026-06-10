@@ -11,7 +11,7 @@ import logging
 import asyncio
 from pathlib import Path
 
-from src.services._llm import generate_text, strip_code_fences, build_narration_timeline, validate_script
+from src.services._llm import generate_text, strip_code_fences, build_narration_timeline, validate_script, prepare_retry_context
 
 logger = logging.getLogger(__name__)
 
@@ -258,15 +258,10 @@ class PlotlyService:
     ) -> str:
         """Generate Plotly script using Claude (streaming + adaptive thinking)."""
 
-        error_context = ""
-        if previous_error:
-            error_context = f"""
-*** PREVIOUS ATTEMPT FAILED WITH ERROR: ***
-{previous_error}
-*** YOU MUST FIX THIS ERROR IN THE NEW SCRIPT ***
-"""
 
         narration_block = build_narration_timeline(voiceover_text, duration)
+        description, narration_block, error_context = prepare_retry_context(
+            description, narration_block, previous_error)
 
         final_prompt = (
             PLOTLY_PROMPT

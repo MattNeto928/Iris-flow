@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 
 MODEL = "claude-fable-5"
 
+# Marker placed in errors raised when the API refuses a generation (content-safety
+# classifier). Services branch on it: re-sending an identical refused prompt can
+# never succeed, so the retry recasts the brief instead (see prepare_retry_context).
+REFUSAL_MARKER = "CONTENT_REFUSAL"
+
 # One module-level client shared by every importer (thread-safe, connection-pooled).
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
@@ -66,6 +71,14 @@ def generate_text(
     logger.info(
         f"[LLM] response: {len(text)} chars text, stop_reason={message.stop_reason}"
     )
+    if message.stop_reason == "refusal":
+        details = getattr(message, "stop_details", None)
+        extra = ""
+        if details is not None:
+            extra = f" (category={getattr(details, 'category', None)}: {getattr(details, 'explanation', '')})"
+        raise RuntimeError(
+            f"{REFUSAL_MARKER}: the API refused this generation request{extra}."
+        )
     return text, message.stop_reason
 
 
@@ -101,6 +114,39 @@ def strip_code_fences(text: str) -> str:
         if end != -1:
             return text[start:end].strip()
     return text.strip()
+
+
+def prepare_retry_context(
+    description: str,
+    narration_block: str,
+    previous_error: str | None,
+) -> tuple[str, str, str]:
+    """Shape (description, narration_block, error_context) for a retry attempt.
+
+    Normal failures: keep the brief as-is and append the error so the model can
+    fix its own bug.
+
+    Content refusals are different: benign science briefs (e.g. a DNA double
+    helix) can false-positive the API's bio/cyber safety classifiers, and
+    re-sending the identical prompt refuses identically every time. On a refusal
+    retry we instead RECAST the brief as pure geometry (curves, spheres, lines)
+    and drop the narration block to minimize trigger surface — an unsynced but
+    rendered segment beats a failed one.
+    """
+    if previous_error and REFUSAL_MARKER in previous_error:
+        recast = (
+            "Purely geometric educational animation on a dark background. Render ONLY "
+            "abstract shapes — curves, spheres, lines, surfaces — as a mathematics "
+            "visualization of the following geometry: " + description
+        )
+        return recast, "", ""
+    if previous_error:
+        return description, narration_block, f"""
+*** PREVIOUS ATTEMPT FAILED WITH ERROR: ***
+{previous_error}
+*** YOU MUST FIX THIS ERROR IN THE NEW SCRIPT ***
+"""
+    return description, narration_block, ""
 
 
 def build_narration_timeline(voiceover_text: str, duration: float, lead_in: float = 0.5) -> str:

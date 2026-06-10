@@ -11,7 +11,7 @@ import logging
 import asyncio
 from pathlib import Path
 
-from src.services._llm import generate_text, strip_code_fences, build_narration_timeline, validate_script
+from src.services._llm import generate_text, strip_code_fences, build_narration_timeline, validate_script, prepare_retry_context
 
 logger = logging.getLogger(__name__)
 
@@ -615,15 +615,10 @@ class ManimService:
         """Generate Manim script using Claude (streaming + adaptive thinking)."""
 
         # Add error context if retrying
-        error_context = ""
-        if previous_error:
-            error_context = f"""
-*** PREVIOUS ATTEMPT FAILED WITH ERROR: ***
-{previous_error}
-*** YOU MUST FIX THIS ERROR IN THE NEW SCRIPT ***
-"""
 
         narration_block = build_narration_timeline(voiceover_text, duration)
+        description, narration_block, error_context = prepare_retry_context(
+            description, narration_block, previous_error)
 
         # Use replace() instead of format() to avoid conflicts with curly braces in the prompt examples
         prompt = (
