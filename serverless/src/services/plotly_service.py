@@ -128,6 +128,19 @@ The surface/model must dominate the 1080x1920 canvas, not float small in the mid
   in `camera_at`) enlarges the subject. Pick a radius where the surface nearly fills the frame.
 - Use `aspectmode='cube'` (or 'data') so the object isn't squashed, and a bold colorscale.
 
+## FEED CRAFT — first frame, cadence, UI-safe text, ending
+
+- **COLD OPEN:** frame_0000 must already show the surface/model fully formed and lit at a
+  flattering camera angle — never start from an empty scene or a degenerate camera.
+- **VISUAL BEAT EVERY 3-5s:** the camera orbit plus at least one other evolution (surface
+  morph, isosurface threshold sweep, annotation fade) — nothing static for >5s.
+- **PLATFORM-UI SAFE ZONES:** platform UI covers the bottom ~18% and right ~13% of the
+  frame. Keep title/annotations within paper coords y in [0.20, 0.94], x in [0.06, 0.85];
+  put the title near the top (y~0.96 in layout title is fine since the scene domain starts
+  at 0.04). Never place a colorbar or annotation in the bottom 18% or right 13%.
+- **ENDING:** end on a composed frame at a flattering angle (ideally near the opening
+  azimuth for a clean loop) — do not end mid-spin at an awkward angle.
+
 ## 3D Trace Types
 
 ### Surface Plot

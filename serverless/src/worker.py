@@ -354,6 +354,14 @@ async def job_visual():
     # Combine audio + video
     if audio_path:
         combined_path = combine_audio_video(video_path, audio_path, video_id, segment_index)
+        # Burn keyword captions for muted-autoplay viewers (graceful no-op on failure).
+        # lead_in=0.5 matches combine_audio_video's narration_delay so caption timing
+        # tracks the spoken words exactly.
+        if voiceover_text and seg_type != "title_card":
+            from src.services.captions import burn_captions
+            combined_path = burn_captions(
+                combined_path, voiceover_text, duration, video_id, segment_index
+            )
     else:
         combined_path = video_path
 
@@ -574,6 +582,15 @@ async def job_concatenate():
     _upload(output_path, f"{prefix}/concat_output.json")
 
 
+def _youtube_included(utc_hour: int, raw_hours: str = None) -> bool:
+    """True when this run should publish to YouTube (UTC hour in the allow-list)."""
+    raw = raw_hours if raw_hours is not None else os.environ.get(
+        'YOUTUBE_POSTING_HOURS', '11,12,20,21'
+    )
+    hours = {int(h.strip()) for h in raw.split(',') if h.strip().isdigit()}
+    return utc_hour in hours
+
+
 # ============================================================
 # JOB: postprocess
 # ============================================================
@@ -613,12 +630,24 @@ async def job_postprocess():
     if not dry_run and schedule_time_str:
         metricool = MetricoolClient()
         schedule_time = datetime.fromisoformat(schedule_time_str)
+
+        # YouTube volume cap: YouTube's "inauthentic content" monetization policy
+        # (July 2025) targets templated AI-narrated channels posting at volume.
+        # Keep 4x/day on TikTok/Reels, but publish to YouTube only on runs whose
+        # postprocess lands in YOUTUBE_POSTING_HOURS (UTC). The default covers the
+        # 11:00 and 20:00 UTC triggers (+1h of pipeline runtime) => max 2/day.
+        exclude_networks = None
+        if not _youtube_included(datetime.utcnow().hour):
+            exclude_networks = {"youtube"}
+            logger.info(f"[{video_id}] YouTube capped for this run (outside YOUTUBE_POSTING_HOURS)")
+
         logger.info(f"[{video_id}] Scheduling to Metricool for {schedule_time}...")
         schedule_result = await metricool.schedule_post(
             video_url=video_url,
             caption=caption,
             schedule_time=schedule_time,
             youtube_title=youtube_title,
+            exclude_networks=exclude_networks,
         )
         for brand_result in schedule_result.get('results', []):
             brand_id = brand_result.get('blog_id')

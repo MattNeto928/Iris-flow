@@ -45,17 +45,47 @@ SEGMENT_GENERATION_PROMPT = """You are an expert video production assistant crea
 
 === THE PEDAGOGICAL APPROACH — THIS IS THE MOST IMPORTANT RULE ===
 
-This is educational content for someone who wants to genuinely understand the topic. Not entertainment. The viewer is studying. Do NOT use:
-- Hook archetypes ("Ever wonder why...", "What if I told you...")
+This is educational content for someone who wants to genuinely understand the topic. The
+viewer is studying — but on a feed, so the first seconds must EARN the watch. Do NOT use:
+- Curiosity-bait archetypes ("Ever wonder why...", "What if I told you...", "You won't believe...")
 - DISRUPTION → TENSION → REVELATION → WONDER narrative arcs
-- Loopable endings
-- Dramatic transitions
+- Dramatic transitions or hype language
 
 DO use:
+- **Misconception-first cold opens (the signature move).** Open by naming and refuting a
+  common wrong belief, or with a precise surprising claim: "Heavier objects don't fall
+  faster." / "Every diagram of an atom you've seen is wrong." / "This orbit never repeats."
+  Refuting a misconception first is the one hook that IS pedagogy: stating the wrong idea
+  and correcting it roughly doubles learning versus a straight exposition. One sentence,
+  ≤12 spoken words, then teach.
 - Motivation-before-formula: each segment opens with WHY before the equation
 - Concrete before abstract: show the phenomenon, then name it
 - One focused idea per segment — no cramming
 - Intuitive language: "the electron cloud shifts" before "the induced dipole moment"
+
+=== THE FIRST 2 SECONDS (distribution gate — design segment 0 around this) ===
+
+Viewers decide to keep or swipe in the first 1-3 seconds, mostly with sound OFF. Segment 0 MUST:
+- COLD-OPEN ON THE PAYOFF: at t=0 the frame already shows the topic's most dramatic,
+  fully-formed visual state (the completed orbit, the resonating bead at peak amplitude,
+  the assembled molecule) — never an empty axes, a slow build-up, or a title screen.
+  Write this into segment 0's description explicitly: "opens already showing ...".
+- Put a ≤7-word on-screen hook line in segment 0's description (e.g. "Heavier does NOT
+  mean faster") displayed immediately at the top of the frame.
+- The voiceover's first sentence is the misconception/claim, ≤12 words.
+
+=== VISUAL BEAT CADENCE ===
+
+Something meaningful must CHANGE on screen every 3-5 seconds — a reveal, a camera move,
+a label appearing, a parameter sweep, a color pulse on the key term. No static shot may
+exceed 5 seconds. Write the beats into each description ("at ~4s the field reverses;
+at ~9s the trace begins...") so the renderer paces them.
+
+=== LOOP-FRIENDLY ENDING ===
+
+The final segment should end on a frame that visually rhymes with the opening frame (same
+object, same composed state) so the video loops cleanly on replay, and the last narration
+sentence is ≤6 words ("That's why the sky is blue."). No trailing dead air, no fade to black.
 
 Each segment serves a clear pedagogical role:
 1. **SETUP** — establish the physical situation, what are we looking at?
@@ -66,7 +96,7 @@ Each segment serves a clear pedagogical role:
 
 Not every video needs all five — pick the ones that matter for the topic.
 
-=== SEGMENT TYPES (4 AVAILABLE) ===
+=== SEGMENT TYPES (3 AVAILABLE) ===
 
 **1. "matplotlib" — Physics simulations and scientific visualizations**
 USE FOR: Any segment involving motion, particles, waves, fields, trajectories, schematics,
@@ -96,10 +126,10 @@ USE FOR: Only when you need Plotly's continuous surface shading quality: dispers
 potential energy landscapes, isosurfaces of scalar fields, or surfaces that need to be
 animated while a camera orbits. When matplotlib 3D would look blocky or insufficient.
 
-**4. "title_card" — 2-3 second text card naming the next concept**
-USE FOR: Brief structural markers between major topic shifts. A short voiceover sentence
-("Now, the dispersion relation.") and a title. Duration: 2-3 seconds.
-Do NOT use title_cards between every segment — only at major topic boundaries.
+Do NOT use title cards or static text-only segments — a static text screen mid-video is
+where viewers swipe away. When the topic shifts, the NEXT segment opens with its own short
+kinetic on-screen label over a live visual (put that in its description), and the narration
+carries the transition in one clause.
 
 === ENGINE DECISION TREE ===
 
@@ -107,26 +137,25 @@ Is the core content an equation, derivation, or proof? → "manim"
 Does the segment need 3D geometry + overlaid equations? → "manim" (ThreeDScene)
 Is it a high-quality continuous 3D surface or isosurface? → "plotly"
 Is it everything else (physical motion, fields, schematics, particles)? → "matplotlib"
-Is it a brief 2-3s label between major topic sections? → "title_card"
 
 === VIDEO STRUCTURE ===
 
-Target: 60-180 seconds total. Aim for 90-120 seconds.
-Segment count: 4-10 visual segments (plus 0-3 title_cards at major boundaries).
+Target: 60-90 seconds total. Length must be EARNED: plan the idea, then cut to the minimum
+that completes it. Only exceed 90s when the topic demonstrably needs it (hard cap 120s);
+never pad to reach a length. Keep the total at or above ~61s when possible.
+Segment count: 3-6 visual segments.
 
 Typical structure:
-  matplotlib (setup/situation) →
+  matplotlib (cold-open on the payoff visual + misconception hook) →
   manim (governing equation) →
-  title_card (optional, if switching to a new sub-topic) →
   matplotlib (mechanism/behavior) →
   manim (result/implication) →
-  matplotlib (final physical intuition)
+  matplotlib (loop-closing physical intuition, ending frame rhymes with the opening)
 
 Content segment durations:
-- Simple concept or single equation: 15-25s
-- Physical simulation with explanation: 25-40s
-- Full derivation: 35-50s
-Title cards: always 2-3s.
+- Simple concept or single equation: 10-20s
+- Physical simulation with explanation: 15-30s
+- Full derivation: 25-40s
 
 === WRITING THE VOICEOVER ===
 
@@ -154,9 +183,6 @@ Bracket tags — USE SPARINGLY (Algenib at 1.0x already has natural pacing):
 
 Speed: default 1.0. Use 0.97 for equation-heavy segments, 1.02 for summary segments.
 
-Title card voiceover: one short sentence only. "Now, the dispersion relation." or
-"The Drude model explains this." Keep under 40 characters.
-
 === VISUAL / NARRATION SYNC — THIS IS WHAT MAKES IT FEEL POLISHED ===
 
 The renderer receives BOTH the `description` and the segment's `voiceover` text, and it
@@ -177,13 +203,13 @@ narration is describing something other than what is on screen:
 
 For each segment provide:
 - order: int, sequential from 0
-- type: one of "matplotlib", "manim", "plotly", "title_card"
+- type: one of "matplotlib", "manim", "plotly"
 - title: short human label (for logging only)
 - description: for visual segments — a DIRECTOR'S NOTE. Describe exactly what is shown:
   what objects, what motion, what camera behavior, what key moment happens at the midpoint.
   Be specific. "3D nanoparticle with oscillating electron cloud, camera sweeps azimuth
   -55° → 35° with ease, electron scatter shifts ±0.3 units along z at 2Hz visual."
-  For title_cards: just the concept name being labeled.
+  Include the timed visual beats and, for segment 0, the cold-open state + on-screen hook line.
 - voiceover: object with "text" (narration), "speed" (float 0.97-1.03)
 - metadata: {} (empty for now)
 
@@ -210,7 +236,8 @@ HARD RULES (violating any one of these makes the post unusable):
 - NO emojis anywhere in the title or caption text. Hashtags only.
 
 TITLE (used as YouTube + TikTok title):
-- Under 80 characters.
+- Under 40 characters, and the payoff keyword must appear in the FIRST 3 words (feeds
+  truncate titles around 40 visible characters).
 - Concrete, specific noun phrase. Name the phenomenon, person, or number.
 - No clickbait fluff like "you wont believe" or "shocking".
 - Examples of the right tone: "Why bees make hexagons", "Bayes rule, decoded in 60 seconds", "Lorenz attractor: order from a butterfly".
@@ -220,7 +247,7 @@ CAPTION:
 - Open with a concrete claim or surprising fact about the actual topic. Mention a number, a name, or a specific phenomenon. Be SPECIFIC.
 - The second sentence (if any) is the "but here's the twist" line, the part that makes a viewer want to watch.
 - Tone: a sharp graduate student texting a friend who is curious about science. Confident, no filler.
-- Then a blank line, then 4-6 hashtags. Hashtags should be specific to the topic (not just generic #science #stem). Include a couple broad ones at the end.
+- Then a blank line, then 3-5 hashtags (more dilutes relevance). Hashtags should be specific to the topic (not just generic #science #stem). Include a couple broad ones at the end.
 
 OUTPUT FORMAT (must parse as JSON, no markdown fences, no commentary):
 {{"title": "...", "caption": "...\\n\\n#tag1 #tag2 #tag3 #tag4"}}"""
@@ -237,9 +264,8 @@ async def generate_segments_from_prompt(
     Returns (segments, llm_prompt, model_used).
     """
     duration_hint = (
-        f"\nTarget total video duration: {target_duration} seconds "
-        f"({target_duration // 60}–{(target_duration + 30) // 60} minutes). "
-        f"Size segments accordingly."
+        f"\nUpper bound for total duration: {target_duration} seconds. "
+        f"Prefer 60–90 seconds total — use the minimum that completes the idea."
     )
     full_prompt = SEGMENT_GENERATION_PROMPT + prompt + duration_hint
 

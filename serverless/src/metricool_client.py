@@ -115,6 +115,14 @@ class MetricoolClient:
             return self.primary_networks
         return self.additional_networks
 
+    def _effective_networks(
+        self, blog_id: str, exclude_networks: Optional[set] = None
+    ) -> list[str]:
+        """Networks for a blog minus any per-post exclusions (e.g. the YouTube
+        volume cap excludes 'youtube' on most daily runs)."""
+        excluded = {n.strip().lower() for n in (exclude_networks or set())}
+        return [n for n in self._networks_for_blog(blog_id) if n not in excluded]
+
     def _build_post_data(
         self,
         blog_id: str,
@@ -252,6 +260,7 @@ class MetricoolClient:
         youtube_title: str,
         tiktok_title: Optional[str] = None,
         audio_name: Optional[str] = None,
+        exclude_networks: Optional[set] = None,
     ) -> dict:
         """
         Schedule a video post to Instagram, TikTok, and YouTube.
@@ -301,7 +310,7 @@ class MetricoolClient:
                     if blog_id == "5786828":
                         logger.info(f"Skipping blog {blog_id}: temporarily disabled")
                         continue
-                    networks = self._networks_for_blog(blog_id)
+                    networks = self._effective_networks(blog_id, exclude_networks)
                     if not networks:
                         logger.warning(f"Skipping blog {blog_id}: no networks configured")
                         results.append({

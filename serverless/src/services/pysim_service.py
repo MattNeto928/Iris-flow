@@ -88,12 +88,28 @@ The subject must FILL most of the 1080x1920 canvas. Apply ALL of these:
 - Use generous marker sizes and line widths (s=200-500 for focal bodies, lw=2.5-4) so the
   subject reads on a phone.
 - Center the composition: the focal action should sit in the vertical middle of the frame,
-  with the title near the top (y~0.93) — never leave the entire bottom third empty.
+  with the title near the top (y~0.93) — never leave the entire middle band empty. (Captions/footnotes go at y~0.21-0.24, just above the platform-UI zone.)
 - **EXCEPTION for 3D MODELS (molecules, lattices, anything with spheres):** the 1.6
   z-stretch egg-shapes spheres. For ball-and-stick / lattice / sphere-based models use an
   EQUAL aspect instead — `ax.set_box_aspect((1, 1, 1), zoom=1.3)` — so spheres render round,
   and fill the vertical space with the title (top) and caption (bottom) rather than by
   stretching the geometry. Keep `(1, 1, 1.6)` only for scenes without spheres.
+
+## FEED CRAFT — first frame, cadence, UI-safe text, ending
+
+- **COLD OPEN:** frame_0000 must already show a complete, visually striking scene — the
+  payoff state, fully lit and composed. NEVER open on empty axes, a lone title, or the
+  start of a slow build. If the description names an on-screen hook line, it is visible
+  from the very first frame.
+- **VISUAL BEAT EVERY 3-5s:** nothing on screen may stay visually static for more than
+  ~5 seconds — keep a camera move, reveal, label fade, or parameter change always in flight.
+- **PLATFORM-UI SAFE ZONES (critical):** the platform overlays UI on the video — the
+  bottom ~18% (caption block / progress UI) and the right ~13% (like/share rail) of the
+  frame are COVERED. With fig.text coordinates: keep ALL text within y in [0.20, 0.94] and
+  x in [0.06, 0.85] (centered titles are fine). Geometry may extend further, but no text,
+  labels, or key detail in the bottom 18% or right 13%.
+- **ENDING:** finish on a composed, holdable frame (ideally echoing the opening state for
+  a clean loop). No fade-to-black, no dead tail.
 
 ## FRAME COUNT IS NON-NEGOTIABLE
 

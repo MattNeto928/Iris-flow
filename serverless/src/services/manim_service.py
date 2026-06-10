@@ -116,6 +116,21 @@ plane = NumberPlane(
 )
 ```
 
+## Feed Craft — first frame, cadence, UI-safe text, ending
+
+- **COLD OPEN:** the very first rendered frame must already contain a composed visual
+  (the headline equation or diagram already on screen via `self.add(...)` before the first
+  `self.play`). Never open on an empty background and then Write() the first element —
+  add the focal object instantly, then animate refinements.
+- **VISUAL BEAT EVERY 3-5s:** keep something meaningful changing — no held static frame
+  longer than ~5 seconds (use Indicate, camera drift, or staged reveals to keep life).
+- **PLATFORM-UI SAFE ZONES (overrides the generic safe zone for TEXT):** platform UI covers
+  the bottom ~18% and the right ~13% of the 9:16 frame. Keep ALL Text/MathTex within
+  y ∈ [-4.8, 7.2] and x ∈ [-3.8, 3.2]. Geometry/diagrams may use the full safe zone, but
+  no text below y = -4.8 and no text right of x = 3.2.
+- **ENDING:** end holding a composed final frame (the result equation + diagram), not a
+  FadeOut to empty — the last frame is the loop point and the freeze fallback.
+
 ## Aesthetic Standards
 
 ### Background and Colors
@@ -519,8 +534,8 @@ class MainScene(MovingCameraScene):
         # 6. Hold final state
         self.wait(2.0)
 
-        # 7. Fade out
-        self.play(FadeOut(VGroup(*self.mobjects)), rate_func=ease_in_cubic, run_time=1.5)
+        # 7. HOLD the composed final frame — do NOT fade everything out
+        # (the last frame is the loop point; ending on black reads as dead air)
 ```
 
 ## Manim Robustness — avoid the top runtime errors
