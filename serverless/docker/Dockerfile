@@ -59,12 +59,18 @@ RUN pip install --no-cache-dir \
     fal-client
 
 # Layer 3: Simulation & Visualization
+# NOTE: plotly==5.24.1 + kaleido==0.2.1 are PINNED on purpose. Kaleido 0.2.1 bundles
+# its own headless Chromium and supports fig.write_image(engine='kaleido'), which is
+# fast and hang-free for the per-frame 3D export this pipeline does. Kaleido v1.x
+# dropped the bundled Chrome, deprecated the engine= arg, and has documented hangs on
+# 3D-figure export in headless containers — leaving these unpinned would let a rebuild
+# pull v1 and silently break every Plotly segment. See src/services/plotly_service.py.
 RUN pip install --no-cache-dir \
     mesa==2.1.4 \
     pymunk==6.6.0 \
     simpy \
-    plotly \
-    kaleido \
+    "plotly==5.24.1" \
+    "kaleido==0.2.1" \
     networkx \
     seaborn \
     statsmodels \

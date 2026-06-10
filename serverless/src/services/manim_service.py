@@ -10,12 +10,10 @@ import uuid
 import logging
 import asyncio
 from pathlib import Path
-import anthropic
+
+from src.services._llm import generate_text, strip_code_fences, build_narration_timeline
 
 logger = logging.getLogger(__name__)
-
-# Initialize Anthropic client
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
 # Output directories
 OUTPUT_DIR = Path("/app/output")
@@ -512,8 +510,43 @@ class MainScene(MovingCameraScene):
         self.play(FadeOut(VGroup(*self.mobjects)), rate_func=ease_in_cubic, run_time=1.5)
 ```
 
+## Manim Robustness — avoid the top runtime errors
+
+These are the failures that actually crash renders in production. Do not trip them.
+
+**1. `VGroup` only holds VMobjects (this is the #1 crash).**
+`Text`, `MathTex`, `Tex`, and geometric shapes (`Circle`, `Line`, `Arrow`, `Dot`, `Axes`,
+`NumberPlane`) are VMobjects and may go in a `VGroup`. **3D mobjects (`Surface`,
+`Sphere`, `ThreeDAxes`, `Dot3D`), `ImageMobject`, and bare `Mobject`s are NOT
+VMobjects** — group those with `Group(...)`, never `VGroup(...)`. The error
+`Only values of type VMobject can be added as submobjects of VGroup` means a
+non-VMobject went into a `VGroup`; switch that one call to `Group(...)`. **When in
+doubt, use `Group`** — it accepts anything. Never put `None` or a Python list into either.
+
+**2. LaTeX must compile.** `MathTex`/`Tex` shell out to LaTeX:
+- Always use raw strings: `MathTex(r"\\frac{a}{b}")`.
+- Keep to standard amsmath. Balance every brace.
+- NO unicode inside `MathTex` (→ a `ParseException`). Put words/units/arrows in a
+  `Text(...)` instead, or wrap text inside math with `\\text{...}` / `\\mathrm{...}`.
+- For a label like "n → ∞" use `MathTex(r"n \\to \\infty")`, not the unicode arrow.
+
+**3. Don't reference a removed mobject.** After `FadeOut`/`ReplacementTransform`, the
+old mobject is gone — don't animate it again.
+
+## Timing Budget — fill the EXACT segment duration
+
+The rendered clip is matched to the voiceover length. If your animation is shorter than
+the target it freezes on the last frame while the narrator keeps talking; if it is longer
+the whole clip is time-compressed and every motion speeds up unnaturally. So make the total
+land on the target:
+
+- Keep a running mental total of every `run_time` plus every `self.wait(...)`.
+- That total MUST equal **{duration} seconds** (within ~1s).
+- End the scene with a final `self.wait(t)` sized to bring the total to {duration}.
+- Use the NARRATION TIMELINE below to decide WHEN each beat happens, not just how long.
+{narration_block}
 CRITICAL DYNAMIC REQUIREMENTS:
-- Target Duration: {duration} seconds
+- Target Duration: {duration} seconds (the sum of all run_time + wait must equal this)
 - Description: {description}
 
 GENERATE ONLY PYTHON CODE. Be concise — use loops, helper functions, and avoid repeating similar code blocks. No markdown, no explanation:
@@ -525,23 +558,23 @@ class ManimService:
         SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
         VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
     
-    async def generate(self, description: str, duration: float, previous_error: str = None) -> str:
+    async def generate(self, description: str, duration: float, previous_error: str = None, voiceover_text: str = None) -> str:
         """
         Generate a Manim video from description.
-        
+
         1. Generate Manim script with Claude
         2. Render with Manim
-        
+
         Returns path to generated video.
         """
         video_id = str(uuid.uuid4())[:8]
-        
+
         logger.info(f"[Manim] Generating script for {duration}s video")
         if previous_error:
             logger.info(f"[Manim] Retrying with error context: {previous_error}")
-        
+
         # Step 1: Generate script
-        script = await self._generate_script(description, duration, previous_error)
+        script = await self._generate_script(description, duration, previous_error, voiceover_text)
         logger.info(f"[Manim] Script generated ({len(script)} chars)")
         
         # Step 2: Render
@@ -565,9 +598,9 @@ class ManimService:
         
         return video_path
     
-    async def _generate_script(self, description: str, duration: float, previous_error: str = None) -> str:
-        """Generate Manim script using Claude."""
-        
+    async def _generate_script(self, description: str, duration: float, previous_error: str = None, voiceover_text: str = None) -> str:
+        """Generate Manim script using Claude (streaming + adaptive thinking)."""
+
         # Add error context if retrying
         error_context = ""
         if previous_error:
@@ -576,35 +609,26 @@ class ManimService:
 {previous_error}
 *** YOU MUST FIX THIS ERROR IN THE NEW SCRIPT ***
 """
-        
+
+        narration_block = build_narration_timeline(voiceover_text, duration)
+
         # Use replace() instead of format() to avoid conflicts with curly braces in the prompt examples
-        prompt = MANIM_PROMPT.replace("{description}", description).replace("{duration}", str(duration)) + error_context
-        
-        self._last_prompt = prompt
-        
-        self._last_model = 'claude-fable-5'
-        
-        message = client.messages.create(
-            model="claude-fable-5",
-            max_tokens=16384,
-            messages=[{"role": "user", "content": prompt}]
+        prompt = (
+            MANIM_PROMPT
+            .replace("{narration_block}", narration_block)
+            .replace("{description}", description)
+            .replace("{duration}", str(duration))
+            + error_context
         )
-        
-        response_text = "".join(_b.text for _b in message.content if getattr(_b,"type",None)=="text")
-        if message.stop_reason == "max_tokens":
+
+        self._last_prompt = prompt
+        self._last_model = "claude-fable-5"
+
+        response_text, stop_reason = generate_text(prompt, max_tokens=32000)
+        if stop_reason == "max_tokens":
             raise RuntimeError("Code generation was truncated (hit max_tokens). The description may be too complex for a single segment.")
-        
-        # Clean markdown if present
-        if "```python" in response_text:
-            start = response_text.find("```python") + 9
-            end = response_text.find("```", start)
-            response_text = response_text[start:end].strip()
-        elif "```" in response_text:
-            start = response_text.find("```") + 3
-            end = response_text.find("```", start)
-            response_text = response_text[start:end].strip()
-        
-        return response_text
+
+        return strip_code_fences(response_text)
     
     async def _render(self, script: str, video_id: str, scene_name: str = "MainScene") -> str:
         """Render Manim scene."""

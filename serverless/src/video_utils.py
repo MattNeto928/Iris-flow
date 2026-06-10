@@ -44,14 +44,26 @@ def get_duration(path: str) -> float:
 
 
 def match_duration(video_path: str, target_duration: float) -> str:
-    """Time-stretch video to match target duration."""
+    """Retime a video toward the target duration, clamped to a gentle band.
+
+    matplotlib/plotly segments now render the exact frame count (DURATION is
+    injected), so this is a no-op for them. Manim has no exact-duration guarantee;
+    we nudge it toward the target with `setpts`, but CLAMP the speed factor so we
+    never apply extreme slow-motion or fast-forward to the animation (that is the
+    "physics looks off" artifact). Whatever residual mismatch remains is absorbed
+    by combine_audio_video, which freezes the last frame (if short) or trims (if
+    long) to the audio — a brief frozen tail reads far better than warped motion.
+    """
     video_duration = get_duration(video_path)
 
     if abs(video_duration - target_duration) < 0.05:
         return video_path
 
     speed_factor = video_duration / target_duration
-    pts_factor = 1 / speed_factor
+    # Clamp to [0.7x, 1.4x]. Beyond this, retiming would visibly distort motion;
+    # let the downstream pad/trim handle the remainder instead.
+    clamped = max(0.7, min(1.4, speed_factor))
+    pts_factor = 1.0 / clamped
 
     output_path = str(Path(video_path).with_suffix('.stretched.mp4'))
 

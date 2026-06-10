@@ -18,11 +18,9 @@ import logging
 from typing import List
 from dataclasses import dataclass
 
-import anthropic
+from src.services._llm import generate_text
 
 logger = logging.getLogger(__name__)
-
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
 MODEL = "claude-fable-5"
 
@@ -185,12 +183,9 @@ async def generate_story(
         + duration_hint
     )
 
-    message = client.messages.create(
-        model=MODEL,
-        max_tokens=16384,
-        messages=[{"role": "user", "content": full_prompt}],
-    )
-    response_text = "".join(_b.text for _b in message.content if getattr(_b,"type",None)=="text")
+    # Streaming + adaptive thinking (avoids the non-streaming "Streaming is required"
+    # failure and lets the model plan the three-act structure before writing).
+    response_text, _stop = generate_text(full_prompt, max_tokens=20000, use_thinking=True)
 
     try:
         result = json.loads(response_text)

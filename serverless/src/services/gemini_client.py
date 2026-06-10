@@ -10,11 +10,10 @@ import json
 import logging
 from typing import List
 from dataclasses import dataclass
-import anthropic
+
+from src.services._llm import generate_text
 
 logger = logging.getLogger(__name__)
-
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
 
 @dataclass
@@ -158,6 +157,22 @@ Speed: default 1.0. Use 0.97 for equation-heavy segments, 1.02 for summary segme
 Title card voiceover: one short sentence only. "Now, the dispersion relation." or
 "The Drude model explains this." Keep under 40 characters.
 
+=== VISUAL / NARRATION SYNC — THIS IS WHAT MAKES IT FEEL POLISHED ===
+
+The renderer receives BOTH the `description` and the segment's `voiceover` text, and it
+times on-screen events to the words. So the two must agree, or the video will look like the
+narration is describing something other than what is on screen:
+- The `description` must introduce events in the SAME ORDER the voiceover mentions them.
+  ("First the ball falls, then it bounces" -> describe the fall before the bounce.)
+- Never name a result in the voiceover before the description shows it; never leave the
+  description still setting up after the narration has moved on.
+- Put the ONE key moment ("watch what happens when...") at roughly the same point in both.
+- Keep them proportional: chars_in_voiceover / 15 should ~ the natural length of the visual
+  you describe. A 30s visual with a 10s voiceover leaves dead air; a 10s visual under 30s of
+  narration freezes on screen. Size them to match.
+- In the `description`, when a beat is pinned to a moment, say so ("at the midpoint, the
+  field reverses") — the renderer uses these cues to line the animation up to the words.
+
 === REQUIRED JSON FORMAT ===
 
 For each segment provide:
@@ -229,13 +244,9 @@ async def generate_segments_from_prompt(
     full_prompt = SEGMENT_GENERATION_PROMPT + prompt + duration_hint
 
     model = "claude-fable-5"
-    message = client.messages.create(
-        model=model,
-        max_tokens=16384,
-        messages=[{"role": "user", "content": full_prompt}]
-    )
-
-    response_text = "".join(_b.text for _b in message.content if getattr(_b,"type",None)=="text")
+    # Streaming + adaptive thinking: the model plans the timed segment breakdown
+    # (and avoids the non-streaming "Streaming is required" failure on long outputs).
+    response_text, _stop = generate_text(full_prompt, max_tokens=20000, use_thinking=True)
 
     # Extract JSON
     try:
@@ -294,12 +305,8 @@ async def generate_caption(topic: str) -> dict:
     import json as _json
     prompt = CAPTION_PROMPT.format(topic=topic)
     model = "claude-fable-5"
-    message = client.messages.create(
-        model=model,
-        max_tokens=2048,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    raw = "".join(_b.text for _b in message.content if getattr(_b,"type",None)=="text").strip()
+    raw, _stop = generate_text(prompt, max_tokens=2048, use_thinking=False)
+    raw = raw.strip()
     # Sometimes Claude wraps in markdown fences; strip them.
     if raw.startswith("```"):
         raw = raw.strip("`")

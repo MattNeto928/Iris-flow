@@ -312,6 +312,9 @@ async def job_visual():
     duration = seg['duration']
     seg_type = seg['type']
     description = seg['description']
+    # Narration text for this segment — passed to the visual generator so on-screen
+    # events can be timed to the words (otherwise the visual never sees what is said).
+    voiceover_text = (seg.get('voiceover') or {}).get('text')
 
     # Title cards are rendered inline — no Claude API call needed
     if seg_type == "title_card":
@@ -329,6 +332,7 @@ async def job_visual():
                     description=description,
                     duration=duration,
                     previous_error=last_error if attempt > 0 else None,
+                    voiceover_text=voiceover_text,
                 )
 
                 if not video_path:
