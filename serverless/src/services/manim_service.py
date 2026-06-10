@@ -11,7 +11,7 @@ import logging
 import asyncio
 from pathlib import Path
 
-from src.services._llm import generate_text, strip_code_fences, build_narration_timeline
+from src.services._llm import generate_text, strip_code_fences, build_narration_timeline, validate_script
 
 logger = logging.getLogger(__name__)
 
@@ -641,7 +641,7 @@ class ManimService:
         if stop_reason == "max_tokens":
             raise RuntimeError("Code generation was truncated (hit max_tokens). The description may be too complex for a single segment.")
 
-        return strip_code_fences(response_text)
+        return validate_script(strip_code_fences(response_text), "class MainScene", stop_reason, "manim")
     
     async def _render(self, script: str, video_id: str, scene_name: str = "MainScene") -> str:
         """Render Manim scene."""

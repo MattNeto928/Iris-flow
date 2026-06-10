@@ -12,7 +12,7 @@ import subprocess
 import asyncio
 from pathlib import Path
 
-from src.services._llm import generate_text, strip_code_fences, build_narration_timeline
+from src.services._llm import generate_text, strip_code_fences, build_narration_timeline, validate_script
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,11 @@ The subject must FILL most of the 1080x1920 canvas. Apply ALL of these:
   subject reads on a phone.
 - Center the composition: the focal action should sit in the vertical middle of the frame,
   with the title near the top (y~0.93) — never leave the entire bottom third empty.
+- **EXCEPTION for 3D MODELS (molecules, lattices, anything with spheres):** the 1.6
+  z-stretch egg-shapes spheres. For ball-and-stick / lattice / sphere-based models use an
+  EQUAL aspect instead — `ax.set_box_aspect((1, 1, 1), zoom=1.3)` — so spheres render round,
+  and fill the vertical space with the title (top) and caption (bottom) rather than by
+  stretching the geometry. Keep `(1, 1, 1.6)` only for scenes without spheres.
 
 ## FRAME COUNT IS NON-NEGOTIABLE
 
@@ -548,7 +553,7 @@ class PysimService:
         if stop_reason == "max_tokens":
             raise RuntimeError("Code generation was truncated (hit max_tokens). The description may be too complex for a single segment.")
 
-        return strip_code_fences(response_text)
+        return validate_script(strip_code_fences(response_text), "savefig", stop_reason, "matplotlib")
 
     async def _run_simulation(self, script: str, output_dir: str, duration: float):
         """Run the simulation script."""

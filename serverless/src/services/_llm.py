@@ -63,7 +63,29 @@ def generate_text(
     text = "".join(
         b.text for b in message.content if getattr(b, "type", None) == "text"
     ).strip()
+    logger.info(
+        f"[LLM] response: {len(text)} chars text, stop_reason={message.stop_reason}"
+    )
     return text, message.stop_reason
+
+
+def validate_script(script: str, must_contain: str, stop_reason: str, what: str) -> str:
+    """Reject empty / truncated / non-script responses BEFORE they are executed.
+
+    Production failure mode this guards: the model occasionally returns an
+    empty or trivial text response (e.g. thinking-only output under load). An
+    empty Python file runs and exits 0 without writing any frames, so the
+    failure surfaced as a confusing "No frames found" three attempts in a row.
+    Raising here instead gives the retry loop a precise error to feed back.
+    """
+    if len(script) < 200 or must_contain not in script:
+        raise RuntimeError(
+            f"Generated {what} script was empty or incomplete "
+            f"(len={len(script)}, stop_reason={stop_reason}, "
+            f"missing required call '{must_contain}'). Respond with ONLY the "
+            f"complete Python script — no commentary, no empty response."
+        )
+    return script
 
 
 def strip_code_fences(text: str) -> str:

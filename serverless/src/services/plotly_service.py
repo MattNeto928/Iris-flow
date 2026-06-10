@@ -11,7 +11,7 @@ import logging
 import asyncio
 from pathlib import Path
 
-from src.services._llm import generate_text, strip_code_fences, build_narration_timeline
+from src.services._llm import generate_text, strip_code_fences, build_narration_timeline, validate_script
 
 logger = logging.getLogger(__name__)
 
@@ -285,7 +285,7 @@ class PlotlyService:
         if stop_reason == "max_tokens":
             raise RuntimeError("Code generation was truncated (hit max_tokens). The description may be too complex for a single segment.")
 
-        return strip_code_fences(response_text)
+        return validate_script(strip_code_fences(response_text), "write_image", stop_reason, "plotly")
 
     async def _run_visualization(self, script: str, output_dir: str, duration: float):
         """Run the Plotly script."""

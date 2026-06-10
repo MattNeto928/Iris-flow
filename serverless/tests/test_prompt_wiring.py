@@ -7,6 +7,16 @@ import src.services.plotly_service as plotly
 import src.services.manim_service as manim
 
 
+# Canned response long enough (>200 chars) and containing every engine's required
+# marker, so it passes validate_script regardless of which service is under test.
+_CANNED_SCRIPT = (
+    "# canned test script\n" * 12
+    + "class MainScene:\n    pass\n"
+    + "fig.savefig('frame_0000.png')\n"
+    + "fig.write_image('frame_0000.png')\n"
+)
+
+
 def _capture(monkeypatch, module):
     """Patch the module's generate_text to record the prompt and return canned code."""
     box = {}
@@ -14,7 +24,7 @@ def _capture(monkeypatch, module):
     def fake_generate_text(prompt, max_tokens=32000, use_thinking=True):
         box["prompt"] = prompt
         box["max_tokens"] = max_tokens
-        return ("print('frame')", "end_turn")
+        return (_CANNED_SCRIPT, "end_turn")
 
     monkeypatch.setattr(module, "generate_text", fake_generate_text)
     return box
