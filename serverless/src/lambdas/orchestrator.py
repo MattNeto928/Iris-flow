@@ -1,9 +1,16 @@
 """
 Orchestrator Lambda — starts a Step Functions execution per video.
 
-Triggered by EventBridge (4x daily). Reads one topic from SQS if available;
-otherwise passes an empty topic string and lets the Batch prep job pick one
-from TopicManager.
+Triggered by EventBridge. Reads one topic from SQS if available; otherwise
+passes an empty topic string and lets the Batch prep job pick one from
+TopicManager.
+
+The triggering EventBridge rule may pass a constant {"include_youtube": bool}.
+The STEM schedule uses two rules to cap YouTube at 2 posts/day: most triggers
+set include_youtube=false (IG/TikTok/Facebook only) and only a couple set it
+true. The flag is threaded onto the execution input and ultimately controls the
+Metricool network list in postprocess. It defaults to True when absent (manual
+invokes, the story pipeline) so existing behavior is unchanged.
 """
 
 import os
@@ -70,11 +77,16 @@ def handler(event, context):
     video_id = str(uuid.uuid4())[:8]
     schedule_time = _random_schedule_time()
 
+    # EventBridge passes {"include_youtube": bool} as a constant input; defaults
+    # to True for manual invokes / raw scheduled events that don't set it.
+    include_youtube = event.get('include_youtube', True) if isinstance(event, dict) else True
+
     execution_input = {
         'video_id': video_id,
-        'topic': topic,                  # empty string → prep job uses its TopicManager
+        'topic': topic,                    # empty string → prep job uses its TopicManager
         'target_duration': TARGET_DURATION,
-        'schedule_time': schedule_time,  # ISO-8601 UTC, passed to postprocess
+        'schedule_time': schedule_time,    # ISO-8601 UTC, passed to postprocess
+        'include_youtube': include_youtube,  # gates the YouTube network in postprocess
     }
 
     sfn.start_execution(
@@ -83,5 +95,13 @@ def handler(event, context):
         input=json.dumps(execution_input),
     )
 
-    logger.info(f"Started execution video_id={video_id} schedule_time={schedule_time}")
-    return {'video_id': video_id, 'schedule_time': schedule_time, 'started': True}
+    logger.info(
+        f"Started execution video_id={video_id} schedule_time={schedule_time} "
+        f"include_youtube={include_youtube}"
+    )
+    return {
+        'video_id': video_id,
+        'schedule_time': schedule_time,
+        'include_youtube': include_youtube,
+        'started': True,
+    }

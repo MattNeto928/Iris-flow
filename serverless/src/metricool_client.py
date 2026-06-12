@@ -250,6 +250,7 @@ class MetricoolClient:
         caption: str,
         schedule_time: datetime,
         youtube_title: str,
+        include_youtube: bool = True,
         tiktok_title: Optional[str] = None,
         audio_name: Optional[str] = None,
     ) -> dict:
@@ -261,6 +262,9 @@ class MetricoolClient:
             caption: Social media caption with hashtags
             schedule_time: When to publish (should be 24h from now)
             youtube_title: Title for YouTube (must be < 100 chars)
+            include_youtube: When False, the youtube network is dropped from
+                every blog's network list (used to cap YouTube at 2 posts/day).
+                Other networks (IG/TikTok/Facebook) are unaffected.
             tiktok_title: Optional separate title for TikTok
 
         Returns:
@@ -302,6 +306,8 @@ class MetricoolClient:
                         logger.info(f"Skipping blog {blog_id}: temporarily disabled")
                         continue
                     networks = self._networks_for_blog(blog_id)
+                    if not include_youtube:
+                        networks = [n for n in networks if n != "youtube"]
                     if not networks:
                         logger.warning(f"Skipping blog {blog_id}: no networks configured")
                         results.append({

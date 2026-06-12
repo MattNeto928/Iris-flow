@@ -464,8 +464,11 @@ export class IrisFlowStack extends cdk.Stack {
       });
 
       // Step 5: Postprocess Batch Job
-      // The orchestrator Lambda always sets schedule_time on the execution input
-      // (random 30 min – 6 hr from now), so $.schedule_time is guaranteed present.
+      // The orchestrator Lambda always sets schedule_time AND include_youtube on
+      // the execution input, so $.schedule_time and $.include_youtube are both
+      // guaranteed present. include_youtube (true/false) caps YouTube at 2 posts
+      // per day: postprocess passes it to Metricool, which drops the youtube
+      // network when false. States.Format stringifies the bool for the env var.
       const postprocessJob = new tasks.BatchSubmitJob(this, `${idPrefix}PostprocessJob`, {
         jobDefinitionArn: jobDefs.postprocess.jobDefinitionArn,
         jobName: sfn.JsonPath.format('postprocess-{}', sfn.JsonPath.stringAt('$.video_id')),
@@ -474,6 +477,7 @@ export class IrisFlowStack extends cdk.Stack {
           environment: {
             VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
             SCHEDULE_TIME: sfn.JsonPath.stringAt('$.schedule_time'),
+            INCLUDE_YOUTUBE: sfn.JsonPath.stringAt("States.Format('{}', $.include_youtube)"),
           },
         },
         resultPath: '$.postprocessResult',
@@ -533,33 +537,61 @@ export class IrisFlowStack extends cdk.Stack {
     storyStateMachine.grantStartExecution(storyOrchestratorFn);
 
     // =============================================
-    // EventBridge: 4× daily orchestrator trigger
-    // Fires at 11:00, 16:00, 20:00, 00:00 UTC = 6am, 11am, 3pm, 7pm EST.
-    // Each invocation generates ONE video and picks a random posting time
-    // in the next 30 min – 6 hr, so posts spread organically across the day.
+    // EventBridge: STEM orchestrator trigger — 5× daily.
+    //
+    // Each invocation generates ONE video and picks a random posting time in the
+    // next 30 min – 6 hr, so posts spread organically across the day.
+    //
+    // YouTube is capped at 2 posts/day. The schedule is split into two rules that
+    // hit the SAME orchestrator Lambda but pass a different constant
+    // `include_youtube` flag. The orchestrator threads it onto the execution
+    // input → postprocess → Metricool, which drops the youtube network when
+    // false. IG/TikTok/Facebook receive all 5 videos/day; YouTube only 2.
     // =============================================
-    const scheduleRule = new events.Rule(this, 'DailySchedule', {
-      ruleName: 'iris-flow-daily-morning',
-      description: 'Trigger orchestrator Lambda 4× daily (6am, 11am, 3pm, 7pm EST)',
+
+    // 2× daily WITH YouTube — prime US engagement windows.
+    // 18:00 UTC = 1pm EST, 00:00 UTC = 7pm EST.
+    const scheduleRuleYouTube = new events.Rule(this, 'DailyScheduleYouTube', {
+      ruleName: 'iris-flow-daily-youtube',
+      description: 'STEM orchestrator 2× daily WITH YouTube (1pm, 7pm EST)',
       enabled: true,
       schedule: events.Schedule.cron({
         minute: '0',
-        hour: '0,11,16,20', // 4× daily, UTC
+        hour: '18,0', // 2× daily, UTC
       }),
     });
+    scheduleRuleYouTube.addTarget(new targets.LambdaFunction(orchestratorFn, {
+      event: events.RuleTargetInput.fromObject({ include_youtube: true }),
+    }));
 
-    scheduleRule.addTarget(new targets.LambdaFunction(orchestratorFn));
-
-    // Story schedule — 4× daily, OFFSET ~2h from the STEM trigger so the two
-    // pipelines don't hit the Gemini / Anthropic APIs at the same instant.
-    // Fires at 02:00, 13:00, 18:00, 22:00 UTC.
-    const storyScheduleRule = new events.Rule(this, 'StoryDailySchedule', {
-      ruleName: 'iris-story-daily',
-      description: 'Trigger story orchestrator Lambda 4× daily (offset from STEM)',
+    // 3× daily WITHOUT YouTube — IG/TikTok/Facebook only.
+    // 11:00 UTC = 6am, 15:00 = 10am, 21:00 = 4pm EST.
+    const scheduleRuleNoYouTube = new events.Rule(this, 'DailyScheduleNoYouTube', {
+      ruleName: 'iris-flow-daily-no-youtube',
+      description: 'STEM orchestrator 3× daily WITHOUT YouTube (6am, 10am, 4pm EST)',
       enabled: true,
       schedule: events.Schedule.cron({
         minute: '0',
-        hour: '2,13,18,22', // 4× daily, UTC, offset from STEM's 0,11,16,20
+        hour: '11,15,21', // 3× daily, UTC
+      }),
+    });
+    scheduleRuleNoYouTube.addTarget(new targets.LambdaFunction(orchestratorFn, {
+      event: events.RuleTargetInput.fromObject({ include_youtube: false }),
+    }));
+
+    // Story schedule — PAUSED. The story pipeline (state machine, orchestrator,
+    // queue, and Batch job defs) stays fully deployed, but this EventBridge rule
+    // is DISABLED so no new story executions are triggered. Flip `enabled` back
+    // to true to resume. When enabled it fires 4× daily at 02/13/18/22 UTC,
+    // offset ~2h from the STEM triggers so the two pipelines don't hit the
+    // Gemini / Anthropic APIs at the same instant.
+    const storyScheduleRule = new events.Rule(this, 'StoryDailySchedule', {
+      ruleName: 'iris-story-daily',
+      description: 'PAUSED — story orchestrator trigger (disabled; set enabled=true to resume)',
+      enabled: false,
+      schedule: events.Schedule.cron({
+        minute: '0',
+        hour: '2,13,18,22', // 4× daily, UTC (only fires when enabled)
       }),
     });
     storyScheduleRule.addTarget(new targets.LambdaFunction(storyOrchestratorFn));

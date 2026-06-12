@@ -609,12 +609,20 @@ async def job_postprocess():
     if not dry_run and schedule_time_str:
         metricool = MetricoolClient()
         schedule_time = datetime.fromisoformat(schedule_time_str)
-        logger.info(f"[{video_id}] Scheduling to Metricool for {schedule_time}...")
+        # INCLUDE_YOUTUBE is set per-execution by the orchestrator (via the
+        # triggering EventBridge rule) to cap YouTube at 2 posts/day. When false,
+        # Metricool drops the youtube network. Defaults to true.
+        include_youtube = os.environ.get('INCLUDE_YOUTUBE', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+        logger.info(
+            f"[{video_id}] Scheduling to Metricool for {schedule_time} "
+            f"(include_youtube={include_youtube})..."
+        )
         schedule_result = await metricool.schedule_post(
             video_url=video_url,
             caption=caption,
             schedule_time=schedule_time,
             youtube_title=youtube_title,
+            include_youtube=include_youtube,
         )
         for brand_result in schedule_result.get('results', []):
             brand_id = brand_result.get('blog_id')
