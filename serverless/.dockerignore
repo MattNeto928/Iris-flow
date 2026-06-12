@@ -1,0 +1,8 @@
+# The image only COPYs src/. Keep the build context small and reproducible by
+# excluding the CDK toolchain, build artifacts, and local caches.
+cdk/node_modules
+cdk/cdk.out
+**/__pycache__
+**/*.pyc
+.git
+*.log
