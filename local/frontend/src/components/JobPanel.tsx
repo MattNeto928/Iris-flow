@@ -332,7 +332,7 @@ export function JobPanel({
         <div className="px-3 pb-3 border-t mt-auto pt-3" style={{ borderColor: 'rgba(255,255,255,0.07)' }}>
           <details>
             <summary className="text-[10px] text-zinc-600 cursor-pointer hover:text-zinc-400 select-none transition-colors">
-              Master prompt ({job.llm_model || 'claude-opus-4-7'})
+              Master prompt ({job.llm_model || 'claude-opus-4-8'})
             </summary>
             <pre className="mt-2 log-terminal whitespace-pre-wrap text-zinc-500 max-h-[120px]">
               {job.llm_prompt}

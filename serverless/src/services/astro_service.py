@@ -400,10 +400,10 @@ class AstroService:
         
         self._last_prompt = final_prompt
         
-        self._last_model = 'claude-fable-5'
+        self._last_model = 'claude-opus-4-8'
         
         message = client.messages.create(
-            model="claude-fable-5",
+            model="claude-opus-4-8",
             max_tokens=16384,
             messages=[{"role": "user", "content": final_prompt}]
         )

@@ -158,7 +158,7 @@ export function PromptInput({ onSubmit, isLoading }: PromptInputProps) {
           <div className="mt-3" style={{ animation: 'slide-up 0.15s ease' }}>
             <details open>
               <summary className="text-[10px] text-zinc-600 cursor-pointer hover:text-zinc-400 select-none transition-colors uppercase tracking-wider">
-                Master prompt preview (claude-opus-4-7)
+                Master prompt preview (claude-opus-4-8)
               </summary>
               <pre className="mt-2 log-terminal whitespace-pre-wrap text-zinc-500 max-h-[240px]">
                 {previewText}

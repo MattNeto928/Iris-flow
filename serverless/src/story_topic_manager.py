@@ -114,7 +114,7 @@ Return ONLY a JSON object (no markdown):
 
         try:
             response = anthropic_client.messages.create(
-                model="claude-fable-5",
+                model="claude-opus-4-8",
                 max_tokens=4096,
                 messages=[{"role": "user", "content": prompt}],
             )

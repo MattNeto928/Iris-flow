@@ -123,7 +123,7 @@ export const Root: React.FC = () => {
         prompt = REMOTION_PROMPT.format(skill_content=skill_content).replace("{description}", description).replace("{duration}", str(duration))
         
         self._last_prompt = prompt
-        self._last_model = 'claude-fable-5'
+        self._last_model = 'claude-opus-4-8'
 
         logger.info(f"[Remotion] Requesting TSX from Claude...")
         message = client.messages.create(

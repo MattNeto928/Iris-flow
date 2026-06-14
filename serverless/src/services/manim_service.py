@@ -582,10 +582,10 @@ class ManimService:
         
         self._last_prompt = prompt
         
-        self._last_model = 'claude-fable-5'
+        self._last_model = 'claude-opus-4-8'
         
         message = client.messages.create(
-            model="claude-fable-5",
+            model="claude-opus-4-8",
             max_tokens=16384,
             messages=[{"role": "user", "content": prompt}]
         )

@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
-MODEL = "claude-fable-5"
+MODEL = "claude-opus-4-8"
 
 
 @dataclass
