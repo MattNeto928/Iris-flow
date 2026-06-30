@@ -35,10 +35,11 @@ TARGET_DURATION = int(os.environ.get('TARGET_DURATION', '90'))
 EXEC_PREFIX = os.environ.get('EXEC_PREFIX', 'iris-flow')
 
 # Random scheduling window: post anywhere from MIN_DELAY_MIN to MAX_DELAY_MIN
-# minutes from now. With EventBridge firing 4× daily, this spreads posts
-# organically across each ~6-hour window rather than clustering at trigger time.
-MIN_DELAY_MIN = 30        # don't post before the pipeline has finished (~15 min runtime)
-MAX_DELAY_MIN = 6 * 60    # 6 hours — matches the EventBridge interval
+# minutes from now. schedule_time is computed at trigger time, BEFORE the ~12-15
+# min render runs, so MIN_DELAY_MIN must stay safely above the pipeline runtime
+# to guarantee the post is scheduled only after the video is finished and uploaded.
+MIN_DELAY_MIN = 30        # don't post before the pipeline has finished (~12-15 min runtime)
+MAX_DELAY_MIN = 90        # 1.5 h — keeps posts fresh while still adding light jitter
 
 
 def _random_schedule_time() -> str:

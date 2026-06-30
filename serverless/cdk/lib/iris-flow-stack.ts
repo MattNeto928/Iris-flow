@@ -14,6 +14,10 @@ import * as batch from 'aws-cdk-lib/aws-batch';
 import * as lambda_ from 'aws-cdk-lib/aws-lambda';
 import * as sfn from 'aws-cdk-lib/aws-stepfunctions';
 import * as tasks from 'aws-cdk-lib/aws-stepfunctions-tasks';
+import * as sns from 'aws-cdk-lib/aws-sns';
+import * as subscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cw_actions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import { Construct } from 'constructs';
 
 export class IrisFlowStack extends cdk.Stack {
@@ -95,6 +99,38 @@ export class IrisFlowStack extends cdk.Stack {
       visibilityTimeout: cdk.Duration.minutes(30),
       retentionPeriod: cdk.Duration.days(14),
     });
+
+    // =====================
+    // SNS alerts + low-queue alarm
+    // =====================
+    // Operational alerts (queue running low/empty, etc.) email mattneto928.
+    const alertsTopic = new sns.Topic(this, 'AlertsTopic', {
+      topicName: 'iris-flow-alerts',
+      displayName: 'Iris-flow alerts',
+    });
+    alertsTopic.addSubscription(
+      new subscriptions.EmailSubscription('mattneto928@gmail.com')
+    );
+
+    // Warn when the STEM topic queue runs low (<=5) or empties, so it can be
+    // refilled (python scripts/populate_mega_topics.py). One email per state
+    // change (OK -> ALARM), not per evaluation. treatMissingData=BREACHING so
+    // a fully-drained, idle queue (which stops emitting the metric) still alerts.
+    const topicQueueLowAlarm = new cloudwatch.Alarm(this, 'TopicQueueLowAlarm', {
+      alarmName: 'iris-flow-topic-queue-low',
+      alarmDescription:
+        'STEM topic queue is low/empty — refill via scripts/populate_mega_topics.py',
+      metric: topicQueue.metricApproximateNumberOfMessagesVisible({
+        period: cdk.Duration.minutes(5),
+        statistic: 'Maximum',
+      }),
+      threshold: 5,
+      comparisonOperator:
+        cloudwatch.ComparisonOperator.LESS_THAN_OR_EQUAL_TO_THRESHOLD,
+      evaluationPeriods: 1,
+      treatMissingData: cloudwatch.TreatMissingData.BREACHING,
+    });
+    topicQueueLowAlarm.addAlarmAction(new cw_actions.SnsAction(alertsTopic));
 
     // =====================
     // Secrets Manager
