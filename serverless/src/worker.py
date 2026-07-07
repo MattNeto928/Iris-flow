@@ -54,9 +54,13 @@ for d in [AUDIO_DIR, VIDEO_DIR, COMBINED_DIR, IMAGE_DIR]:
 # Service registry — 3 engines + title_card (inline, no service)
 # ============================================================
 SERVICE_MAP = {
-    "matplotlib": ("src.services.pysim_service", "PysimService"),
-    "manim":      ("src.services.manim_service",  "ManimService"),
-    "plotly":     ("src.services.plotly_service", "PlotlyService"),
+    "matplotlib": ("src.services.pysim_service",   "PysimService"),
+    "manim":      ("src.services.manim_service",   "ManimService"),
+    "plotly":     ("src.services.plotly_service",  "PlotlyService"),
+    # networkx: dedicated graph/network engine. Re-enabled 2026-07 — analytics
+    # showed graph-based videos are the top performers (highest median views).
+    # Deps (networkx) already ship in the image; interface matches PysimService.
+    "networkx":   ("src.services.networkx_service", "NetworkxService"),
     # "title_card" is handled inline in job_visual — no service needed
 }
 

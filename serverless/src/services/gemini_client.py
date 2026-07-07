@@ -27,7 +27,7 @@ class VoiceoverConfig:
 @dataclass
 class Segment:
     order: int
-    type: str  # "matplotlib", "manim", "plotly", "title_card"
+    type: str  # "networkx", "matplotlib", "manim", "plotly", "title_card"
     title: str
     description: str
     voiceover: VoiceoverConfig = None
@@ -67,24 +67,42 @@ Each segment serves a clear pedagogical role:
 
 Not every video needs all five — pick the ones that matter for the topic.
 
-=== SEGMENT TYPES (4 AVAILABLE) ===
+=== SEGMENT TYPES (5 AVAILABLE) ===
 
-**1. "matplotlib" — Physics simulations and scientific visualizations**
+**1. "networkx" — Graphs, networks, and algorithms that run on them**  ⭐ HIGH-PERFORMING — PREFER WHEN APPLICABLE
+USE FOR: anything that IS a graph or runs on one — nodes and edges, shortest-path / BFS /
+DFS / Dijkstra / Bellman-Ford, spanning trees, PageRank, network growth and connectivity,
+percolation, community detection, sorting and data structures shown as node-link diagrams,
+and counterintuitive network results (e.g. Braess's paradox, small-world, six degrees).
+Renders step-by-step animations of nodes lighting up and edges being traversed.
+
+PRIORITY RULE: if a topic can be honestly framed as *entities and the relationships between
+them*, prefer "networkx" — these graph visualizations are consistently our best-performing
+style. Reach for it before defaulting to matplotlib whenever the framing fits.
+
+**2. "matplotlib" — Simulations, physical motion, and scientific visualizations**  ⭐ FAVOR RUNNING SIMULATIONS
 USE FOR: Any segment involving motion, particles, waves, fields, trajectories, schematics,
 cross-sections, process diagrams, orbital mechanics, electron behavior, physical geometry.
 
-**DEFAULT TO 3D.** When the topic has any spatial geometry — surfaces, fields, volumes,
-particle clouds, crystal structures, wavefunctions — use mpl_toolkits.mplot3d. 3D is the
-default; 2D is the exception.
+**FAVOR ACTUAL SIMULATION over static illustration.** The strongest matplotlib segments
+*run a system and show it evolve*: agent-based models, particle systems, cellular automata,
+Monte Carlo convergence, reaction-diffusion, N-body gravity, flocking, epidemic spread,
+random walks. Prefer "integrate the dynamics and animate the emergent behavior" over "draw a
+labeled diagram." For 2D rigid-body physics (collisions, pendulums, ropes, stacking), request
+a **Pymunk** physics simulation in the description — the engine supports it.
 
-Key 3D patterns to request in description:
+**DEFAULT TO 3D** for spatial geometry — surfaces, fields, volumes, particle clouds, crystal
+structures, wavefunctions — use mpl_toolkits.mplot3d. 3D is the default; 2D is the exception.
+
+Key patterns to request in description:
+- "agent-based simulation of X, N agents, show the emergent pattern forming over time"
+- "Pymunk 2D physics: chain of linked bodies falling and settling under gravity"
+- "Monte Carlo estimate of X — scatter samples, running estimate converging live"
 - "driven oscillator sweeping through resonance" — bead on spring, Verlet integration
-- "electron sea sloshing in nanoparticle" — two point clouds, one oscillating
 - "surface plot of dispersion relation" — rotating 3D surface with camera sweep
 - "vector field in 3D" — quiver arrows showing E or B field
-- "orbital trajectory" — parametric 3D curve with fading trail
 
-**2. "manim" — Mathematical derivations and equations**
+**3. "manim" — Mathematical derivations and equations**
 USE FOR: Any segment whose core content is an equation, derivation, formula step-through,
 or symbolic manipulation. Manim renders real LaTeX via MathTex. If a segment needs BOTH
 3D geometry AND overlaid equations, use manim ThreeDScene.
@@ -92,22 +110,23 @@ or symbolic manipulation. Manim renders real LaTeX via MathTex. If a segment nee
 RULE: If the viewer needs to READ an equation to understand the segment, it must be manim.
 matplotlib text rendering of math is unreadable.
 
-**3. "plotly" — Continuous 3D surfaces and isosurfaces**
+**4. "plotly" — Continuous 3D surfaces and isosurfaces**
 USE FOR: Only when you need Plotly's continuous surface shading quality: dispersion surfaces,
 potential energy landscapes, isosurfaces of scalar fields, or surfaces that need to be
 animated while a camera orbits. When matplotlib 3D would look blocky or insufficient.
 
-**4. "title_card" — 2-3 second text card naming the next concept**
+**5. "title_card" — 2-3 second text card naming the next concept**
 USE FOR: Brief structural markers between major topic shifts. A short voiceover sentence
 ("Now, the dispersion relation.") and a title. Duration: 2-3 seconds.
 Do NOT use title_cards between every segment — only at major topic boundaries.
 
-=== ENGINE DECISION TREE ===
+=== ENGINE DECISION TREE (check in this order) ===
 
+Can the concept be framed as nodes + edges / a graph algorithm / a network? → "networkx"  (prefer this)
 Is the core content an equation, derivation, or proof? → "manim"
 Does the segment need 3D geometry + overlaid equations? → "manim" (ThreeDScene)
 Is it a high-quality continuous 3D surface or isosurface? → "plotly"
-Is it everything else (physical motion, fields, schematics, particles)? → "matplotlib"
+Is it everything else (a running simulation, physical motion, fields, particles)? → "matplotlib" (favor an actual simulation)
 Is it a brief 2-3s label between major topic sections? → "title_card"
 
 === VIDEO STRUCTURE ===
@@ -115,13 +134,20 @@ Is it a brief 2-3s label between major topic sections? → "title_card"
 Target: 60-180 seconds total. Aim for 90-120 seconds.
 Segment count: 4-10 visual segments (plus 0-3 title_cards at major boundaries).
 
+**OPEN ON YOUR STRONGEST VISUAL (visual hook, not a verbal one).** The FIRST segment must be
+the single most arresting *moving image* the topic offers — a graph assembling and a path
+lighting up (networkx), a simulation already in motion resolving into a pattern (matplotlib),
+particles snapping into order. Never open on a static title_card or a still diagram. This is a
+VISUAL hook only: the voiceover stays pedagogical (motivation-before-formula) — no clickbait
+phrasing. When the topic supports a graph or a live simulation, make that the opener.
+
 Typical structure:
-  matplotlib (setup/situation) →
+  networkx or matplotlib (HOOK — graph forms / simulation runs) →
   manim (governing equation) →
   title_card (optional, if switching to a new sub-topic) →
-  matplotlib (mechanism/behavior) →
+  matplotlib (mechanism/behavior, favor a running simulation) →
   manim (result/implication) →
-  matplotlib (final physical intuition)
+  networkx or matplotlib (final intuition / the result on the graph)
 
 Content segment durations:
 - Simple concept or single equation: 15-25s
@@ -162,7 +188,7 @@ Title card voiceover: one short sentence only. "Now, the dispersion relation." o
 
 For each segment provide:
 - order: int, sequential from 0
-- type: one of "matplotlib", "manim", "plotly", "title_card"
+- type: one of "networkx", "matplotlib", "manim", "plotly", "title_card"
 - title: short human label (for logging only)
 - description: for visual segments — a DIRECTOR'S NOTE. Describe exactly what is shown:
   what objects, what motion, what camera behavior, what key moment happens at the midpoint.

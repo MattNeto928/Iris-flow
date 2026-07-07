@@ -4,7 +4,7 @@ Read Manifest Lambda — returns the visual segment list for the Step Functions 
 Downloads manifest.json from S3 and returns:
   { "visualSegments": [{ "video_id": "...", "segment_index": 0 }, ...] }
 
-All segment types (matplotlib, manim, plotly, title_card) are handled by
+All segment types (networkx, matplotlib, manim, plotly, title_card) are handled by
 job_visual — title_cards use inline FFmpeg drawtext, no code generation.
 There are no "transition" segments anymore.
 """
