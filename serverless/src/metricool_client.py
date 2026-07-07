@@ -7,11 +7,19 @@ Direct port from gemini_manim working implementation.
 
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Metricool interprets a post's `dateTime` as wall-clock in this timezone. The
+# pipeline computes schedule_time in UTC, so it MUST be converted to this zone's
+# wall clock before formatting — otherwise UTC digits get read as Eastern and
+# every post lands ~4h late (midnight-UTC triggers posted after midnight ET).
+POST_TIMEZONE = "America/New_York"
+_POST_TZ = ZoneInfo(POST_TIMEZONE)
 
 
 class MetricoolClient:
@@ -129,7 +137,7 @@ class MetricoolClient:
         post_data = {
             "publicationDate": {
                 "dateTime": date_str,
-                "timezone": "America/New_York"
+                "timezone": POST_TIMEZONE
             },
             "text": caption,
             "autoPublish": True,
@@ -291,8 +299,14 @@ class MetricoolClient:
         if len(youtube_title) > 100:
             youtube_title = youtube_title[:97] + "..."
 
-        # Format datetime for Metricool API
-        date_str = schedule_time.strftime("%Y-%m-%dT%H:%M:%S")
+        # Format datetime for Metricool API. schedule_time is UTC (the orchestrator
+        # builds it with datetime.now(timezone.utc)); convert it to POST_TIMEZONE's
+        # wall clock so the digits match the timezone label we send. A naive
+        # datetime is assumed to be UTC.
+        st = schedule_time
+        if st.tzinfo is None:
+            st = st.replace(tzinfo=timezone.utc)
+        date_str = st.astimezone(_POST_TZ).strftime("%Y-%m-%dT%H:%M:%S")
 
         results = []
         try:

@@ -48,6 +48,7 @@ RUN pip install --no-cache-dir \
     boto3 \
     httpx \
     Pillow \
+    tzdata \
     aiofiles==23.2.1
 
 # Layer 2: ML & AI integration
