@@ -281,13 +281,17 @@ class GeoService:
         
         self._last_prompt = final_prompt
         
-        self._last_model = 'claude-opus-4-8'
+        self._last_model = 'claude-opus-5'
         
-        message = client.messages.create(
-            model="claude-opus-4-8",
-            max_tokens=16384,
+        # Opus 5 thinks by default and max_tokens caps thinking + text together,
+        # so the budget is doubled vs Opus 4.8. Streamed to stay under the SDK's
+        # non-streaming request-duration guard at this size.
+        with client.messages.stream(
+            model="claude-opus-5",
+            max_tokens=32768,
             messages=[{"role": "user", "content": final_prompt}]
-        )
+        ) as _stream:
+            message = _stream.get_final_message()
         
         response_text = "".join(_b.text for _b in message.content if getattr(_b,"type",None)=="text")
         if message.stop_reason == "max_tokens":

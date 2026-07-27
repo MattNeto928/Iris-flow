@@ -113,9 +113,11 @@ Return ONLY a JSON object (no markdown):
 - "short_title": a 3-5 word title for tracking."""
 
         try:
+            # Opus 5 thinks by default and max_tokens caps thinking + text
+            # together, so the budget is raised to leave room for both.
             response = anthropic_client.messages.create(
-                model="claude-opus-4-8",
-                max_tokens=4096,
+                model="claude-opus-5",
+                max_tokens=16384,
                 messages=[{"role": "user", "content": prompt}],
             )
             text = "".join(_b.text for _b in response.content if getattr(_b,"type",None)=="text").strip()

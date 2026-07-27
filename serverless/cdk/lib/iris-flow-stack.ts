@@ -395,6 +395,9 @@ export class IrisFlowStack extends cdk.Stack {
       memorySize: 256,
       environment: {
         TOPIC_QUEUE_URL: topicQueue.queueUrl,
+        // 60-75s target: measured watch-through falls sharply past ~90s
+        // (videos over 120s retain ~11% of runtime vs ~19% median).
+        TARGET_DURATION: '70',
         // AWS_REGION is set automatically by Lambda runtime
       },
     });
@@ -500,11 +503,11 @@ export class IrisFlowStack extends cdk.Stack {
       });
 
       // Step 5: Postprocess Batch Job
-      // The orchestrator Lambda always sets schedule_time AND include_youtube on
-      // the execution input, so $.schedule_time and $.include_youtube are both
-      // guaranteed present. include_youtube (true/false) caps YouTube at 2 posts
-      // per day: postprocess passes it to Metricool, which drops the youtube
-      // network when false. States.Format stringifies the bool for the env var.
+      // The orchestrator Lambda always sets schedule_time, include_youtube AND
+      // include_tiktok on the execution input, so all three paths are guaranteed
+      // present. include_youtube caps YouTube at 2 posts/day; include_tiktok caps
+      // TikTok at 3 posts/day: postprocess passes them to Metricool, which drops
+      // the network when false. States.Format stringifies the bools for env vars.
       const postprocessJob = new tasks.BatchSubmitJob(this, `${idPrefix}PostprocessJob`, {
         jobDefinitionArn: jobDefs.postprocess.jobDefinitionArn,
         jobName: sfn.JsonPath.format('postprocess-{}', sfn.JsonPath.stringAt('$.video_id')),
@@ -514,6 +517,7 @@ export class IrisFlowStack extends cdk.Stack {
             VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
             SCHEDULE_TIME: sfn.JsonPath.stringAt('$.schedule_time'),
             INCLUDE_YOUTUBE: sfn.JsonPath.stringAt("States.Format('{}', $.include_youtube)"),
+            INCLUDE_TIKTOK: sfn.JsonPath.stringAt("States.Format('{}', $.include_tiktok)"),
           },
         },
         resultPath: '$.postprocessResult',
@@ -576,20 +580,22 @@ export class IrisFlowStack extends cdk.Stack {
     // EventBridge: STEM orchestrator trigger — 5× daily.
     //
     // Each invocation generates ONE video and picks a random posting time in the
-    // next 30 min – 6 hr, so posts spread organically across the day.
+    // next 30-90 min, so posts spread organically across the day.
     //
-    // YouTube is capped at 2 posts/day. The schedule is split into two rules that
-    // hit the SAME orchestrator Lambda but pass a different constant
-    // `include_youtube` flag. The orchestrator threads it onto the execution
-    // input → postprocess → Metricool, which drops the youtube network when
-    // false. IG/TikTok/Facebook receive all 5 videos/day; YouTube only 2.
+    // Per-network caps: YouTube 2 posts/day, TikTok 3 posts/day (its For-You
+    // distribution collapsed under the 5×/day identical-crosspost cadence —
+    // fewer, spread-out posts while it recovers). The schedule is split into
+    // three rules that hit the SAME orchestrator Lambda with different constant
+    // `include_youtube` / `include_tiktok` flags, threaded onto the execution
+    // input → postprocess → Metricool, which drops a network when its flag is
+    // false. IG/Facebook receive all 5 videos/day.
     // =============================================
 
-    // 2× daily WITH YouTube — prime US engagement windows.
+    // 2× daily with YouTube + TikTok — prime US engagement windows.
     // 18:00 UTC = 1pm EST, 00:00 UTC = 7pm EST.
     const scheduleRuleYouTube = new events.Rule(this, 'DailyScheduleYouTube', {
       ruleName: 'iris-flow-daily-youtube',
-      description: 'STEM orchestrator 2× daily WITH YouTube (1pm, 7pm EST)',
+      description: 'STEM orchestrator 2× daily WITH YouTube + TikTok (1pm, 7pm EST)',
       enabled: true,
       schedule: events.Schedule.cron({
         minute: '0',
@@ -597,23 +603,69 @@ export class IrisFlowStack extends cdk.Stack {
       }),
     });
     scheduleRuleYouTube.addTarget(new targets.LambdaFunction(orchestratorFn, {
-      event: events.RuleTargetInput.fromObject({ include_youtube: true }),
+      event: events.RuleTargetInput.fromObject({ include_youtube: true, include_tiktok: true }),
     }));
 
-    // 3× daily WITHOUT YouTube — IG/TikTok/Facebook only.
-    // 11:00 UTC = 6am, 15:00 = 10am, 21:00 = 4pm EST.
-    const scheduleRuleNoYouTube = new events.Rule(this, 'DailyScheduleNoYouTube', {
-      ruleName: 'iris-flow-daily-no-youtube',
-      description: 'STEM orchestrator 3× daily WITHOUT YouTube (6am, 10am, 4pm EST)',
+    // 1× daily with TikTok (no YouTube) — midday slot.
+    // 15:00 UTC = 10am EST.
+    const scheduleRuleTikTok = new events.Rule(this, 'DailyScheduleTikTok', {
+      ruleName: 'iris-flow-daily-tiktok',
+      description: 'STEM orchestrator 1× daily WITH TikTok, no YouTube (10am EST)',
       enabled: true,
       schedule: events.Schedule.cron({
         minute: '0',
-        hour: '11,15,21', // 3× daily, UTC
+        hour: '15', // 1× daily, UTC
       }),
     });
-    scheduleRuleNoYouTube.addTarget(new targets.LambdaFunction(orchestratorFn, {
-      event: events.RuleTargetInput.fromObject({ include_youtube: false }),
+    scheduleRuleTikTok.addTarget(new targets.LambdaFunction(orchestratorFn, {
+      event: events.RuleTargetInput.fromObject({ include_youtube: false, include_tiktok: true }),
     }));
+
+    // 2× daily IG/Facebook only — early morning + late afternoon.
+    // 11:00 UTC = 6am, 21:00 = 4pm EST.
+    const scheduleRuleIgFb = new events.Rule(this, 'DailyScheduleNoYouTube', {
+      ruleName: 'iris-flow-daily-no-youtube',
+      description: 'STEM orchestrator 2× daily IG/Facebook only (6am, 4pm EST)',
+      enabled: true,
+      schedule: events.Schedule.cron({
+        minute: '0',
+        hour: '11,21', // 2× daily, UTC
+      }),
+    });
+    scheduleRuleIgFb.addTarget(new targets.LambdaFunction(orchestratorFn, {
+      event: events.RuleTargetInput.fromObject({ include_youtube: false, include_tiktok: false }),
+    }));
+
+    // =============================================
+    // Weekly retention-KPI report — the content mix is steered by measured
+    // watch-through, so surface it every Monday instead of waiting for a
+    // manual deep-dive. Pulls IG Reels analytics from Metricool, joins S3
+    // manifests for per-category medians, emails via the alerts topic.
+    // =============================================
+    const retentionReportFn = new lambda_.Function(this, 'RetentionReportFn', {
+      functionName: 'iris-flow-retention-report',
+      runtime: lambda_.Runtime.PYTHON_3_12,
+      handler: 'retention_report.handler',
+      code: lambda_.Code.fromAsset('../src/lambdas'),
+      timeout: cdk.Duration.minutes(5),
+      memorySize: 512,
+      environment: {
+        ALERTS_TOPIC_ARN: alertsTopic.topicArn,
+        VIDEO_BUCKET_NAME: videoBucket.bucketName,
+        API_SECRET_ID: 'iris-flow/api-keys',
+      },
+    });
+    videoBucket.grantRead(retentionReportFn);
+    alertsTopic.grantPublish(retentionReportFn);
+    apiSecrets.grantRead(retentionReportFn);
+
+    const retentionReportRule = new events.Rule(this, 'WeeklyRetentionReport', {
+      ruleName: 'iris-flow-weekly-retention-report',
+      description: 'Weekly IG watch-through report (Mondays 13:00 UTC = 8/9am ET)',
+      enabled: true,
+      schedule: events.Schedule.cron({ minute: '0', hour: '13', weekDay: 'MON' }),
+    });
+    retentionReportRule.addTarget(new targets.LambdaFunction(retentionReportFn));
 
     // Story schedule — PAUSED. The story pipeline (state machine, orchestrator,
     // queue, and Batch job defs) stays fully deployed, but this EventBridge rule

@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
-MODEL = "claude-opus-4-8"
+MODEL = "claude-opus-5"
 
 
 @dataclass
@@ -185,11 +185,15 @@ async def generate_story(
         + duration_hint
     )
 
-    message = client.messages.create(
+    # Opus 5 thinks by default and max_tokens caps thinking + text together,
+    # so the budget is doubled vs Opus 4.8. Streamed to stay under the SDK's
+    # non-streaming request-duration guard at this size.
+    with client.messages.stream(
         model=MODEL,
-        max_tokens=16384,
+        max_tokens=32768,
         messages=[{"role": "user", "content": full_prompt}],
-    )
+    ) as _stream:
+        message = _stream.get_final_message()
     response_text = "".join(_b.text for _b in message.content if getattr(_b,"type",None)=="text")
 
     try:

@@ -123,17 +123,21 @@ export const Root: React.FC = () => {
         prompt = REMOTION_PROMPT.format(skill_content=skill_content).replace("{description}", description).replace("{duration}", str(duration))
         
         self._last_prompt = prompt
-        self._last_model = 'claude-opus-4-8'
+        self._last_model = 'claude-opus-5'
 
         logger.info(f"[Remotion] Requesting TSX from Claude...")
-        message = client.messages.create(
+        # Opus 5 thinks by default and max_tokens caps thinking + text together,
+        # so the budget is doubled vs Opus 4.8. Streamed to stay under the SDK's
+        # non-streaming request-duration guard at this size.
+        with client.messages.stream(
             model=self._last_model,
             # TSX/JSX is verbose; 8k was hitting the ceiling on moderately complex
             # scenes (causing "Expected identifier but found end of file" esbuild
-            # errors at ~line 815). 16k matches the other code-gen services.
-            max_tokens=16384,
+            # errors at ~line 815). 32k matches the other code-gen services.
+            max_tokens=32768,
             messages=[{"role": "user", "content": prompt}]
-        )
+        ) as _stream:
+            message = _stream.get_final_message()
 
         # If Claude ran out of tokens mid-file the TSX is invalid — fail fast
         # with a clean error so the worker retry loop can feed this back to

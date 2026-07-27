@@ -517,7 +517,9 @@ async def job_concatenate():
     Download all segment.mp4 files, crossfade concatenate, add background music.
     Upload final.mp4.
     """
-    from src.video_utils import concatenate_videos
+    from src.video_utils import (
+        concatenate_videos, add_background_music, get_random_background_music
+    )
 
     video_id = os.environ['VIDEO_ID']
     manifest = _load_manifest(video_id)
@@ -552,10 +554,17 @@ async def job_concatenate():
     logger.info(f"[{video_id}] Concatenating {len(segment_paths)} segments...")
     final_path = concatenate_videos(segment_paths, video_id)
 
-    # NOTE: We no longer bake background music into the MP4 here. Trending
-    # audio is now attached at publish time by Metricool (TikTok via
-    # `tiktokData.autoAddMusic`; Instagram via manual-publish workflow).
-    # See serverless/src/metricool_client.py.
+    # Bake background music into the MP4 (re-enabled after 424e758: the
+    # Metricool publish-time audio attach turned out to be a no-op for video
+    # posts — TikTok rejects autoAddMusic on videos and IG's audioName is only
+    # a label — so posts were going out voiceover-only).
+    try:
+        music_path = get_random_background_music(video_id)
+        if music_path:
+            logger.info(f"[{video_id}] Adding background music...")
+            final_path = add_background_music(final_path, music_path, video_id)
+    except Exception as e:
+        logger.error(f"[{video_id}] Failed to add background music (proceeding without): {e}")
 
     # Upload final video to jobs prefix and to permanent storage
     _upload(final_path, f"{prefix}/final.mp4")
@@ -600,12 +609,16 @@ async def job_postprocess():
         concat_output = json.load(f)
     video_url = concat_output['video_url']
 
-    # Generate caption + title (single API call, returns {title, caption})
-    logger.info(f"[{video_id}] Generating caption + title...")
+    # Generate caption + titles (single API call, returns {title, caption, tiktok_title})
+    logger.info(f"[{video_id}] Generating caption + titles...")
     cap_data = await generate_caption(prompt)
     caption = cap_data["caption"]
     youtube_title = cap_data["title"][:97]
-    logger.info(f"[{video_id}] title='{youtube_title}'  caption_first40='{caption[:40]}'")
+    tiktok_title = (cap_data.get("tiktok_title") or cap_data["title"])[:80]
+    logger.info(
+        f"[{video_id}] title='{youtube_title}'  tiktok_title='{tiktok_title}'  "
+        f"caption_first40='{caption[:40]}'"
+    )
 
     # Schedule to Metricool
     dry_run = os.environ.get('DRY_RUN', 'false').lower() == 'true'
@@ -613,13 +626,15 @@ async def job_postprocess():
     if not dry_run and schedule_time_str:
         metricool = MetricoolClient()
         schedule_time = datetime.fromisoformat(schedule_time_str)
-        # INCLUDE_YOUTUBE is set per-execution by the orchestrator (via the
-        # triggering EventBridge rule) to cap YouTube at 2 posts/day. When false,
-        # Metricool drops the youtube network. Defaults to true.
+        # INCLUDE_YOUTUBE / INCLUDE_TIKTOK are set per-execution by the
+        # orchestrator (via the triggering EventBridge rule) to cap YouTube at
+        # 2 posts/day and TikTok at 3 posts/day. When false, Metricool drops
+        # that network. Both default to true.
         include_youtube = os.environ.get('INCLUDE_YOUTUBE', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+        include_tiktok = os.environ.get('INCLUDE_TIKTOK', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
         logger.info(
             f"[{video_id}] Scheduling to Metricool for {schedule_time} "
-            f"(include_youtube={include_youtube})..."
+            f"(include_youtube={include_youtube}, include_tiktok={include_tiktok})..."
         )
         schedule_result = await metricool.schedule_post(
             video_url=video_url,
@@ -627,6 +642,8 @@ async def job_postprocess():
             schedule_time=schedule_time,
             youtube_title=youtube_title,
             include_youtube=include_youtube,
+            include_tiktok=include_tiktok,
+            tiktok_title=tiktok_title,
         )
         for brand_result in schedule_result.get('results', []):
             brand_id = brand_result.get('blog_id')

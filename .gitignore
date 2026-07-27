@@ -41,3 +41,6 @@ iris-local/
 
 # Music library (large media)
 *.mp3
+
+# Local prompt-engineering scratch experiment (renders ~170MB of PNG frames)
+prompt_test/

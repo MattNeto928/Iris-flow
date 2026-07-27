@@ -259,6 +259,7 @@ class MetricoolClient:
         schedule_time: datetime,
         youtube_title: str,
         include_youtube: bool = True,
+        include_tiktok: bool = True,
         tiktok_title: Optional[str] = None,
         audio_name: Optional[str] = None,
     ) -> dict:
@@ -273,6 +274,9 @@ class MetricoolClient:
             include_youtube: When False, the youtube network is dropped from
                 every blog's network list (used to cap YouTube at 2 posts/day).
                 Other networks (IG/TikTok/Facebook) are unaffected.
+            include_tiktok: When False, the tiktok network is dropped from
+                every blog's network list (used to cap TikTok at 3 posts/day
+                while its For-You distribution recovers).
             tiktok_title: Optional separate title for TikTok
 
         Returns:
@@ -322,6 +326,8 @@ class MetricoolClient:
                     networks = self._networks_for_blog(blog_id)
                     if not include_youtube:
                         networks = [n for n in networks if n != "youtube"]
+                    if not include_tiktok:
+                        networks = [n for n in networks if n != "tiktok"]
                     if not networks:
                         logger.warning(f"Skipping blog {blog_id}: no networks configured")
                         results.append({

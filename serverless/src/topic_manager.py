@@ -102,13 +102,20 @@ class TopicManager:
 
 AVOID these recently used topics: {recent_list}
 
-Choose ONE of these categories (vary your choices):
-1. PARADOXES: Mind-bending logical or mathematical paradoxes
-2. COUNTERINTUITIVE PHENOMENA: Results that defy intuition
-3. ELEGANT THEOREMS: Beautiful mathematical results with visual proofs
-4. REAL-WORLD APPLICATIONS: How abstract math applies to everyday life
-5. MATHEMATICAL PATTERNS: Fascinating patterns in nature and numbers
-6. PHYSICS PHENOMENA: Surprising physics concepts
+Choose ONE of these categories. They are ordered by measured audience performance —
+STRONGLY prefer the top four; pick from the bottom two at most 1 time in 5:
+1. COUNTERINTUITIVE PHENOMENA: Results that defy intuition (top performer)
+2. ELEGANT THEOREMS: Beautiful mathematical results with visual proofs
+3. CRYPTOGRAPHY: Codes, secrets, and the math that protects them
+4. QUANTUM INFORMATION: Qubits, entanglement, quantum weirdness made concrete
+5. PARADOXES: Mind-bending logical or mathematical paradoxes
+6. MATHEMATICAL PATTERNS: Fascinating patterns in nature and numbers
+
+THE ONE REQUIREMENT: the topic must have a TWIST — a specific claim that sounds
+wrong but is true, stateable in one sentence ("Adding a road makes traffic worse",
+"Three people can hold a secret no two of them can read"). Textbook demonstrations
+of well-known laws (how induction works, why light refracts) measurably lose the
+audience; a surprise they have to see resolved keeps it.
 
 Provide:
 - A specific topic with depth (not just "explain X" but "show how X leads to Y and its applications in Z")
@@ -124,9 +131,11 @@ Return ONLY the JSON object, no markdown."""
 
         try:
             # Opus 4.7 deprecated `temperature` — uses adaptive thinking instead.
+            # Opus 5 thinks by default and max_tokens caps thinking + text
+            # together, so the budget is raised to leave room for both.
             response = anthropic_client.messages.create(
-                model="claude-opus-4-8",
-                max_tokens=4096,
+                model="claude-opus-5",
+                max_tokens=16384,
                 messages=[{"role": "user", "content": prompt}]
             )
 

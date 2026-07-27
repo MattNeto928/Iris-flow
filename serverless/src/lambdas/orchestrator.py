@@ -31,7 +31,8 @@ sfn = boto3.client('stepfunctions')
 # TOPIC_QUEUE_URL is kept as a fallback so the original STEM deployment is unchanged.
 TOPIC_QUEUE_URL = os.environ.get('QUEUE_URL') or os.environ['TOPIC_QUEUE_URL']
 STATE_MACHINE_ARN = os.environ['STATE_MACHINE_ARN']
-TARGET_DURATION = int(os.environ.get('TARGET_DURATION', '90'))
+# 70s default: measured watch-through drops sharply past ~90s of runtime.
+TARGET_DURATION = int(os.environ.get('TARGET_DURATION', '70'))
 EXEC_PREFIX = os.environ.get('EXEC_PREFIX', 'iris-flow')
 
 # Random scheduling window: post anywhere from MIN_DELAY_MIN to MAX_DELAY_MIN
@@ -78,9 +79,11 @@ def handler(event, context):
     video_id = str(uuid.uuid4())[:8]
     schedule_time = _random_schedule_time()
 
-    # EventBridge passes {"include_youtube": bool} as a constant input; defaults
-    # to True for manual invokes / raw scheduled events that don't set it.
+    # EventBridge passes {"include_youtube": bool, "include_tiktok": bool} as a
+    # constant input; both default to True for manual invokes / raw scheduled
+    # events that don't set them.
     include_youtube = event.get('include_youtube', True) if isinstance(event, dict) else True
+    include_tiktok = event.get('include_tiktok', True) if isinstance(event, dict) else True
 
     execution_input = {
         'video_id': video_id,
@@ -88,6 +91,7 @@ def handler(event, context):
         'target_duration': TARGET_DURATION,
         'schedule_time': schedule_time,    # ISO-8601 UTC, passed to postprocess
         'include_youtube': include_youtube,  # gates the YouTube network in postprocess
+        'include_tiktok': include_tiktok,    # gates the TikTok network in postprocess
     }
 
     sfn.start_execution(
@@ -98,11 +102,12 @@ def handler(event, context):
 
     logger.info(
         f"Started execution video_id={video_id} schedule_time={schedule_time} "
-        f"include_youtube={include_youtube}"
+        f"include_youtube={include_youtube} include_tiktok={include_tiktok}"
     )
     return {
         'video_id': video_id,
         'schedule_time': schedule_time,
         'include_youtube': include_youtube,
+        'include_tiktok': include_tiktok,
         'started': True,
     }

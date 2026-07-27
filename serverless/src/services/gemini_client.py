@@ -69,16 +69,16 @@ Not every video needs all five — pick the ones that matter for the topic.
 
 === SEGMENT TYPES (5 AVAILABLE) ===
 
-**1. "networkx" — Graphs, networks, and algorithms that run on them**  ⭐ HIGH-PERFORMING — PREFER WHEN APPLICABLE
-USE FOR: anything that IS a graph or runs on one — nodes and edges, shortest-path / BFS /
+**1. "networkx" — Graphs, networks, and algorithms that run on them**
+USE FOR: only when the concept genuinely IS a graph — nodes and edges, shortest-path / BFS /
 DFS / Dijkstra / Bellman-Ford, spanning trees, PageRank, network growth and connectivity,
-percolation, community detection, sorting and data structures shown as node-link diagrams,
-and counterintuitive network results (e.g. Braess's paradox, small-world, six degrees).
-Renders step-by-step animations of nodes lighting up and edges being traversed.
+percolation, community detection, and counterintuitive network results (e.g. Braess's
+paradox, small-world, six degrees). Renders step-by-step animations of nodes lighting up
+and edges being traversed.
 
-PRIORITY RULE: if a topic can be honestly framed as *entities and the relationships between
-them*, prefer "networkx" — these graph visualizations are consistently our best-performing
-style. Reach for it before defaulting to matplotlib whenever the framing fits.
+Do NOT stretch a topic into a graph framing just to use this engine — measured watch-through
+on node-link videos is below average. A graph visual has to earn its place: the traversal or
+structure itself must be the surprising part.
 
 **2. "matplotlib" — Simulations, physical motion, and scientific visualizations**  ⭐ FAVOR RUNNING SIMULATIONS
 USE FOR: Any segment involving motion, particles, waves, fields, trajectories, schematics,
@@ -122,37 +122,44 @@ Do NOT use title_cards between every segment — only at major topic boundaries.
 
 === ENGINE DECISION TREE (check in this order) ===
 
-Can the concept be framed as nodes + edges / a graph algorithm / a network? → "networkx"  (prefer this)
 Is the core content an equation, derivation, or proof? → "manim"
 Does the segment need 3D geometry + overlaid equations? → "manim" (ThreeDScene)
 Is it a high-quality continuous 3D surface or isosurface? → "plotly"
+Is the concept literally a graph algorithm or network result (not merely graph-flavorable)? → "networkx"
 Is it everything else (a running simulation, physical motion, fields, particles)? → "matplotlib" (favor an actual simulation)
 Is it a brief 2-3s label between major topic sections? → "title_card"
 
 === VIDEO STRUCTURE ===
 
-Target: 60-180 seconds total. Aim for 90-120 seconds.
-Segment count: 4-10 visual segments (plus 0-3 title_cards at major boundaries).
+Target: 45-90 seconds total. Aim for 60-75 seconds. NEVER exceed 90 seconds — measured
+watch-through falls off a cliff past that point (videos over 120s retain barely a tenth of
+their runtime). Shorter and denser beats longer and thorough: cut the second example, not
+the payoff.
+Segment count: 3-6 visual segments (plus 0-1 title_cards at major boundaries).
 
-**OPEN ON YOUR STRONGEST VISUAL (visual hook, not a verbal one).** The FIRST segment must be
-the single most arresting *moving image* the topic offers — a graph assembling and a path
-lighting up (networkx), a simulation already in motion resolving into a pattern (matplotlib),
-particles snapping into order. Never open on a static title_card or a still diagram. This is a
-VISUAL hook only: the voiceover stays pedagogical (motivation-before-formula) — no clickbait
-phrasing. When the topic supports a graph or a live simulation, make that the opener.
+**OPEN ON THE TWIST — visually AND verbally.** The FIRST segment must be the single most
+arresting *moving image* the topic offers — a simulation already in motion resolving into a
+pattern, particles snapping into order. Never open on a static title_card or a still diagram.
+AND the first voiceover sentence must state the topic's counterintuitive claim as a concrete,
+specific assertion — the thing that sounds wrong but is true:
+  Good: "Drop a magnet through a copper pipe and it falls in slow motion."
+  Good: "Adding a road to this network makes every driver's commute longer."
+  Bad:  "The real question is what happens when a magnet meets a conductor." (buries the twist)
+  Bad:  "What if I told you magnets can fall slowly?" (clickbait archetype — still forbidden)
+This is a factual claim stated plainly, not a rhetorical hook. Viewers decide in the first
+three seconds; give them the payoff's shape immediately, then spend the video earning it.
 
 Typical structure:
-  networkx or matplotlib (HOOK — graph forms / simulation runs) →
+  matplotlib (HOOK — the twist, already in motion) →
   manim (governing equation) →
   title_card (optional, if switching to a new sub-topic) →
   matplotlib (mechanism/behavior, favor a running simulation) →
-  manim (result/implication) →
-  networkx or matplotlib (final intuition / the result on the graph)
+  manim or matplotlib (result — pay off the opening claim)
 
 Content segment durations:
-- Simple concept or single equation: 15-25s
-- Physical simulation with explanation: 25-40s
-- Full derivation: 35-50s
+- Simple concept or single equation: 10-20s
+- Physical simulation with explanation: 15-30s
+- Full derivation: 25-35s
 Title cards: always 2-3s.
 
 === WRITING THE VOICEOVER ===
@@ -220,11 +227,20 @@ HARD RULES (violating any one of these makes the post unusable):
 - NO ellipses ( ... ).
 - NO emojis anywhere in the title or caption text. Hashtags only.
 
-TITLE (used as YouTube + TikTok title):
+TITLE (used as the YouTube title):
 - Under 80 characters.
 - Concrete, specific noun phrase. Name the phenomenon, person, or number.
 - No clickbait fluff like "you wont believe" or "shocking".
 - Examples of the right tone: "Why bees make hexagons", "Bayes rule, decoded in 60 seconds", "Lorenz attractor: order from a butterfly".
+
+TIKTOK_TITLE (used only on TikTok, where a flat noun phrase dies in the feed):
+- Under 80 characters.
+- State the counterintuitive claim directly, as a challenge or a tension. A question is
+  allowed here. One emoji is allowed here (at the end, never mid-sentence), no more.
+- Still banned: "you won't believe", "shocking", "mind-blowing", "what if I told you",
+  and everything in the hard rules above.
+- Examples of the right tone: "Building more roads makes traffic worse", "A magnet falls
+  slower through copper. No magic 🧲", "Your intuition about this coin flip is wrong".
 
 CAPTION:
 - 1-2 short sentences, under 220 chars total before hashtags.
@@ -234,7 +250,7 @@ CAPTION:
 - Then a blank line, then 4-6 hashtags. Hashtags should be specific to the topic (not just generic #science #stem). Include a couple broad ones at the end.
 
 OUTPUT FORMAT (must parse as JSON, no markdown fences, no commentary):
-{{"title": "...", "caption": "...\\n\\n#tag1 #tag2 #tag3 #tag4"}}"""
+{{"title": "...", "tiktok_title": "...", "caption": "...\\n\\n#tag1 #tag2 #tag3 #tag4"}}"""
 
 
 async def generate_segments_from_prompt(
@@ -254,12 +270,16 @@ async def generate_segments_from_prompt(
     )
     full_prompt = SEGMENT_GENERATION_PROMPT + prompt + duration_hint
 
-    model = "claude-opus-4-8"
-    message = client.messages.create(
+    model = "claude-opus-5"
+    # Opus 5 thinks by default and max_tokens caps thinking + text together,
+    # so the budget is doubled vs Opus 4.8. Streamed to stay under the SDK's
+    # non-streaming request-duration guard at this size.
+    with client.messages.stream(
         model=model,
-        max_tokens=16384,
+        max_tokens=32768,
         messages=[{"role": "user", "content": full_prompt}]
-    )
+    ) as _stream:
+        message = _stream.get_final_message()
 
     response_text = "".join(_b.text for _b in message.content if getattr(_b,"type",None)=="text")
 
@@ -319,10 +339,12 @@ async def generate_caption(topic: str) -> dict:
     """
     import json as _json
     prompt = CAPTION_PROMPT.format(topic=topic)
-    model = "claude-opus-4-8"
+    model = "claude-opus-5"
+    # Opus 5 thinks by default and max_tokens caps thinking + text together,
+    # so the budget is raised to leave room for both.
     message = client.messages.create(
         model=model,
-        max_tokens=2048,
+        max_tokens=8192,
         messages=[{"role": "user", "content": prompt}]
     )
     raw = "".join(_b.text for _b in message.content if getattr(_b,"type",None)=="text").strip()
@@ -336,10 +358,12 @@ async def generate_caption(topic: str) -> dict:
         data = _json.loads(raw)
         title = _strip_em_dashes(data.get("title", "").strip())
         caption = _strip_em_dashes(data.get("caption", "").strip())
+        tiktok_title = _strip_em_dashes(data.get("tiktok_title", "").strip()) or title
     except Exception:
         # Fallback: treat entire response as caption, derive title heuristically.
         cleaned = _strip_em_dashes(raw)
         caption = cleaned
         # Take first sentence (up to 80 chars) as title.
         title = cleaned.split(".")[0].strip()[:80]
-    return {"title": title, "caption": caption}
+        tiktok_title = title
+    return {"title": title, "caption": caption, "tiktok_title": tiktok_title}
