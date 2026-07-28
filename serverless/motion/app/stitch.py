@@ -9,6 +9,8 @@ would reject never leaves here unnoticed.
 env: VIDEO_ID, MOTION_BUCKET
 """
 
+import hashlib
+import os
 import json
 import re
 import subprocess
@@ -153,7 +155,47 @@ def _video_frame_count(path) -> int:
     return int(res.stdout.strip())
 
 
-def _encode(wd: Path, video_path: Path, fps: int, narration):
+MUSIC_BUCKET = os.environ.get('MUSIC_BUCKET_NAME', 'iris-flow-music-482625028438')
+# 0.20 and a 15 s start offset are IrisFlowStack's settled values, copied rather
+# than re-derived so a motion post sounds like the STEM posts it replaces:
+# _add_background_music in serverless/src/video_pipeline.py. The offset skips the
+# intro of a track that was chosen for its middle.
+MUSIC_VOLUME = float(os.environ.get('MUSIC_VOLUME', '0.20'))
+MUSIC_START_S = 15
+
+
+def _pick_music(wd: Path, vid: str):
+    """
+    One track from the shared music bucket, chosen deterministically per video.
+
+    Deterministic on video_id, not random: a re-run of the same job -- a Spot
+    retry, a manual re-stitch -- produces the same audio, which is what makes
+    the encode reproducible. Returns None if the bucket is empty or unreadable;
+    music is a nice-to-have and must never fail a render that is otherwise fine.
+    """
+    try:
+        objs = []
+        for page in common.s3.get_paginator('list_objects_v2').paginate(
+                Bucket=MUSIC_BUCKET):
+            objs += [o['Key'] for o in page.get('Contents', [])
+                     if o['Key'].lower().endswith(('.mp3', '.m4a', '.wav'))]
+        if not objs:
+            common.logger.warning('no music in s3://%s — encoding without', MUSIC_BUCKET)
+            return None
+        objs.sort()
+        key = objs[int(hashlib.sha256(vid.encode()).hexdigest(), 16) % len(objs)]
+        dest = wd / 'music' / Path(key).name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        common.s3.download_file(MUSIC_BUCKET, key, str(dest))
+        common.logger.info('background music: %s', key)
+        return dest
+    except Exception as e:                                  # noqa: BLE001
+        common.logger.warning('could not fetch background music (%s) — '
+                              'encoding without', e)
+        return None
+
+
+def _encode(wd: Path, video_path: Path, fps: int, narration, music=None):
     cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
            '-framerate', fps,
            # start_number is 0 by default, but say it: the sequence starts at
@@ -162,8 +204,23 @@ def _encode(wd: Path, video_path: Path, fps: int, narration):
            '-i', 'frames/f%04d.png']          # never a glob (CONTRACT rule 4)
     if narration:
         cmd += ['-i', str(narration)]
+    if narration and music:
+        # -stream_loop -1 so a track shorter than the piece repeats rather than
+        # dropping out; -ss BEFORE -i seeks the music input only.
+        cmd += ['-ss', str(MUSIC_START_S), '-stream_loop', '-1', '-i', str(music)]
     cmd += ['-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p']
-    if narration:
+    if narration and music:
+        # duration=first pins the mix to the NARRATION, not the looped music,
+        # which is otherwise infinite. normalize=0 stops amix halving both inputs
+        # whenever one of them goes quiet — without it the voice ducks every time
+        # the music swells, which is backwards.
+        cmd += ['-filter_complex',
+                f'[1:a]volume=1.0[v];[2:a]volume={MUSIC_VOLUME}[m];'
+                f'[v][m]amix=inputs=2:duration=first:dropout_transition=0'
+                f':normalize=0[a]',
+                '-map', '0:v', '-map', '[a]',
+                '-c:a', 'aac', '-b:a', '192k', '-shortest']
+    elif narration:
         cmd += ['-c:a', 'aac', '-b:a', '128k', '-shortest']
     cmd += ['-movflags', '+faststart', str(video_path)]
 
@@ -198,7 +255,8 @@ def run():
     gates_passed = _run_gates(vid, frames_dir, out_dir, fps, beats, plan)
 
     video_path = out_dir / 'video.mp4'
-    _encode(wd, video_path, fps, narration)
+    music = _pick_music(wd, vid)
+    _encode(wd, video_path, fps, narration, music)
 
     # --- verify the deliverable against CONTRACT rule 7 ---------------------
     v = _ffprobe(video_path, 'v:0',

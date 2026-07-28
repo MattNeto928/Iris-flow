@@ -173,6 +173,10 @@ export class IrisMotionStack extends cdk.Stack {
     // grantReadWrite includes s3:PutObjectTagging, which the render shards need
     // to apply the frames lifecycle tag.
     motionBucket.grantReadWrite(batchJobRole);
+    // Background music, so a motion post sounds like the STEM posts it replaces.
+    // Read-only, and imported by name -- the bucket belongs to IrisFlowStack.
+    s3.Bucket.fromBucketName(this, 'MusicBucket', `iris-flow-music-${this.account}`)
+      .grantRead(batchJobRole);
     // Write-only on the public bucket, and only for postprocess's copy of the
     // finished MP4. Deliberately NOT grantReadWrite: the STEM pipeline's own
     // manifests and segments live in there and nothing in iris-motion has any
@@ -245,6 +249,10 @@ export class IrisMotionStack extends cdk.Stack {
     const batchSecrets: { [key: string]: batch.Secret } = {
       ANTHROPIC_API_KEY: batch.Secret.fromSecretsManager(apiSecrets, 'ANTHROPIC_API_KEY'),
       GOOGLE_AI_API_KEY: batch.Secret.fromSecretsManager(apiSecrets, 'GOOGLE_AI_API_KEY'),
+
+      // Primary TTS. Gemini stays bound as the fallback path in app/tts.py.
+
+      ELEVENLABS_API_KEY: batch.Secret.fromSecretsManager(apiSecrets, 'ELEVENLABS_API_KEY'),
     };
 
     // extraEnv / extraSecrets exist for postprocess: it is the only job that

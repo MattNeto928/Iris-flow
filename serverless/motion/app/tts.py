@@ -10,16 +10,48 @@ like the same person across parallel segment renders.
 """
 
 import io
+import json
 import logging
 import os
 import re
 import subprocess
 import time
+import urllib.request
 import wave
 from pathlib import Path
 
 log = logging.getLogger("motion.tts")
 
+# ---------------------------------------------------------------- ElevenLabs
+# Primary. Chosen over Gemini on MEASURED evidence, not preference:
+#   latency        3.8 s   vs 60-203 s (a 504 on the first call is routine)
+#   silence pad    none    vs 43% of a real track, incl. one 8.25 s dead gap
+#   duration spread 2%     vs unbounded (11 s of speech padded to 68.9 s)
+#   timestamps     character-level ground truth   vs none
+#
+# eleven_multilingual_v2, NOT v3. v3 is newer and worse here: the live model
+# list reports NO capability flags for it, it is the slowest to generate AND
+# the slowest speaker, caps at 5000 chars, and the docs disable speed,
+# similarity, speaker boost and request stitching on it. It is built for
+# expressive dialogue, not deterministic narration.
+# eleven_flash_v2_5 is faster still (0.9 s) but was DISQUALIFIED by test: it
+# read "1,384,000 km" as "1084 thousand kilometerly". On a pipeline whose
+# premise is defensible on-screen numbers, that is fatal.
+EL_MODEL = "eleven_multilingual_v2"
+EL_VOICE_ID = os.environ.get("EL_VOICE_ID", "iiidtqDt9FBdT1vfBluA")   # Bill Oxley
+EL_VOICE_NAME = "Bill Oxley - Documentary Commentator"
+# Settings D, chosen by listening. MEASURED against the alternatives: 3.30 w/s
+# (vs 2.89 at defaults) with a +-0.81 s spread over 3 runs. The wider spread is
+# harmless HERE because the beat table is derived from each run's own measured
+# audio -- it would only matter on the picture-locked path, which fits audio
+# into fixed slots.
+EL_SETTINGS = {"stability": 0.30, "similarity_boost": 0.70, "style": 0.50,
+               "speed": 1.15, "use_speaker_boost": True}
+# pcm_24000 lands in the sample rate this module already uses, so the bytes go
+# straight into _pcm_to_wav with no transcode.
+EL_FORMAT = "pcm_24000"
+
+# ------------------------------------------------------------ Gemini fallback
 MODEL_ID = "gemini-3.1-flash-tts-preview"
 VOICE = "Algenib"          # "Gravelly" deep baritone — the documentary register
 TEMPERATURE = 0.6          # lower = less prosody drift between parallel calls
@@ -65,6 +97,56 @@ def _clean(text):
     return _PAUSE_TAGS.sub("", text).strip()
 
 
+# Trim the silence Gemini pads around every segment, and cap the pauses inside
+# it. MEASURED on a real 53.8 s narration track: 43% of it was silence, with a
+# single 8.25 s dead gap three seconds in. Two things went wrong at once —
+# the piece sounded full of holes, AND the beat table is derived from each
+# segment's DURATION, so the picture was being timed to the padding rather than
+# to the speech.
+#   - both ends trimmed to nothing (leading silence also shifts every later beat)
+#   - internal pauses capped at 0.30 s, which keeps natural sentence prosody and
+#     removes the caesuras Algenib leaves between clauses
+TRIM_DB = "-45dB"
+MAX_INTERNAL_PAUSE = 0.30
+
+# Trimming alone is NOT enough, and the sibling STEM pipeline learned this the
+# expensive way (serverless/src/services/tts_client.py, commit b603f1b):
+# Algenib sometimes speaks only PART of the line and pads the rest, and a
+# truncated clip trims to a clean-but-incomplete clip -- which is worse than a
+# noisy one, because nothing downstream can tell it is wrong. So the length is
+# judged on the RAW clip, before trimming, and the whole call is re-rolled when
+# it is wildly long. 14.5 chars/s is their measured rate for this voice.
+CHARS_PER_SEC = 14.5
+ANOMALY_SLACK, ANOMALY_PAD = 1.8, 4.0
+GEN_ATTEMPTS = 4
+
+
+def _trim_silence(path):
+    """Trim head/tail silence and cap internal pauses. Returns new duration."""
+    out = str(path) + ".trim.wav"
+    chain = (
+        f"silenceremove=start_periods=1:start_threshold={TRIM_DB}:start_silence=0,"
+        f"areverse,"
+        f"silenceremove=start_periods=1:start_threshold={TRIM_DB}:start_silence=0,"
+        f"areverse,"
+        f"silenceremove=stop_periods=-1:stop_threshold={TRIM_DB}"
+        f":stop_silence={MAX_INTERNAL_PAUSE}"
+    )
+    r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(path),
+                        "-af", chain, out], capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 4096:
+        log.warning("silence trim failed for %s, keeping original: %s",
+                    path, r.stderr[:200])
+        return _duration(path)
+    os.replace(out, path)
+    return _duration(path)
+
+
+def _duration(path):
+    with wave.open(str(path)) as w:
+        return w.getnframes() / float(w.getframerate())
+
+
 def _pcm_to_wav(pcm, path):
     with wave.open(str(path), "wb") as w:
         w.setnchannels(CHANNELS)
@@ -74,8 +156,84 @@ def _pcm_to_wav(pcm, path):
     return len(pcm) / (SAMPLE_RATE * SAMPLE_WIDTH * CHANNELS)
 
 
+def _elevenlabs(text, out_path):
+    """
+    One segment via ElevenLabs /with-timestamps. Returns (path, duration).
+
+    Duration comes from the ALIGNMENT, not the file length: the last character's
+    end time is exactly when speech stops, so there is no silence to detect or
+    trim and no heuristic in the loop. The audio is cut to that point, which
+    makes the returned duration ground truth rather than an estimate -- and the
+    beat table downstream is only ever as good as this number.
+
+    The full alignment is written alongside as <out>.align.json. Nothing reads
+    it yet; it is what a future pass needs to key captions to individual WORDS
+    instead of to a whole segment.
+    """
+    import base64
+    key = os.environ["ELEVENLABS_API_KEY"]
+    body = json.dumps({"text": text, "model_id": EL_MODEL,
+                       "voice_settings": EL_SETTINGS}).encode()
+    req = urllib.request.Request(
+        f"https://api.elevenlabs.io/v1/text-to-speech/{EL_VOICE_ID}"
+        f"/with-timestamps?output_format={EL_FORMAT}",
+        data=body, headers={"xi-api-key": key, "content-type": "application/json"})
+    d = json.loads(urllib.request.urlopen(req, timeout=TIMEOUT_S).read())
+
+    pcm = base64.b64decode(d["audio_base64"])
+    align = d.get("alignment") or {}
+    ends = align.get("character_end_times_seconds") or []
+    raw = _pcm_to_wav(pcm, out_path)
+    if not ends:
+        log.warning("no alignment returned — falling back to file length")
+        return str(out_path), raw
+
+    speech_end = float(ends[-1])
+    Path(str(out_path) + ".align.json").write_text(json.dumps(align))
+    # Cut to the last character. ElevenLabs does not pad, but a few hundred ms
+    # of room tone at the end is still dead air in a 50 s piece.
+    if raw - speech_end > 0.05:
+        trimmed = str(out_path) + ".cut.wav"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(out_path),
+                        "-t", f"{speech_end:.3f}", trimmed], check=True)
+        os.replace(trimmed, out_path)
+    return str(out_path), speech_end
+
+
 def generate_voiceover(text, out_path):
-    """Synthesise one segment. Returns (path, duration_seconds)."""
+    """
+    Synthesise one segment. Returns (path, duration_seconds).
+
+    ElevenLabs primary, Gemini fallback. The fallback is not decoration: this
+    runs unattended 5x/day and a single-vendor outage would otherwise skip the
+    slot entirely. The anomaly re-roll below guards BOTH paths, because both are
+    generative and both can decide to stop early and pad.
+    """
+    clean_text = _clean(text)
+    if os.environ.get("ELEVENLABS_API_KEY"):
+        expected = max(1.0, len(clean_text) / CHARS_PER_SEC)
+        ceiling = expected * ANOMALY_SLACK + ANOMALY_PAD
+        for attempt in range(GEN_ATTEMPTS):
+            try:
+                path, dur = _elevenlabs(clean_text, out_path)
+                if dur > ceiling:
+                    raise RuntimeError(
+                        f"{dur:.1f}s >> expected ~{expected:.1f}s "
+                        f"(ceiling {ceiling:.1f}s)")
+                if dur < 0.35:
+                    raise RuntimeError(f"only {dur:.2f}s of speech")
+                return path, dur
+            except Exception as e:                          # noqa: BLE001
+                log.warning("elevenlabs attempt %d/%d failed: %s",
+                            attempt + 1, GEN_ATTEMPTS, str(e)[:180])
+                time.sleep(2 ** attempt)
+        log.error("ElevenLabs failed %d times — falling back to Gemini",
+                  GEN_ATTEMPTS)
+    return _gemini_voiceover(text, out_path)
+
+
+def _gemini_voiceover(text, out_path):
+    """Fallback. Returns (path, duration_seconds)."""
     from google import genai
     from google.genai import types
 
@@ -88,12 +246,13 @@ def generate_voiceover(text, out_path):
             voice_config=types.VoiceConfig(
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=VOICE))),
     )
+    clean = _clean(text)
     last = None
-    for attempt in range(RETRIES):
+    for attempt in range(max(RETRIES, GEN_ATTEMPTS)):
         try:
             r = client.models.generate_content(
                 model=MODEL_ID,
-                contents=STYLE_PREAMBLE.format(transcript=_clean(text)),
+                contents=STYLE_PREAMBLE.format(transcript=clean),
                 config=cfg)
             pcm = None
             for cand in (r.candidates or []):
@@ -105,7 +264,25 @@ def generate_voiceover(text, out_path):
                 raise RuntimeError("no audio part in response (silent throttle?)")
             if len(pcm) < SAMPLE_RATE * SAMPLE_WIDTH * 0.2:
                 raise RuntimeError(f"suspiciously short audio: {len(pcm)} bytes")
-            return str(out_path), _pcm_to_wav(pcm, out_path)
+            raw = _pcm_to_wav(pcm, out_path)
+            expected = max(1.0, len(clean) / CHARS_PER_SEC)
+            ceiling = expected * ANOMALY_SLACK + ANOMALY_PAD
+            if raw > ceiling and attempt < GEN_ATTEMPTS - 1:
+                # Judged on RAW, deliberately: a truncated clip trims to
+                # something clean and short, and then silently desynchronises
+                # the whole beat table.
+                raise RuntimeError(
+                    f"raw clip {raw:.1f}s >> expected ~{expected:.1f}s "
+                    f"(ceiling {ceiling:.1f}s) -- partial script + dead air")
+            dur = _trim_silence(out_path)
+            if dur < 0.35:
+                raise RuntimeError(
+                    f"segment is {dur:.2f}s after trimming ({raw:.2f}s raw) "
+                    f"-- the model returned padding, not speech")
+            if raw - dur > 0.5:
+                log.info("  trimmed %.2fs of silence (%.2f -> %.2f, expected ~%.1f)",
+                         raw - dur, raw, dur, expected)
+            return str(out_path), dur
         except Exception as e:                              # noqa: BLE001
             last = e
             # 429/5xx are the common transients; back off rather than fail the job.

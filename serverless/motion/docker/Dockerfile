@@ -138,6 +138,17 @@ RUN mkdir -p /work
 RUN node --check /app/render.mjs \
  && node --check /app/serve.mjs \
  && python3 -m compileall -q /app -x 'node_modules' \
+ # Only the WORKER modules: the lambdas run in Lambda, not in this image,
+ # and they read their env at import time by design (fail fast on a cold
+ # start). plan_shards carries its own env-free self-test, run separately.
+ # compileall only COMPILES -- it never runs module scope, so a missing import
+ # used at import time (a NameError on os.environ in a module constant) sails
+ # through it and fails on the first Batch job instead. Importing every worker
+ # module for real is the check that would have caught exactly that.
+ && MOTION_BUCKET=build-check AWS_DEFAULT_REGION=us-east-1 AWS_REGION=us-east-1 \
+    python3 -c "import sys; sys.path.insert(0,'/app'); \
+      import common, tts, narrate, render_shard, stitch, postprocess, prep, worker; \
+      print('all worker modules import')" \
  && ffmpeg -version > /dev/null \
  && ffprobe -version > /dev/null
 

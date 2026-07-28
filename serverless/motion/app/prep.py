@@ -155,7 +155,13 @@ Hard rules, each learned from a real failure:
   the lit fraction swings by an order of magnitude.
 - Put anything at infinity in `bgScene`, or depth of field renders it once per
   aperture sample and a starfield becomes clumps of dots.
-- Point size is world units: px = size*(H/2)*(1/tan(fov/2))/dist. Aim 1.5-3 px.
+- POINT FIELDS. makePointField's `size` is a WORLD-SPACE DIAMETER, and getting
+  it wrong by 10x is the most repeated mistake in this pipeline -- twice now a
+  scene has been ruined by dust the size of tennis balls. COMPUTE it, never
+  guess:  px = size * (H/2) * (1/tan(fov/2)) / dist
+  At H=1920 and fov=32 that is  size * 3348 / dist.  Aim for 1.5-3 px on screen.
+  On a radius-900 shell that means size ~0.6, NOT 4. If a point field is meant
+  to read as dust or stars it must be small enough to be texture, not objects.
 - Use the existing helpers rather than rebuilding them: makePointField, makePanel,
   makeCard, makeAxis, makeGlow, makeScrim, makeCaption, makeAnchoredLabel.
   Every make* returns a controller with .set() and .mesh — never reach past it.
@@ -166,19 +172,68 @@ Hard rules, each learned from a real failure:
 - A single NaN in shading turns the WHOLE frame black, because the bloom mip
   chain spreads it. Guard any normalize() on a difference of two path points.
 
-Return ONLY a JSON object, no prose, no markdown fence:
-{
-  "title": "short title card text",
-  "narration": [{"id":"hook","text":"one or two spoken sentences"}, ...],
-  "edits": [{"find":"...","replace":"..."}, ...]
-}
+Return your answer in EXACTLY this format. The header is JSON; the EDITS are
+NOT, because they carry JavaScript, and embedding multi-kilobyte code inside
+JSON strings means escaping every quote, newline and backslash perfectly across
+the whole payload. One slip discards everything — MEASURED: a 30,505-character
+response was thrown away over a single delimiter.
 
-narration: 6-10 segments, spoken aloud. BUDGET WORDS AT 1.4 WORDS/SECOND --
-that is MEASURED for this narrator, not the ~2.5 w/s of ordinary speech, and
-there is no speed control to rescue an over-long script. A 45 s piece is about
-60 words TOTAL. Write sparse, declarative lines; the visual carries the weight.
-Narration carries the ARGUMENT. Captions carry numbers and labels — do not just
-read the captions aloud.
+HEADER
+{"title": "short title card text",
+ "narration": [{"id": "hook", "text": "one or two spoken sentences"}, ...]}
+
+<<<<<<< FIND
+the exact text to find, verbatim, newlines and all
+=======
+the replacement text
+>>>>>>> END
+
+<<<<<<< FIND
+...
+=======
+...
+>>>>>>> END
+
+Repeat the FIND/REPLACE block once per edit. Write the code literally, with
+real newlines and real quotes — nothing is escaped.
+
+NARRATION — IT NEEDS A BEGINNING AND AN END.
+
+The failure to avoid: starting in the middle of the mechanism and stopping when
+the mechanism runs out. That reads as a fragment overheard halfway through, and
+it is what the last two scripts did. Every piece follows this arc:
+
+1. NAME THE THING (segment 1). Say what the viewer is looking at, in plain
+   words, in the first three seconds. Not "at sunset, look east" — the viewer
+   does not yet know what they are being shown or why. A viewer who cannot
+   answer "what is this about?" after one sentence has already scrolled.
+2. THE TURN (segment 2). The counterintuitive claim, stated flatly. "Lightning
+   doesn't fall. It climbs." This is the reason to keep watching, and it is a
+   promise you must then pay off.
+3. THE MECHANISM (3-5 segments). One causal step each, in order, each one
+   earning the next. No step may be skipped as obvious.
+4. LAND IT (final segment). Close the loop opened in 1 and 2 — say what the
+   viewer now understands that they did not 40 seconds ago, and NAME THE
+   PHENOMENON again so it is memorable and searchable. A piece that just stops
+   has no ending; a piece whose last line restates the turn does.
+
+Write it so the first and last lines could stand alone as the whole idea.
+
+LENGTH. BUDGET WORDS AT 3.2 WORDS/SECOND — MEASURED for this narrator at its
+configured pace. A 45 s piece is about 145 words, a 60 s piece about 190. That
+is roughly 18-22 words per segment: two or three real sentences.
+
+If you have seen an older version of this instruction quoting 1.4 words/second
+and a 60-word ceiling, IGNORE IT. That number was an artifact of a previous
+voice that padded its output with silence, and writing to it produces a script
+too thin to introduce its own subject or close it — which was the single most
+common complaint about these pieces. You now have room for a real opening and a
+real ending. Use it, but do not pad: sparse, declarative, Anglo-Saxon, every
+sentence earning its place. The visual still carries the weight.
+
+Narration carries the ARGUMENT. Captions carry numbers and labels — never write
+a line that just reads a caption aloud, and never put a number in the narration
+that is not already on screen.
 
 Beat ids in BEATS must match narration ids exactly and in order. Leave `from`/`to`
 as any integers; they are overwritten from the measured audio durations."""
@@ -283,7 +338,7 @@ def author_claude(topic, seconds, template, previous_error=None):
             f"model returned no text (stop_reason={r.stop_reason}, blocks={kinds}, "
             f"output_tokens={usage.get('output_tokens')}) — "
             f"max_tokens likely exhausted by thinking")
-    return _extract_json(text), _price(usage, True), "claude"
+    return _parse_authored(text), _price(usage, True), "claude"
 
 
 def author_gemini(topic, seconds, template, previous_error=None):
@@ -297,7 +352,7 @@ def author_gemini(topic, seconds, template, previous_error=None):
         config=types.GenerateContentConfig(
             response_mime_type="application/json", max_output_tokens=32000),
     )
-    return _extract_json(r.text), 0.0, "gemini"
+    return _parse_authored(r.text), 0.0, "gemini"
 
 
 def apply_edits(template, edits):
@@ -365,9 +420,27 @@ for these first, in this order — they are the failures that actually happen:
 6. MONOTONY. Six tiles that look identical mean six seconds where nothing
    happened.
 
-Return ONLY a JSON object, no prose, no fence:
-{"assessment": "one or two sentences on what is actually wrong",
- "edits": [{"find": "...", "replace": "..."}]}
+Return your answer in EXACTLY this format. Not JSON — the replacement blocks
+are JavaScript, and embedding them in JSON strings means escaping every quote,
+newline and backslash correctly across thousands of characters. One slip
+invalidates the whole payload.
+
+ASSESSMENT: one or two sentences on what is actually wrong
+
+<<<<<<< FIND
+the exact text to find, verbatim, newlines and all
+=======
+the replacement text
+>>>>>>> END
+
+<<<<<<< FIND
+...
+=======
+...
+>>>>>>> END
+
+Repeat the block per edit. Write the code literally, with real newlines. Emit no
+blocks at all if there is nothing to fix.
 
 The edits apply to the CURRENT piece.html, which is given to you below — not to
 the original template. Same rules as before: each `find` must appear EXACTLY
@@ -377,6 +450,42 @@ referenced by pose().
 If the sheet genuinely looks good, return {"assessment": "...", "edits": []}.
 Do not invent work. A cosmetic tweak that risks a ReferenceError is worse than
 leaving it alone."""
+
+
+_EDIT_RE = re.compile(
+    r"<<<<<<<+ *FIND\r?\n(.*?)\r?\n=======+\r?\n(.*?)\r?\n>>>>>>>+ *END",
+    re.S)
+
+
+def _parse_authored(text):
+    """
+    HEADER json + conflict-marker edits -> the same dict the JSON format gave.
+
+    The header stays JSON because it is small, flat and has nothing to escape;
+    the edits do not, for the reason in the prompt.
+    """
+    blocks = _parse_edit_blocks(text)
+    m = re.search(r"HEADER\s*\n(\{.*?\})\s*(?:\n\s*<<<<<<<|\Z)", text, re.S)
+    head = _extract_json(m.group(1)) if m else _extract_json(text)
+    return {"title": head.get("title", ""),
+            "narration": head.get("narration") or [],
+            "edits": blocks["edits"]}
+
+
+def _parse_edit_blocks(text):
+    """
+    Conflict-marker edits -> {"assessment": str, "edits": [{find, replace}]}.
+
+    NOT JSON, on purpose. The first real production use of the repair pass died
+    on `Expecting ',' delimiter: line 1 column 2167` — the model had to escape
+    every quote, newline and backslash of a multi-kilobyte JavaScript block into
+    a JSON string, and one slip discards the entire response. There is nothing
+    to escape in this format.
+    """
+    m = re.search(r"ASSESSMENT:\s*(.+?)(?:\n\s*\n|<<<<<<<|$)", text, re.S)
+    edits = [{"find": f, "replace": r} for f, r in _EDIT_RE.findall(text)]
+    return {"assessment": (m.group(1).strip() if m else "").strip(),
+            "edits": edits}
 
 
 def _contact_sheet(frames_dir, dest, cols=6, rows=4):
@@ -471,7 +580,7 @@ def preflight_repair(piece_path, wd, plan_frames, fps, attempt_cost):
         usage = (resp.usage.model_dump() if hasattr(resp.usage, "model_dump")
                  else dict(resp.usage))
         cost = _price(usage, False)
-        spec = _extract_json(text)
+        spec = _parse_edit_blocks(text)
     except Exception as e:                                  # noqa: BLE001
         log.warning("repair call failed: %s", e)
         return False, 0.0
@@ -539,18 +648,18 @@ def _tts_one(text, out_path, seg_id):
 
 def _tts_all(narration, wd):
     """
-    Synthesise every segment, 2 at a time.
+    Synthesise every segment, 4 at a time.
 
-    Measured: one segment takes ~60-95 s wall (and a 504 on the first call is
-    routine, which is why generate_voiceover retries). Serially, 8 segments is
-    over ten minutes and threatens the job timeout. Concurrency is held at 2
-    because that is the documented safe floor for this preview model — higher
-    starts returning empty audio parts, which reads as silent throttling.
+    MEASURED on ElevenLabs: ~1.2 s per segment, so 8 segments is about ten
+    seconds, against the five minutes the previous engine took (60-203 s each,
+    a 504 on the first call being routine). 4 workers rather than 2: the old cap
+    existed because that model silently throttled above 2, returning empty audio
+    parts. That constraint is gone.
     """
     from concurrent.futures import ThreadPoolExecutor
     jobs = [(i, s) for i, s in enumerate(narration)]
     out = [None] * len(jobs)
-    with ThreadPoolExecutor(max_workers=2) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:
         futs = {ex.submit(_tts_one, s["text"], Path(wd) / f"vo_{i:02d}.wav",
                           s["id"]): i for i, s in jobs}
         for f in futs:
