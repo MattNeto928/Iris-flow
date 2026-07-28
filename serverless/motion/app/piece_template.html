@@ -1,0 +1,1003 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>piece</title>
+<style>
+  html,body{margin:0;padding:0;background:#000;overflow:hidden;height:100%}
+  #stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  canvas{display:block;max-width:100vw;max-height:100vh}
+  body.render #stage{align-items:flex-start;justify-content:flex-start}
+  body.render canvas{max-width:none;max-height:none}
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "/node_modules/three/build/three.module.js",
+    "three/addons/": "/node_modules/three/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="stage"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { TexturePass } from 'three/addons/postprocessing/TexturePass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+/* ============================================================================
+   TEMPLATE. Renders as-is -- check that first, so any later breakage is yours.
+   Sections marked >>> AUTHOR <<< are the ones you replace.
+
+   The contract that makes everything else work: pose(frame) is a PURE function
+   of frame. It re-derives all scene state from scratch every call. No `+=`, no
+   Math.random, no Date.now, no reading the previous frame. The renderer seeks
+   out of order for motion-blur sub-samples, so impurity desynchronises silently
+   instead of failing loudly.
+   ========================================================================== */
+
+// FPS 24 is the film default and right for a standalone piece. Set it to 30 for
+// anything that will be concatenated into the Iris-flow pipeline, which
+// normalises every segment to 1080x1920@30 -- feeding it 24 makes ffmpeg
+// duplicate frames on an uneven 5:4 cadence and the motion judders. SHUTTER is
+// a fraction of the frame interval, so the blur math carries either way.
+const W = 1080, H = 1920, FPS = 24;                  // >>> AUTHOR: 30 for Iris-flow
+const FRAMES = 240;                                  // >>> AUTHOR: length
+// 16 for motion blur alone; 24+ when they also serve as depth-of-field aperture
+// samples (below ~20 the bokeh bands). ?ss=N overrides, so a pipeline can trade
+// quality for render time without editing the piece.
+const SUBSAMPLES = Number(new URLSearchParams(location.search).get('ss')) || 24;
+const SHUTTER = 0.675;                               // ~243deg. 1.0 over-smears by ~50%.
+
+// Social-safe box. Stops at x 900 (not 1020) to clear TikTok's button rail, so
+// it is NOT centred -- compose on LANE_CX, not W/2.
+const SAFE = { x0: 60, x1: 900, y0: 200, y1: 1560 };
+const LANE_CX = (SAFE.x0 + SAFE.x1) / 2;             // 480
+
+// ---------------------------------------------------------------- easing
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const span = (t, a, b) => clamp((t - a) / (b - a), 0, 1);
+const E = {
+  linear: t => t,
+  outQuad: t => 1 - (1 - t) ** 2,
+  inCubic: t => t ** 3,
+  outCubic: t => 1 - (1 - t) ** 3,
+  outQuart: t => 1 - (1 - t) ** 4,
+  outQuint: t => 1 - (1 - t) ** 5,
+  // inOutCubic is the safe default for travel. inOutQuint has a much higher
+  // mid-velocity and will smear a moving subject into an unreadable streak.
+  inOutCubic: t => (t < .5 ? 4 * t ** 3 : 1 - (-2 * t + 2) ** 3 / 2),
+  inOutQuint: t => (t < .5 ? 16 * t ** 5 : 1 - (-2 * t + 2) ** 5 / 2),
+  outExpo: t => (t >= 1 ? 1 : 1 - Math.pow(2, -10 * t)),
+  outBack: t => 1 + 2.2 * (t - 1) ** 3 + 1.2 * (t - 1) ** 2,
+  outSoft: t => 1 - Math.pow(1 - t, 3.4),
+};
+const ease = (f, a, b, fn = E.inOutCubic) => fn(span(f, a, b));
+
+/** Seeded PRNG. Call during build only -- never from pose(). */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rnd = mulberry32(0xC0FFEE);
+
+/** sRGB -> THREE.Color. THREE.Color(r,g,b) treats floats as ALREADY LINEAR. */
+const C = (hex) => new THREE.Color().setHex(hex, THREE.SRGBColorSpace);
+
+// ============================================================== BEAT TABLE
+// >>> AUTHOR <<<  One row per beat. `bloom` is a per-beat multiplier on the base
+// strength: a threshold-free bloom scales with lit AREA as well as radiance, so
+// one global value cannot serve both a sparse beat and a full-frame one.
+//
+// The values below are near 1.0 only because this template's beats are all
+// similarly lit. THEY ARE NOT A HINT AT THE USEFUL RANGE. A piece that runs
+// from a near-black opening to a full-frame daylight beat needs the multiplier
+// to span 3x or more -- a measured example went 1.05 -> 0.32 across a 4.5% to
+// 75% swing in lit fraction, and its first full-quality preflight before that
+// was a solid white disc. Read the per-beat `lit` column that check.py prints:
+// if it moves by an order of magnitude, so must this.
+const BEATS = [
+  { id: 'open',  from: 0,   to: 71,  bloom: 1.00 },
+  { id: 'main',  from: 72,  to: 179, bloom: 1.05 },
+  { id: 'title', from: 180, to: 239, bloom: 0.95 },
+];
+const beatAt = (frame) => {
+  // Ownership from the OUTPUT frame, never the fractional sub-frame time:
+  // sub-samples run up to SHUTTER past the nominal frame, so `frame <= to`
+  // would cull a beat for most of its own final frame's samples.
+  const f = Math.floor(frame + 1e-6);
+  return BEATS.find(b => f >= b.from && f <= b.to) || BEATS[BEATS.length - 1];
+};
+
+// ============================================================== RENDERER
+const renderer = new THREE.WebGLRenderer({
+  antialias: false, preserveDrawingBuffer: true, powerPreference: 'high-performance',
+});
+renderer.setPixelRatio(1);
+renderer.setSize(W, H);
+renderer.setClearColor(0x000000, 1);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+// A lit scene wants a highlight shoulder. Use NoToneMapping instead only for
+// flat graphic/line work, where a hard clip is correct.
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.12;
+document.getElementById('stage').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(C(0x120a1c).getHex(), 0.012);
+const camera = new THREE.PerspectiveCamera(32, W / H, 0.5, 4000);
+
+// Backdrop scene, drawn first with the SAME camera pose but WITHOUT the
+// aperture offset. Anything effectively at infinity -- stars, a sky dome, a
+// distant field -- belongs here.
+//
+// Why: accumulation depth of field works by re-rendering from N points across
+// the aperture. For geometry near the focal plane those copies overlap into
+// smooth blur. For a point sprite 200 units behind it, they do not: you get N
+// discrete copies, and a starfield renders as visible clumps of 24 dots rather
+// than stars. That is what the optics really imply at that aperture, but it is
+// never what you want from a backdrop, and no realistic sample count fixes it.
+const bgScene = new THREE.Scene();
+const bgCamera = new THREE.PerspectiveCamera(32, W / H, 0.5, 8000);
+
+// The caption overlay: an ortho scene so type never picks up depth of field,
+// still rendered inside the sub-sample loop so its own motion blurs. Declared
+// HERE rather than down with the caption helpers because makePanel/makeCard/
+// makeAxis add to it, and the SCENE section below is where you build panels --
+// a `const` is in its temporal dead zone until its own line, so declaring this
+// later made every panel built in the SCENE section throw
+// "Cannot access 'capScene' before initialization".
+const capScene = new THREE.Scene();
+const capCam = new THREE.OrthographicCamera(-W / 2, W / 2, H / 2, -H / 2, -500, 500);
+const FONT = '"Helvetica Neue", Helvetica, Arial, sans-serif';
+
+// ============================================================== >>> AUTHOR: SCENE
+const key = new THREE.DirectionalLight(C(0xffd3a0), 2.9); key.position.set(38, 46, 26);
+const rim = new THREE.DirectionalLight(C(0x7fd4ff), 2.0); rim.position.set(-34, 18, -40);
+const fill = new THREE.HemisphereLight(C(0x8266c4), C(0x180c14), 1.4);
+scene.add(key, rim, fill);
+
+{ // ground
+  const cv = document.createElement('canvas'); cv.width = cv.height = 512;
+  const g = cv.getContext('2d');
+  const grd = g.createRadialGradient(256, 256, 0, 256, 256, 256);
+  grd.addColorStop(0, '#33203c'); grd.addColorStop(1, '#0a0611');
+  g.fillStyle = grd; g.fillRect(0, 0, 512, 512);
+  const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace;
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(1200, 1200),
+    new THREE.MeshStandardMaterial({ map: tex, roughness: 0.95 }));
+  ground.rotation.x = -Math.PI / 2; ground.position.y = -0.4;
+  scene.add(ground);
+}
+
+// A hero object that travels a path -- exercises the follow camera, motion blur
+// and DoF. Replace with your subject.
+const hero = new THREE.Mesh(
+  new THREE.IcosahedronGeometry(1.1, 1),
+  new THREE.MeshStandardMaterial({ color: C(0xffb347), roughness: 0.35, metalness: 0.1,
+                                   emissive: C(0xff7a1f), emissiveIntensity: 0.25 }),
+);
+scene.add(hero);
+
+const heroPath = new THREE.CatmullRomCurve3([
+  new THREE.Vector3(-16, 5, 14), new THREE.Vector3(-6, 8, 6),
+  new THREE.Vector3(4, 6, -2),   new THREE.Vector3(12, 9, -10),
+], false, 'catmullrom', 0.5);
+
+/** Subject position, pure in frame. The camera rig reads this too. */
+function heroAt(frame) {
+  const t = ease(frame, 20, 200, E.inOutCubic);
+  const p = heroPath.getPoint(t);
+  p.y += Math.sin(frame * 0.13) * 0.5;   // authored, not accumulated
+  return p;
+}
+
+// Scenery. Note the rejection against camera waypoints: scenery sitting on the
+// camera path blows out at close range and blocks the shot.
+const CAM_XZ = [[-10, 20], [6, 16], [16, -2]];
+for (let i = 0; i < 90; i++) {
+  const p = new THREE.Vector3((rnd() - 0.5) * 150, 0, (rnd() - 0.5) * 150);
+  if (CAM_XZ.some(([cx, cz]) => Math.hypot(p.x - cx, p.z - cz) < 9)) continue;
+  const h = 3 + rnd() * 9;
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(0.10, 0.16, h, 6),
+    new THREE.MeshStandardMaterial({ color: C(0x4a7a52), roughness: 0.85 }));
+  m.position.set(p.x, h / 2, p.z);
+  scene.add(m);
+}
+
+// Star shell, using the helper: fov-correct sizes and sane density for 9:16.
+const STARS = makePointField(4000, { radius: 200, size: 0.9, shell: true, opacity: 0.7 });
+bgScene.add(STARS.points);   // backdrop, so DoF cannot shred it into copies
+
+// Dust motes: cheap atmosphere, and they become real bokeh when out of focus.
+const MOTES = 220;
+const moteMesh = new THREE.InstancedMesh(new THREE.SphereGeometry(0.05, 6, 5),
+  new THREE.MeshBasicMaterial({ color: C(0xffd9a0), transparent: true, opacity: 0.4 }), MOTES);
+// Kept in a moderate depth band. A dust field spread over 100+ units is so far
+// off the focal plane that its blur circle is huge, and 24 aperture samples
+// paint 24 separate dots inside it instead of one soft disc. Bokeh only reads as
+// bokeh while the blur circle stays comparable to the sample spacing.
+const moteData = Array.from({ length: MOTES }, () => ({
+  p: new THREE.Vector3((rnd() - .5) * 46, 1 + rnd() * 22, (rnd() - .5) * 46),
+  ph: rnd() * 6.28, sp: .3 + rnd() * .9, sc: .7 + rnd() * 1.4,
+}));
+scene.add(moteMesh);
+
+/** Soft radial glow sprite. A flat disc reads as a coin; the falloff reads as light. */
+function glowTexture(power = 2.4) {
+  const n = 256, cv = document.createElement('canvas'); cv.width = cv.height = n;
+  const g = cv.getContext('2d');
+  const grd = g.createRadialGradient(n / 2, n / 2, 0, n / 2, n / 2, n / 2);
+  for (let i = 0; i <= 16; i++) {
+    const t = i / 16;
+    grd.addColorStop(t, `rgba(255,255,255,${Math.pow(1 - t, power).toFixed(4)})`);
+  }
+  g.fillStyle = grd; g.fillRect(0, 0, n, n);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.generateMipmaps = false;
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  return tex;
+}
+
+/* ===========================================================================
+   HELPER CONVENTION -- read this once and you will not have to guess.
+
+   Every `make*` factory returns a CONTROLLER OBJECT, never a bare mesh or
+   material. The controller always exposes:
+
+     .set(...)      drive it from pose(). Always the first thing you call.
+     .mesh          the Object3D, if you need to reparent or reposition it.
+
+   and some also expose `.material` / `.ctx` / `.redraw` where that is useful.
+   makePointField is the one that names its object `.points` rather than
+   `.mesh`, because it is a THREE.Points and calling it a mesh would mislead.
+
+   So: `PANEL.set(v)` and `PANEL.mesh.position.y = ...`, never `PANEL.opacity`
+   or `PANEL.uOp.value`. If you write a helper of your own, match this shape --
+   a scene full of objects that each need a different access pattern is how you
+   get `TypeError: Cannot set properties of undefined` 1200 lines from the
+   thing you were actually editing.
+
+   The exception is makeGlow, which returns a plain Mesh and says so.
+   =========================================================================== */
+
+// ============================================================== CAPTIONS
+// capScene / capCam / FONT are declared up with the renderer, so that panels
+// built in the SCENE section can reach them.
+
+/**
+ * One quad per glyph, so characters can be staggered independently -- a single
+ * texture for the whole line cannot do that.
+ */
+function makeCaption(text, opts = {}) {
+  const { size = 78, weight = 700, tracking = 0.02, color = '#efefef',
+          y = 0, maxWidth = SAFE.x1 - SAFE.x0 } = opts;
+
+  const probe = document.createElement('canvas').getContext('2d');
+  const measure = (px) => {
+    probe.font = `${weight} ${px}px ${FONT}`;
+    probe.letterSpacing = `${(tracking * px).toFixed(2)}px`;
+    return probe.measureText(text).width;
+  };
+  // Auto-fit rather than hand-picking a size: type that overflows the safe box
+  // gets clipped by platform UI.
+  let fit = size;
+  if (measure(fit) > maxWidth) {
+    let lo = 10, hi = size;
+    while (hi - lo > 0.5) { const m = (lo + hi) / 2; if (measure(m) > maxWidth) hi = m; else lo = m; }
+    fit = Math.floor(lo);
+  }
+  probe.font = `${weight} ${fit}px ${FONT}`;
+  probe.letterSpacing = `${(tracking * fit).toFixed(2)}px`;
+  const total = probe.measureText(text).width;
+
+  const group = new THREE.Group();
+  group.position.set(LANE_CX - W / 2, y, 0);
+  capScene.add(group);
+
+  const chars = [];
+  let cursor = -total / 2;
+  const PAD = Math.ceil(fit * 0.42);
+  for (const ch of text) {
+    const adv = probe.measureText(ch).width;
+    if (ch !== ' ') {
+      const cw = Math.ceil(adv) + PAD * 2, chh = Math.ceil(fit * 1.7) + PAD;
+      const cv = document.createElement('canvas'); cv.width = cw; cv.height = chh;
+      const g = cv.getContext('2d');
+      g.font = `${weight} ${fit}px ${FONT}`;
+      g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = color;
+      g.fillText(ch, cw / 2, chh / 2);
+      const tex = new THREE.CanvasTexture(cv);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.minFilter = tex.magFilter = THREE.LinearFilter; tex.generateMipmaps = false;
+      renderer.initTexture(tex);   // else a mid-piece first appearance renders blank
+      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(cw, chh),
+        // Normal alpha, not additive: additive glyph edges compound against the
+        // glow behind them and legibility goes. Bloom supplies the halo.
+        new THREE.MeshBasicMaterial({ map: tex, transparent: true,
+          depthTest: false, depthWrite: false, toneMapped: false }));
+      mesh.position.x = cursor + adv / 2;
+      group.add(mesh);
+      chars.push({ mesh });
+    }
+    cursor += adv;
+  }
+
+  return {
+    group, chars, size: fit, width: total,
+    /** in-window [a,b], out-window [c,d]. Ensure d_in = b + n*stagger < c. */
+    play(f, a, b, c, d) {
+      const n = chars.length || 1;
+      // Cap TOTAL stagger, not per-character: at a fixed 1.15 frames/char a
+      // 28-character line takes 2.4s to land and its exit opens first.
+      const SI = Math.min(1.0, 11 / n), SO = Math.min(0.5, 6 / n);
+      let vis = false;
+      for (let i = 0; i < n; i++) {
+        const m = chars[i].mesh;
+        const pi = clamp((f - a - i * SI) / Math.max(1, b - a), 0, 1);
+        const po = clamp((f - c - i * SO) / Math.max(1, d - c), 0, 1);
+        const ei = E.outQuint(pi), eo = E.inCubic(po);
+        const o = ei * (1 - eo);
+        m.material.opacity = o;
+        m.position.y = (1 - ei) * 46 - eo * 30;
+        m.scale.setScalar((0.82 + 0.18 * ei) * (1 - 0.10 * eo));
+        m.rotation.x = (1 - ei) * -0.95 + eo * 0.5;
+        m.visible = o > 0.003;
+        if (m.visible) vis = true;
+      }
+      group.visible = vis;
+    },
+  };
+}
+
+/** Rule that wipes open under a caption. */
+function makeRule(y, w = 320, color = 0xffb347) {
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 3),
+    new THREE.MeshBasicMaterial({ color: C(color), transparent: true, opacity: 0,
+      depthTest: false, toneMapped: false }));
+  mesh.position.set(LANE_CX - W / 2, y, 0);
+  capScene.add(mesh);
+  return { mesh, play(f, a, b, c, d) {
+    const o = span(f, a, b) > 0 ? 1 - E.inCubic(clamp((f - c) / Math.max(1, d - c), 0, 1)) : 0;
+    mesh.scale.x = w * E.outExpo(span(f, a, b));
+    mesh.material.opacity = o * 0.9;
+    mesh.visible = o > 0.004 && mesh.scale.x > 1;
+  } };
+}
+
+
+
+/**
+ * A field of points -- stars, dust, plasma, photons, particles. Every piece
+ * built with this skill has needed one, and hand-rolling it hits two traps.
+ *
+ * 1. three.js PointsMaterial computes gl_PointSize as `size * (scale / -z)`
+ *    with scale fixed at H/2, which IGNORES the field of view. Animate the fov
+ *    and every point silently keeps the size it had at the old fov. The shader
+ *    below multiplies by projectionMatrix[1][1] (= 1/tan(fov/2)) instead, so
+ *    `size` is a true world-space diameter at any fov.
+ * 2. Density intuition is wrong in 9:16. A 32 deg vertical fov on a portrait
+ *    frame sees roughly 2% of a surrounding sphere, so a "few thousand stars"
+ *    scattered on a shell shows about forty. Budget accordingly, or distribute
+ *    into the visible cone rather than over a full sphere.
+ *
+ * SIZE IS IN WORLD UNITS, and the on-screen result is easy to be wrong about by
+ * an order of magnitude in either direction. Compute it, do not guess:
+ *
+ *     px = size * (H/2) * (1/tan(fov/2)) / dist
+ *
+ * At H=1920 and fov=32 deg that is `size * 3348 / dist`. So on a radius-900
+ * star shell, size 4.2 gives 15 px snowballs and size 0.55 gives 2 px -- and
+ * with the default sizeVar the small tail of that distribution goes sub-pixel
+ * and disappears entirely. Aim for 1.5-3 px and check a full-res crop, not a
+ * contact sheet: a downscaled sheet cannot tell you a point field vanished.
+ *
+ * @param opts.size   world-space diameter; see the px formula above
+ * @param opts.shell  scatter on a spherical shell (stars) vs a solid ball (dust)
+ */
+function makePointField(n, opts = {}) {
+  const {
+    radius = 60, inner = 0, size = 0.5, sizeVar = 0.6,
+    color = 0xffffff, opacity = 0.9, shell = false, rng = rnd,
+  } = opts;
+
+  const pos = new Float32Array(n * 3);
+  const sz = new Float32Array(n);
+  const seed = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    // cube-root radial sampling keeps a solid ball uniform in volume; without
+    // it everything piles up at the centre
+    const u = rng(), v = rng(), w = rng();
+    const r = shell ? radius : inner + (radius - inner) * Math.cbrt(w);
+    const th = Math.acos(2 * u - 1), ph = v * Math.PI * 2;
+    pos[i * 3] = r * Math.sin(th) * Math.cos(ph);
+    pos[i * 3 + 1] = r * Math.sin(th) * Math.sin(ph);
+    pos[i * 3 + 2] = r * Math.cos(th);
+    sz[i] = size * (1 - sizeVar + rng() * sizeVar * 2);
+    seed[i] = rng() * 6.283;
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('aSize', new THREE.BufferAttribute(sz, 1));
+  geo.setAttribute('aSeed', new THREE.BufferAttribute(seed, 1));
+
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uH: { value: H }, uOpacity: { value: opacity },
+      uColor: { value: C(color) }, uTwinkle: { value: 0 }, uPhase: { value: 0 },
+    },
+    vertexShader: `
+      attribute float aSize; attribute float aSeed;
+      uniform float uH; varying float vFade;
+      void main() {
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        gl_Position = projectionMatrix * mv;
+        // projectionMatrix[1][1] == 1/tan(fov/2): fov-correct, unlike PointsMaterial
+        gl_PointSize = aSize * (0.5 * uH * projectionMatrix[1][1]) / max(0.001, -mv.z);
+        vFade = aSeed;
+      }`,
+    fragmentShader: `
+      uniform vec3 uColor; uniform float uOpacity, uTwinkle, uPhase;
+      varying float vFade;
+      void main() {
+        vec2 d = gl_PointCoord - 0.5;
+        float a = smoothstep(0.5, 0.06, length(d));       // soft round sprite
+        float tw = 1.0 - uTwinkle * 0.5 * (1.0 + sin(vFade + uPhase));
+        gl_FragColor = vec4(uColor, a * uOpacity * tw);
+      }`,
+    transparent: true, depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+
+  const points = new THREE.Points(geo, mat);
+  points.userData.ignoreClearance = true;   // ambient, never an obstacle
+  return {
+    points, material: mat,
+    set(o = 1, twinkle = 0, phase = 0) {
+      mat.uniforms.uOpacity.value = o;
+      mat.uniforms.uTwinkle.value = twinkle;
+      mat.uniforms.uPhase.value = phase;
+      points.visible = o > 0.004;
+    },
+  };
+}
+
+/**
+ * Scrim: a soft dark gradient behind a caption band. On any scene that is
+ * bright behind the type -- a lit sky, a white flash, a pale subject -- this is
+ * the single biggest legibility fix available, and it costs one quad.
+ */
+function makeScrim(cy, h, color = '#000000') {
+  const n = 256, cv = document.createElement('canvas');
+  cv.width = 4; cv.height = n;
+  const g = cv.getContext('2d');
+  const grd = g.createLinearGradient(0, 0, 0, n);
+  grd.addColorStop(0.00, 'rgba(0,0,0,0)');
+  grd.addColorStop(0.28, 'rgba(0,0,0,0.72)');
+  grd.addColorStop(0.72, 'rgba(0,0,0,0.72)');
+  grd.addColorStop(1.00, 'rgba(0,0,0,0)');
+  g.fillStyle = grd; g.fillRect(0, 0, 4, n);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.generateMipmaps = false;
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(W * 1.1, h),
+    new THREE.MeshBasicMaterial({ map: tex, color: C(parseInt(color.slice(1), 16)),
+      transparent: true, opacity: 0, depthTest: false, depthWrite: false, toneMapped: false }));
+  mesh.position.set(0, cy, -1);      // behind the glyphs in the overlay
+  mesh.renderOrder = -1;
+  capScene.add(mesh);
+  return { mesh, set(v) { mesh.material.opacity = clamp(v, 0, 1); mesh.visible = v > 0.004; } };
+}
+
+/**
+ * A 2D panel drawn with the canvas API and composited in screen space -- graphs,
+ * bars, swatches, axes, legends. Explainers need these constantly and they are
+ * miserable to build out of 3D geometry.
+ *
+ * draw(ctx, w, h) is called once at build. Pass `live: true` and call redraw()
+ * from pose() if the panel animates, but prefer static: redrawing uploads a new
+ * texture every sub-sample, which is 24x per output frame.
+ */
+function makePanel(w, h, draw, opts = {}) {
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const ctx = cv.getContext('2d');
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.generateMipmaps = false;
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  const render = () => { ctx.clearRect(0, 0, w, h); draw(ctx, w, h); tex.needsUpdate = true; };
+  render();
+  renderer.initTexture(tex);
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0,
+      depthTest: false, depthWrite: false, toneMapped: false }));
+  // Default x centres the panel on the SAFE LANE (x 480), not the frame centre
+  // (x 540) -- the safe box stops at 900 to clear TikTok's button rail. Pass
+  // opts.x only when you deliberately want it off-lane.
+  mesh.position.set(opts.x ?? (LANE_CX - W / 2), opts.y ?? 0, 0);
+  capScene.add(mesh);
+  return {
+    mesh, ctx, redraw: render,
+    set(v, dy = 0) {
+      mesh.material.opacity = clamp(v, 0, 1);
+      mesh.position.y = (opts.y ?? 0) + dy;
+      mesh.visible = v > 0.004;
+    },
+  };
+}
+
+/**
+ * A spec card: rule, title, subtitle, and value rows. Every explainer that names
+ * a thing ends up building one of these -- a spectral line, a material, a
+ * species, a planet. Built on makePanel, so it shares set(v, dy).
+ *
+ *   makeCard({ title: '557.7 nm', sub: 'O(1S) -> O(1D)',
+ *              rows: [['t', '0.75 s'], ['survives above', '88 km']],
+ *              accent: 0x66ff9e, y: -320 })
+ *
+ * Rows are label/value pairs; the value is right-aligned on the accent colour so
+ * a column of them scans. Keep to four rows -- past that it is a table, and a
+ * table in a 9:16 frame is unreadable at arm's length.
+ */
+function makeCard(opts = {}) {
+  const { title = '', sub = '', rows = [], accent = 0xffb347, w = 760 } = opts;
+  const PAD = 34, TITLE = 62, SUB = 30, ROW = 40;
+  const h = PAD * 2 + TITLE + (sub ? SUB + 12 : 0) + rows.length * ROW + 10;
+  const A = srgb(accent);
+  return makePanel(w, h, (ctx, cw, ch) => {
+    ctx.fillStyle = 'rgba(8,10,14,0.72)';
+    roundRect(ctx, 0, 0, cw, ch, 14); ctx.fill();
+    ctx.fillStyle = A; ctx.fillRect(0, 0, 5, ch);           // accent spine
+    let y = PAD + TITLE * 0.78;
+    ctx.textAlign = 'left'; ctx.fillStyle = '#eeeeee';
+    ctx.font = `600 ${TITLE}px -apple-system, Helvetica, Arial, sans-serif`;
+    ctx.fillText(title, PAD, y);
+    if (sub) {
+      y += SUB + 12;
+      ctx.font = `400 ${SUB}px -apple-system, Helvetica, Arial, sans-serif`;
+      ctx.fillStyle = 'rgba(238,238,238,0.62)';
+      ctx.fillText(sub, PAD, y);
+    }
+    ctx.font = `400 ${ROW * 0.72}px -apple-system, Helvetica, Arial, sans-serif`;
+    for (const [k, v] of rows) {
+      y += ROW;
+      ctx.textAlign = 'left';  ctx.fillStyle = 'rgba(238,238,238,0.55)';
+      ctx.fillText(k, PAD, y);
+      ctx.textAlign = 'right'; ctx.fillStyle = A;
+      ctx.fillText(v, cw - PAD, y);
+    }
+  }, opts);
+}
+
+/**
+ * A labelled scale down the side of frame -- altitude, depth, time, temperature.
+ * The second most common panel in an explainer after the card, and the one most
+ * often rebuilt badly: ticks want to be quiet and the labels want to be small,
+ * because the scale is context, not the subject.
+ *
+ *   makeAxis({ ticks: [[100,'100 km'],[200,'200 km']], lo: 80, hi: 420,
+ *              h: 1200, x: -430 })
+ *
+ * Values map linearly from [lo, hi] onto the panel height.
+ */
+function makeAxis(opts = {}) {
+  const { ticks = [], lo = 0, hi = 1, h = 1100, w = 240, color = 0xffffff } = opts;
+  const A = srgb(color);
+  return makePanel(w, h, (ctx, cw, ch) => {
+    ctx.strokeStyle = 'rgba(238,238,238,0.20)'; ctx.lineWidth = 2;
+    ctx.font = '400 26px -apple-system, Helvetica, Arial, sans-serif';
+    for (const [v, label] of ticks) {
+      const y = ch - ((v - lo) / (hi - lo)) * ch;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(26, y); ctx.stroke();
+      ctx.fillStyle = 'rgba(238,238,238,0.50)'; ctx.textAlign = 'left';
+      ctx.fillText(label, 36, y + 9);
+    }
+    ctx.fillStyle = A;
+  }, opts);
+}
+
+/** Rounded rect path. Canvas has roundRect() only in newer engines; this is safe. */
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);         ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+/**
+ * 0xRRGGBB -> '#rrggbb', for canvas fills. Canvas is sRGB, so no conversion.
+ * Declared as a function, not a const arrow: helpers must be callable from the
+ * SCENE section above them, and a const is in its temporal dead zone until the
+ * line that defines it.
+ */
+function srgb(hex) { return '#' + hex.toString(16).padStart(6, '0'); }
+
+/**
+ * A billboarded additive glow. Note this returns a MESH you add and scale
+ * yourself, unlike the make* factories which return a controller object.
+ * A flat CircleGeometry reads as a coin; this reads as light.
+ */
+function makeGlow(size, color = 0xffffff, opacity = 0.9, power = 2.4) {
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(size, size),
+    new THREE.MeshBasicMaterial({ map: glowTexture(power), color: C(color),
+      transparent: true, opacity, depthWrite: false, toneMapped: false,
+      blending: THREE.AdditiveBlending }));
+  m.userData.ignoreClearance = true;
+  return m;
+}
+
+/**
+ * A label pinned to a point in the 3D scene but drawn in the overlay, so it
+ * stays crisp instead of being softened by depth of field. Call set() from
+ * pose() AFTER the camera is positioned.
+ */
+function makeAnchoredLabel(text, opts = {}) {
+  const { size = 34, weight = 600, color = '#efefef', tracking = 0.06 } = opts;
+  const cv = document.createElement('canvas');
+  const g = cv.getContext('2d');
+  const font = `${weight} ${size}px ${FONT}`;
+  g.font = font; g.letterSpacing = `${(tracking * size).toFixed(2)}px`;
+  const wpx = Math.ceil(g.measureText(text).width) + 24, hpx = Math.ceil(size * 1.6);
+  cv.width = wpx; cv.height = hpx;
+  g.font = font; g.letterSpacing = `${(tracking * size).toFixed(2)}px`;
+  g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = color;
+  g.fillText(text, wpx / 2, hpx / 2);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.generateMipmaps = false;
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  renderer.initTexture(tex);
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(wpx, hpx),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0,
+      depthTest: false, depthWrite: false, toneMapped: false }));
+  capScene.add(mesh);
+  const _v = new THREE.Vector3();
+  return {
+    mesh,
+    /** @param world THREE.Vector3 anchor  @param off screen-pixel offset */
+    set(world, opacity, off = { x: 0, y: 0 }) {
+      _v.copy(world).project(camera);
+      mesh.position.set(_v.x * W / 2 + off.x, _v.y * H / 2 + off.y, 0);
+      // z > 1 means the anchor is behind the camera; NDC wraps and the label
+      // would appear mirrored on the opposite side of frame.
+      const behind = _v.z > 1;
+      mesh.material.opacity = behind ? 0 : clamp(opacity, 0, 1);
+      mesh.visible = !behind && opacity > 0.004;
+    },
+  };
+}
+
+// >>> AUTHOR <<<  Headlines near y +560, sub-lines near y +430 read well in 9:16
+// -- but that is a default, not a rule. Compose type against where the SUBJECT
+// sits, not just inside the safe box: when the subject is a single centred
+// object, high captions crowd it and the type wants to be low instead.
+const CAP = {
+  a: makeCaption('REPLACE THIS LINE', { y: 560, size: 84 }),
+  b: makeCaption('AND THIS ONE', { y: 430, size: 46, weight: 500,
+                                   color: '#ffb347', tracking: 0.06 }),
+  t: makeCaption('TITLE', { y: 560, size: 128, tracking: 0.05 }),
+};
+const RULE = makeRule(450, 300);   // keep the title block clear of centre-frame subjects
+const SCRIM = makeScrim(500, 460);   // sits behind the headline band
+
+// Full-frame flash. Keep it to a few frames -- a flat wash reads as a cheap cut,
+// and a radial burst at the thing that caused it is usually better.
+const flashPlane = new THREE.Mesh(new THREE.PlaneGeometry(4, 4),
+  new THREE.MeshBasicMaterial({ color: C(0xfff0d8), transparent: true, opacity: 0,
+    depthTest: false, toneMapped: false }));
+flashPlane.renderOrder = 999; flashPlane.scale.set(W, H, 1);
+capScene.add(flashPlane);
+
+// ============================================================== POST CHAIN
+const rtOpts = { type: THREE.HalfFloatType, colorSpace: THREE.LinearSRGBColorSpace };
+const sceneTarget = new THREE.WebGLRenderTarget(W, H, { ...rtOpts, samples: 4, depthBuffer: true });
+const accumTarget = new THREE.WebGLRenderTarget(W, H, { ...rtOpts, depthBuffer: false });
+
+const accScene = new THREE.Scene();
+const accCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const accMat = new THREE.ShaderMaterial({
+  uniforms: { tSrc: { value: null }, uW: { value: 1 / SUBSAMPLES } },
+  vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.,1.); }`,
+  // 1/N applied in-shader, not via material opacity: transparent objects in the
+  // scene make opacity-as-weight unreliable.
+  fragmentShader: `uniform sampler2D tSrc; uniform float uW; varying vec2 vUv;
+    void main(){ gl_FragColor = vec4(texture2D(tSrc,vUv).rgb*uW, 1.0); }`,
+  depthTest: false, depthWrite: false,
+  blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor,
+});
+accScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), accMat));
+
+const LookShader = {
+  uniforms: { tDiffuse: { value: null }, uRes: { value: new THREE.Vector2(W, H) },
+              uVig: { value: 0.62 }, uGrain: { value: 0.55 } },
+  vertexShader: `varying vec2 vUv;
+    void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
+  fragmentShader: `
+    uniform sampler2D tDiffuse; uniform vec2 uRes; uniform float uVig, uGrain;
+    varying vec2 vUv;
+    // These constants are in sRGB CODE UNITS but this pass runs before
+    // OutputPass, i.e. in linear space. Adding them raw is a ~13x error near
+    // black. 12.92 is the sRGB linear-segment slope, valid down here.
+    float srgb2lin(float c){ return (c/255.0)/12.92; }
+    float hash(vec2 p){ p=fract(p*vec2(233.34,851.73)); p+=dot(p,p+23.45); return fract(p.x*p.y); }
+    float vnoise(vec2 p){
+      vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+      return mix(mix(hash(i),hash(i+vec2(1,0)),f.x), mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),f.x), f.y);
+    }
+    void main(){
+      vec2 c = vUv-0.5;
+      // Radial chromatic aberration: per-channel scale about frame centre,
+      // separation growing linearly with radius (2.79 px R-B at the corner).
+      vec3 col;
+      col.r = texture2D(tDiffuse, 0.5 + c*1.001369).r;
+      col.g = texture2D(tDiffuse, vUv).g;
+      col.b = texture2D(tDiffuse, 0.5 + c*0.998589).b;
+
+      float r = length(c*vec2(1.0, 0.62));
+      col *= clamp(1.0 - uVig*(r*r*2.15 - 0.06), 0.0, 1.0);
+
+      col += vec3(srgb2lin(3.2), srgb2lin(2.6), srgb2lin(4.4));   // black is not 0
+
+      // Static grain (46.55 px). Static reads as film; animated reads as noise.
+      float n = vnoise(vUv*uRes/46.55) - 0.5;
+      col += vec3(srgb2lin(0.189), srgb2lin(0.24), srgb2lin(0.290))*n*2.0*uGrain*24.0;
+
+      gl_FragColor = vec4(max(col,0.0), 1.0);
+    }`,
+};
+
+const composer = new EffectComposer(renderer);
+composer.setSize(W, H);
+const texPass = new TexturePass(accumTarget.texture);
+composer.addPass(texPass);
+// Threshold is HIGH on purpose. Near zero, every dim pixel enters the mip chain
+// and the frame hazes to milky grey -- the single biggest lever on whether the
+// render looks professional. Threshold and strength are TUNED, not measured.
+const BLOOM_BASE = 0.42;
+const bloom = new UnrealBloomPass(new THREE.Vector2(W, H), BLOOM_BASE, 0.32, 0.70);
+{ // far glow reads violet: blue carries the widest lobes, green only ~73% of blue
+  const tints = [[1,.98,1],[.97,.90,1],[.92,.82,1],[.88,.76,1],[.86,.74,1]]
+    .map(([r, g, b]) => new THREE.Vector3(r, g, b));
+  if (bloom.bloomTintColors) bloom.bloomTintColors = tints;
+  if (bloom.compositeMaterial?.uniforms?.bloomTintColors)
+    bloom.compositeMaterial.uniforms.bloomTintColors.value = tints;
+}
+composer.addPass(bloom);
+composer.addPass(new ShaderPass(LookShader));
+composer.addPass(new OutputPass());
+
+// Halton (2,3) mapped to a disc: aperture offset (depth of field) AND sub-pixel
+// offset (AA), from one fixed table. Not a PRNG -- the render must reproduce.
+const halton = (i, b) => { let f = 1, r = 0, n = i + 1;
+  while (n > 0) { f /= b; r += f * (n % b); n = Math.floor(n / b); } return r; };
+const SAMPLES = Array.from({ length: SUBSAMPLES }, (_, i) => {
+  const u = halton(i, 2), v = halton(i, 3), rr = Math.sqrt(u), th = v * Math.PI * 2;
+  return { dx: Math.cos(th) * rr, dy: Math.sin(th) * rr,
+           jx: halton(i, 5) - .5, jy: halton(i, 7) - .5 };
+});
+
+// ============================================================== CAMERA
+/**
+ * >>> AUTHOR <<<  [frame, x,y,z, tx,ty,tz, aperture, fov, follow, cut]
+ *
+ * cut=1 SNAPS to this key instead of easing into it. Use it between staging
+ * areas -- a diagram in space and a cross-section of the atmosphere are not one
+ * continuous camera move, and interpolating between them wastes seconds of
+ * screen time on a flythrough of nothing.
+ *
+ * follow=1 makes position and target OFFSETS from the subject instead of world
+ * coordinates. This matters beyond convenience: the focal plane sits on the
+ * TARGET, so a target that drifts off the subject renders it soft. Each key is
+ * resolved at the current frame and only then interpolated, so follow and
+ * locked-off keys blend cleanly.
+ *
+ * Portrait is narrow: half-width is d*tan(fov/2)*(9/16) -- about 1.18 units at
+ * d=7, fov=32. Keep offsets generous or a fast subject exits the side.
+ */
+const CAMKEYS = [
+  [0,     7.0, 3.0, 9.0,   0, 0, 0,   0.14, 32, 1],
+  [110,   8.0, 3.6, 9.5,   0, 0, 0,   0.20, 32, 1],
+  [179,   9.0, 4.2, 10.5,  0, 0, 0,   0.16, 34, 1],
+  // A locked-off wide still has to contain the subject. The subject ends near
+  // (12, 9, -10), so this target is chosen to keep it in shot -- pulling back to
+  // an arbitrary framing is how you lose it.
+  [239,  22.0, 20.0, 24.0, 10, 8, -8, 0.10, 40, 0],
+];
+const _kp = new THREE.Vector3(), _kt = new THREE.Vector3();
+const _pA = new THREE.Vector3(), _tA = new THREE.Vector3();
+function resolveKey(K, frame, outP, outT) {
+  if (K[9]) {
+    const s = heroAt(frame);
+    outP.set(s.x + K[1], s.y + K[2], s.z + K[3]);
+    outT.set(s.x + K[4], s.y + K[5], s.z + K[6]);
+  } else {
+    outP.set(K[1], K[2], K[3]);
+    outT.set(K[4], K[5], K[6]);
+  }
+}
+function camAt(frame) {
+  let i = 0;
+  while (i < CAMKEYS.length - 2 && frame > CAMKEYS[i + 1][0]) i++;
+  const A = CAMKEYS[i], B = CAMKEYS[i + 1];
+  // cut=1 on B: SNAP to B at B's frame instead of easing into it. Any explainer
+  // with more than one staging area needs this -- without it the camera flies
+  // the thousand units between them and every frame in between is garbage.
+  // Safe against the shutter because sub-samples run F -> F+SHUTTER and never
+  // backwards, so `frame < B[0]` puts every sample of frame B[0]-1 on the near
+  // side of the cut and every sample of B[0] on the far side. No sub-sample
+  // ever straddles it, so the cut lands clean with no cross-dissolved frame.
+  const t = B[10] ? (frame < B[0] ? 0 : 1) : E.inOutCubic(span(frame, A[0], B[0]));
+  resolveKey(A, frame, _pA, _tA);
+  resolveKey(B, frame, _kp, _kt);
+  return { pos: _pA.clone().lerp(_kp, t), tgt: _tA.clone().lerp(_kt, t),
+           ap: lerp(A[7], B[7], t), fov: lerp(A[8], B[8], t) };
+}
+
+// ============================================================== POSE
+const UP = new THREE.Vector3(0, 1, 0), ZERO = new THREE.Vector3();
+const _cF = new THREE.Vector3(), _cR = new THREE.Vector3(), _cU = new THREE.Vector3();
+const _dummy = new THREE.Object3D();
+
+function pose(frame, sample) {
+  const F = Math.floor(frame + 1e-6);
+  const beat = beatAt(frame);
+
+  // ---- camera + accumulation depth of field. Offsetting the eye across the
+  // aperture and re-aiming at the same target keeps that plane sharp and blurs
+  // everything off it: real DoF, free, because the samples already exist.
+  const ck = camAt(frame);
+  camera.fov = ck.fov;
+  _cF.subVectors(ck.tgt, ck.pos).normalize();
+  _cR.crossVectors(_cF, UP).normalize();
+  _cU.crossVectors(_cR, _cF).normalize();
+  camera.position.copy(ck.pos)
+    .addScaledVector(_cR, sample.dx * ck.ap)
+    .addScaledVector(_cU, sample.dy * ck.ap);
+  camera.lookAt(ck.tgt);
+  camera.setViewOffset(W, H, sample.jx, sample.jy, W, H);   // sub-pixel AA
+  camera.updateProjectionMatrix();
+
+  // Same pose, no aperture offset -- keeps sub-pixel jitter (so AA still works)
+  // and full parallax, but no bokeh multiplication of distant points.
+  bgCamera.fov = ck.fov;
+  bgCamera.position.copy(ck.pos);
+  bgCamera.lookAt(ck.tgt);
+  bgCamera.setViewOffset(W, H, sample.jx, sample.jy, W, H);
+  bgCamera.updateProjectionMatrix();
+
+  // ---- >>> AUTHOR: scene state. Everything written, never accumulated.
+  const p = heroAt(frame);
+  hero.position.copy(p);
+  hero.rotation.set(frame * 0.03, frame * 0.045, 0);
+
+  // To aim a +z-forward model along a tangent:
+  //   _m.lookAt(tangent, ZERO, UP)   -- NOT lookAt(ZERO, tangent, UP).
+  // Matrix4.lookAt sets +z to normalize(eye - target), so the intuitive-looking
+  // argument order points the model backwards for the whole piece.
+
+  for (let i = 0; i < MOTES; i++) {
+    const d = moteData[i];
+    _dummy.position.set(
+      d.p.x + Math.sin(frame * 0.007 * d.sp + d.ph) * 1.6,
+      d.p.y + Math.sin(frame * 0.011 * d.sp + d.ph * 2) * 1.1,
+      d.p.z + Math.cos(frame * 0.006 * d.sp + d.ph) * 1.6);
+    _dummy.rotation.set(0, 0, 0);
+    _dummy.scale.setScalar(d.sc);
+    _dummy.updateMatrix();
+    moteMesh.setMatrixAt(i, _dummy.matrix);
+  }
+  moteMesh.instanceMatrix.needsUpdate = true;
+  STARS.set(0.55 * (1 - span(frame, 150, 215)), 0.35, frame * 0.07);
+
+  // ---- >>> AUTHOR: captions. play(frame, inStart, inEnd, outStart, outEnd).
+  // Check in-end + n*stagger < out-start, or the tail never appears.
+  // Scrim tracks whichever caption band is live. On a dark scene you can leave
+  // it at 0; on anything bright it is the difference between readable and not.
+  SCRIM.set(0.55 * Math.max(span(frame, 10, 34) * (1 - span(frame, 120, 145)),
+                            span(frame, 184, 206)));
+  CAP.a.play(frame, 14, 38, 120, 140);
+  CAP.b.play(frame, 40, 62, 120, 140);
+  CAP.t.play(frame, 188, 210, 900, 920);
+  RULE.play(frame, 200, 218, 900, 920);
+
+  flashPlane.material.opacity = 0;   // e.g. F === 120 ? 0.3 : 0
+  flashPlane.visible = flashPlane.material.opacity > 0;
+
+  return beat;
+}
+
+// ============================================================== RENDER
+function renderAtTime(frame) {
+  const beat = beatAt(frame);
+
+  // render() honours autoClear, so leaving it on here wipes the accumulator
+  // before each additive blend -- the frame comes out at 1/N brightness.
+  renderer.autoClear = false;
+  renderer.setRenderTarget(accumTarget);
+  renderer.setClearColor(0x000000, 1);
+  renderer.clear(true, true, true);
+
+  for (let s = 0; s < SUBSAMPLES; s++) {
+    pose(frame + (s / SUBSAMPLES) * SHUTTER, SAMPLES[s]);
+    renderer.setRenderTarget(sceneTarget);
+    renderer.clear(true, true, true);
+    renderer.render(bgScene, bgCamera);     // backdrop first, no aperture offset
+    renderer.render(scene, camera);         // no clear between: composite in order
+    renderer.render(capScene, capCam);
+    accMat.uniforms.tSrc.value = sceneTarget.texture;
+    renderer.setRenderTarget(accumTarget);
+    renderer.render(accScene, accCam);
+  }
+
+  renderer.setRenderTarget(null);
+  renderer.autoClear = true;
+  // Motion blur is accumulated BEFORE the post chain: the smear happens at the
+  // shutter, the glow happens after -- and it is N times cheaper.
+  bloom.strength = BLOOM_BASE * (beat.bloom ?? 1);
+  texPass.map = accumTarget.texture;
+  composer.render();
+}
+
+const _sph = new THREE.Sphere();
+/**
+ * Does the camera fly through anything? Sampling the path and measuring the
+ * nearest surface catches "the camera passes through the subject and fills the
+ * frame with one blown-out object" in a second, instead of after a full render.
+ *
+ * Skips objects larger than `envRadius` (ground planes, sky domes -- the camera
+ * is always inside those) and anything with userData.ignoreClearance. Instanced
+ * meshes report their base geometry, not per-instance, so treat them as a hint.
+ */
+function cameraClearance(stride = 6, warn = 1.5, envRadius = 60) {
+  const hits = [];
+  for (let f = 0; f < FRAMES; f += stride) {
+    pose(f, SAMPLES[0]);
+    scene.updateMatrixWorld(true);
+    const ck = camAt(f);
+    let min = Infinity, who = '';
+    scene.traverse((o) => {
+      if (!o.isMesh || !o.visible || o.userData.ignoreClearance) return;
+      if (!o.geometry.boundingSphere) o.geometry.computeBoundingSphere();
+      _sph.copy(o.geometry.boundingSphere).applyMatrix4(o.matrixWorld);
+      if (_sph.radius > envRadius) return;
+      const d = ck.pos.distanceTo(_sph.center) - _sph.radius;
+      if (d < min) { min = d; who = o.name || o.geometry.type; }
+    });
+    if (min < warn) hits.push({ frame: f, clearance: +min.toFixed(2), object: who });
+  }
+  return hits;
+}
+
+window.__piece = {
+  frames: FRAMES, fps: FPS,
+  seek: (f) => renderAtTime(f),
+  cameraClearance,
+  /** The same frame must render identically twice, seeking away in between. */
+  async determinismCheck(f = Math.floor(FRAMES * 0.6)) {
+    const grab = () => { renderAtTime(f); return renderer.domElement.toDataURL('image/png'); };
+    const a = grab(); renderAtTime(0); const b = grab();
+    return a === b;
+  },
+};
+
+if (new URLSearchParams(location.search).has('render')) {
+  document.body.classList.add('render');
+  renderAtTime(0);
+} else {
+  const t0 = performance.now();
+  const loop = () => { renderAtTime(((performance.now() - t0) / 1000) * FPS % FRAMES);
+                       requestAnimationFrame(loop); };
+  loop();
+}
+window.__ready = true;
+</script>
+</body>
+</html>

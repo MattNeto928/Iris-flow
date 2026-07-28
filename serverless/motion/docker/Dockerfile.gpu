@@ -1,0 +1,82 @@
+# iris-motion renderer, GPU variant — same app, real hardware GL.
+#
+# Fargate has no GPU, so WebGL there runs on SwiftShader at a MEASURED 14.2
+# s/frame (ss12, 4 vCPU). A g4dn.xlarge carries a T4; the same scene on an
+# M-series GPU runs at 0.08 s/frame. This image exists to find out where a T4
+# lands between those, because the economics turn on it: GPU wins on wall-clock
+# below ~0.65 s/frame and on cost below ~2.8 s/frame.
+#
+# Runs on EC2-backed Batch, not Fargate. Build:
+#   docker buildx build --platform linux/amd64 -f docker/Dockerfile.gpu \
+#     -t <repo>:gpu --push .
+
+FROM nvidia/cuda:12.4.1-base-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+# THE flag that makes this work. nvidia-container-runtime mounts the host driver
+# into the container based on this, and the DEFAULT is "compute,utility" — which
+# gives you CUDA and nvidia-smi but NO libEGL/libGL. Chrome then finds no GL
+# driver, silently falls back to SwiftShader, and the whole point of paying for a
+# GPU instance is lost while everything still "works". `graphics` is the part
+# that mounts the GL/EGL stack; `display` brings the rest of the X/GLX bits.
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,display
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl gnupg ffmpeg tini \
+      python3 python3-pip \
+      fonts-liberation fonts-dejavu-core \
+      # libglvnd is the GL/EGL *dispatch* layer. The vendor implementation comes
+      # from the host driver at runtime; without the dispatcher Chrome cannot
+      # dlopen libEGL.so.1 at all.
+      libglvnd0 libgl1 libglx0 libegl1 libgles2 \
+      libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 \
+      libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 \
+      libpango-1.0-0 libcairo2 libx11-6 libxcb1 libxext6 libxi6 libxtst6 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL -o /tmp/chrome.deb \
+      https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get update && apt-get install -y --no-install-recommends /tmp/chrome.deb \
+    && rm -f /tmp/chrome.deb && rm -rf /var/lib/apt/lists/*
+
+ENV CHROME_PATH=/usr/bin/google-chrome
+
+# The GL flags for hardware rendering. render.mjs reads MOTION_GL_FLAGS and uses
+# it verbatim, so the backend can be re-tried from the job definition without
+# rebuilding a 2 GB image — which matters because the right incantation for
+# headless Chrome on NVIDIA is version-sensitive.
+# MEASURED on a T4, all three backends tried in one job:
+#   --use-gl=egl                -> "GL_VENDOR = Disabled", no context
+#   --use-angle=gl              -> "BindToCurrentSequence failed", no context
+#   --use-angle=vulkan          -> ANGLE (NVIDIA, Vulkan 1.4.312, Tesla T4)  <-- this
+# 0.133 s/frame at ss12 against 14.2 on Fargate SwiftShader: 107x.
+ENV MOTION_GL_FLAGS="--use-gl=angle --use-angle=vulkan --enable-gpu --ignore-gpu-blocklist"
+
+# Ubuntu 22.04's pip predates PEP 668, so --break-system-packages does not
+# exist here (it is a pip 23+ flag and only needed on bookworm/24.04).
+RUN pip3 install --no-cache-dir \
+      boto3 numpy Pillow "google-genai>=1.73" "anthropic>=0.79.0"
+
+WORKDIR /app
+COPY docker/package.json /app/package.json
+RUN npm install --omit=dev --no-audit --no-fund \
+ && npm cache clean --force \
+ && ln -s /app/node_modules /node_modules
+
+COPY app/ /app/
+RUN mkdir -p /work
+
+RUN node --check /app/render.mjs && node --check /app/serve.mjs \
+ && python3 -m compileall -q /app \
+ && ffmpeg -version > /dev/null
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python3", "/app/worker.py"]

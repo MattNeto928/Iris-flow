@@ -1,0 +1,5 @@
+**/node_modules
+**/__pycache__
+**/*.pyc
+cdk/cdk.out
+cdk/node_modules

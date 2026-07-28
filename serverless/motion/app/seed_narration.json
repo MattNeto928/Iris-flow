@@ -1,0 +1,50 @@
+{
+  "title": "AURORA",
+  "picture_locked": true,
+  "_why": "The seed piece's pose() is keyed to fixed frame numbers, so its BEATS cannot be re-timed from the audio. Narration is fitted INTO these slots instead: ids and ranges must stay byte-identical to the BEATS table in seed_aurora.html.",
+  "_word_budget": "MEASURED: Algenib reads this preamble at ~1.25 words/s raw, and atempo can recover at most 1.15x, so the ceiling is ~1.44 words/s. Slot lengths at 24 fps are hook 6.0s, sun 10.0s, magneto 9.0s, precip 8.0s, colours 18.0s, payoff 6.0s, title 3.0s -- roughly 8/14/13/11/26/8/3 words. The first draft ran 175s of speech into a 60s picture; every segment overlapped the next. Sparse narration over a dense visual is the right trade here, not a defect.",
+  "narration": [
+    {
+      "id": "hook",
+      "from": 0,
+      "to": 143,
+      "text": "Nothing up there is burning. The sky is a neon sign."
+    },
+    {
+      "id": "sun",
+      "from": 144,
+      "to": 383,
+      "text": "It starts at the sun. A wind of charged particles, four days out."
+    },
+    {
+      "id": "magneto",
+      "from": 384,
+      "to": 599,
+      "text": "Earth has a magnetic shield. It turns that wind aside, but it leaks at the poles."
+    },
+    {
+      "id": "precip",
+      "from": 600,
+      "to": 791,
+      "text": "Electrons pour down. Each stops where the air finally thickens."
+    },
+    {
+      "id": "colours",
+      "from": 792,
+      "to": 1223,
+      "text": "That is what picks the colour. Nitrogen answers instantly, in violet. Oxygen waits three quarters of a second for green. The red line waits two minutes, so it only glows where the sky is nearly empty."
+    },
+    {
+      "id": "payoff",
+      "from": 1224,
+      "to": 1367,
+      "text": "Same air. Same electrons. Different waiting times."
+    },
+    {
+      "id": "title",
+      "from": 1368,
+      "to": 1439,
+      "text": "Aurora."
+    }
+  ]
+}

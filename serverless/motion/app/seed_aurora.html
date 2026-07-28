@@ -1,0 +1,1570 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>piece</title>
+<style>
+  html,body{margin:0;padding:0;background:#000;overflow:hidden;height:100%}
+  #stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  canvas{display:block;max-width:100vw;max-height:100vh}
+  body.render #stage{align-items:flex-start;justify-content:flex-start}
+  body.render canvas{max-width:none;max-height:none}
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "/node_modules/three/build/three.module.js",
+    "three/addons/": "/node_modules/three/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="stage"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { TexturePass } from 'three/addons/postprocessing/TexturePass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+/* ============================================================================
+   TEMPLATE. Renders as-is -- check that first, so any later breakage is yours.
+   Sections marked >>> AUTHOR <<< are the ones you replace.
+
+   The contract that makes everything else work: pose(frame) is a PURE function
+   of frame. It re-derives all scene state from scratch every call. No `+=`, no
+   Math.random, no Date.now, no reading the previous frame. The renderer seeks
+   out of order for motion-blur sub-samples, so impurity desynchronises silently
+   instead of failing loudly.
+   ========================================================================== */
+
+const W = 1080, H = 1920, FPS = 24;
+const FRAMES = 1440;                                 // 60.0 s at 24 fps
+// 16 for motion blur alone; 24+ when they also serve as depth-of-field aperture
+// samples (below ~20 the bokeh bands). ?ss=N overrides, so a pipeline can trade
+// quality for render time without editing the piece.
+const SUBSAMPLES = Number(new URLSearchParams(location.search).get('ss')) || 24;
+const SHUTTER = 0.675;                               // ~243deg. 1.0 over-smears by ~50%.
+
+// Social-safe box. Stops at x 900 (not 1020) to clear TikTok's button rail, so
+// it is NOT centred -- compose on LANE_CX, not W/2.
+const SAFE = { x0: 60, x1: 900, y0: 200, y1: 1560 };
+const LANE_CX = (SAFE.x0 + SAFE.x1) / 2;             // 480
+
+// ============================================================== DATA
+// Every number this piece puts on screen comes from here. data/solve.py derives
+// it from NRLMSIS 2.1, published spectroscopic constants, the Rees (1963)
+// range-energy relation and the Shue et al. (1997) magnetopause model, and
+// validates each result against literature values before writing the file.
+// Captions interpolate these fields, so a caption cannot drift from the solve.
+const D = await (await fetch('data/aurora.json')).json();
+
+// World scale for the atmospheric staging area: 1 unit = 4 km. This is a FREE
+// parameter, chosen so the 85-420 km auroral slab composes in a 9:16 frame.
+// Every ALTITUDE that follows from it is real.
+const KMU = 0.25;
+const km = (v) => v * KMU;
+
+// The auroral sheet is field-aligned. At 68 N geomagnetic the dipole relation
+// tan(I) = 2 tan(lambda) gives a dip of 78.6 deg, i.e. 11.4 deg off vertical --
+// which is why real auroral rays converge toward the magnetic zenith instead of
+// standing straight up. Solved in data/solve.py.
+const LEAN = Math.tan((90 - D.magnetosphere.dip_deg_at_68) * Math.PI / 180);
+
+// Curtain staging. z is the horizontal standoff from the ground camera; at
+// KMU = 0.25 a base of 85 km sits 22 deg above the horizon, which is what a
+// wide-angle aurora frame actually looks like.
+const CURT_Z = -53, CURT_LEN = 300;
+
+const fx = (v, d = 1) => Number(v).toFixed(d);
+const commas = (v) => Math.round(v).toLocaleString('en-US');
+
+// ---------------------------------------------------------------- easing
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const span = (t, a, b) => clamp((t - a) / (b - a), 0, 1);
+const E = {
+  linear: t => t,
+  outQuad: t => 1 - (1 - t) ** 2,
+  inCubic: t => t ** 3,
+  outCubic: t => 1 - (1 - t) ** 3,
+  outQuart: t => 1 - (1 - t) ** 4,
+  outQuint: t => 1 - (1 - t) ** 5,
+  // inOutCubic is the safe default for travel. inOutQuint has a much higher
+  // mid-velocity and will smear a moving subject into an unreadable streak.
+  inOutCubic: t => (t < .5 ? 4 * t ** 3 : 1 - (-2 * t + 2) ** 3 / 2),
+  inOutQuint: t => (t < .5 ? 16 * t ** 5 : 1 - (-2 * t + 2) ** 5 / 2),
+  outExpo: t => (t >= 1 ? 1 : 1 - Math.pow(2, -10 * t)),
+  outBack: t => 1 + 2.2 * (t - 1) ** 3 + 1.2 * (t - 1) ** 2,
+  outSoft: t => 1 - Math.pow(1 - t, 3.4),
+};
+const ease = (f, a, b, fn = E.inOutCubic) => fn(span(f, a, b));
+
+/**
+ * Piecewise keyframed scalar, eased between stops: kf(frame, [[f,v],[f,v],...]).
+ * Pure in frame, which is the whole contract -- every animated uniform in this
+ * piece is written from one of these rather than accumulated.
+ */
+function kf(f, keys) {
+  if (f <= keys[0][0]) return keys[0][1];
+  for (let i = 0; i < keys.length - 1; i++) {
+    if (f <= keys[i + 1][0]) {
+      return lerp(keys[i][1], keys[i + 1][1],
+                  E.inOutCubic(span(f, keys[i][0], keys[i + 1][0])));
+    }
+  }
+  return keys[keys.length - 1][1];
+}
+
+/** Seeded PRNG. Call during build only -- never from pose(). */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rnd = mulberry32(0xC0FFEE);
+
+/** sRGB -> THREE.Color. THREE.Color(r,g,b) treats floats as ALREADY LINEAR. */
+const C = (hex) => new THREE.Color().setHex(hex, THREE.SRGBColorSpace);
+
+// ============================================================== BEAT TABLE
+// >>> AUTHOR <<<  One row per beat. `bloom` is a per-beat multiplier on the base
+// strength: a threshold-free bloom scales with lit AREA as well as radiance, so
+// one global value cannot serve both a sparse beat and a full-frame one.
+//
+// The values below are near 1.0 only because this template's beats are all
+// similarly lit. THEY ARE NOT A HINT AT THE USEFUL RANGE. A piece that runs
+// from a near-black opening to a full-frame daylight beat needs the multiplier
+// to span 3x or more -- a measured example went 1.05 -> 0.32 across a 4.5% to
+// 75% swing in lit fraction, and its first full-quality preflight before that
+// was a solid white disc. Read the per-beat `lit` column that check.py prints:
+// if it moves by an order of magnitude, so must this.
+// Per-beat bloom multipliers span 2.3x here: the space beats put a huge
+// glowing solar limb across the bottom of frame (high lit fraction) while the
+// ground beats are a dark sky with a bright ribbon in it (low lit fraction).
+// Tuned against the `lit` column check.py prints, not guessed.
+const BEATS = [
+  { id: 'hook',    from: 0,    to: 143,  bloom: 1.00 },
+  { id: 'sun',     from: 144,  to: 383,  bloom: 0.46 },
+  { id: 'magneto', from: 384,  to: 599,  bloom: 0.72 },
+  { id: 'precip',  from: 600,  to: 791,  bloom: 0.86 },
+  { id: 'colours', from: 792,  to: 1223, bloom: 0.78 },
+  { id: 'payoff',  from: 1224, to: 1367, bloom: 1.00 },
+  { id: 'title',   from: 1368, to: 1439, bloom: 0.88 },
+];
+const beatAt = (frame) => {
+  // Ownership from the OUTPUT frame, never the fractional sub-frame time:
+  // sub-samples run up to SHUTTER past the nominal frame, so `frame <= to`
+  // would cull a beat for most of its own final frame's samples.
+  const f = Math.floor(frame + 1e-6);
+  return BEATS.find(b => f >= b.from && f <= b.to) || BEATS[BEATS.length - 1];
+};
+
+// ============================================================== RENDERER
+const renderer = new THREE.WebGLRenderer({
+  antialias: false, preserveDrawingBuffer: true, powerPreference: 'high-performance',
+});
+renderer.setPixelRatio(1);
+renderer.setSize(W, H);
+renderer.setClearColor(0x000000, 1);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+// A lit scene wants a highlight shoulder. Use NoToneMapping instead only for
+// flat graphic/line work, where a hard clip is correct.
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.12;
+document.getElementById('stage').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+// No global fog: the two staging areas are 600 units apart and any density that
+// gives the ground shot atmospheric perspective turns the solar limb grey.
+// Depth is carried by explicit per-object colour instead.
+scene.fog = null;
+const camera = new THREE.PerspectiveCamera(32, W / H, 0.5, 6000);
+
+// Backdrop scene, drawn first with the SAME camera pose but WITHOUT the
+// aperture offset. Anything effectively at infinity -- stars, a sky dome, a
+// distant field -- belongs here.
+//
+// Why: accumulation depth of field works by re-rendering from N points across
+// the aperture. For geometry near the focal plane those copies overlap into
+// smooth blur. For a point sprite 200 units behind it, they do not: you get N
+// discrete copies, and a starfield renders as visible clumps of 24 dots rather
+// than stars. That is what the optics really imply at that aperture, but it is
+// never what you want from a backdrop, and no realistic sample count fixes it.
+const bgScene = new THREE.Scene();
+const bgCamera = new THREE.PerspectiveCamera(32, W / H, 0.5, 8000);
+
+// ============================================================== >>> AUTHOR: SCENE
+// Two staging areas, CUT between and never flown between: the atmosphere sits at
+// the origin and the Sun/Earth diagram sits SPACE_Y units above it, out of every
+// frame that is not its own.
+const SPACE_Y = 3000;
+
+const gGround = new THREE.Group(); scene.add(gGround);
+const gSpace = new THREE.Group(); gSpace.position.y = SPACE_Y; scene.add(gSpace);
+
+// An aurora is self-luminous, so almost nothing here is "lit". The one
+// directional light exists to shade the Earth globe from the Sun's actual
+// direction (-y in the space area's local frame).
+const key = new THREE.DirectionalLight(C(0xfff4e2), 9.0); key.position.set(0, -400, 150);
+const fill = new THREE.HemisphereLight(C(0x24314f), C(0x03040a), 0.35);
+scene.add(key, fill);
+
+/** Soft radial glow sprite. A flat disc reads as a coin; the falloff reads as light. */
+function glowTexture(power = 2.4) {
+  const n = 256, cv = document.createElement('canvas'); cv.width = cv.height = n;
+  const g = cv.getContext('2d');
+  const grd = g.createRadialGradient(n / 2, n / 2, 0, n / 2, n / 2, n / 2);
+  for (let i = 0; i <= 16; i++) {
+    const t = i / 16;
+    grd.addColorStop(t, `rgba(255,255,255,${Math.pow(1 - t, power).toFixed(4)})`);
+  }
+  g.fillStyle = grd; g.fillRect(0, 0, n, n);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.generateMipmaps = false;
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  renderer.initTexture(tex);
+  return tex;
+}
+const GLOW = glowTexture(2.4), GLOW_S = glowTexture(3.6);
+
+function glowSprite(size, colorHex, opacity, tex = GLOW) {
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
+    new THREE.MeshBasicMaterial({ map: tex, color: C(colorHex), transparent: true,
+      opacity, depthWrite: false, depthTest: false,
+      blending: THREE.AdditiveBlending, toneMapped: false }));
+  m.scale.setScalar(size);
+  m.userData.ignoreClearance = true;
+  return m;
+}
+
+// ---------------------------------------------------------------- STARS
+// radius 900 shell, and moved onto the camera each frame so it behaves as a sky
+// at infinity for both staging areas (which are 3000 units apart).
+// px = size*(H/2)*(1/tan(fov/2))/dist: at fov 55, dist 900 -> size*2.05, so
+// size 0.9 is a ~1.8 px star. Count is high because a 9:16 frame sees ~4% of a
+// surrounding sphere.
+const STARS = makePointField(14000, { radius: 900, size: 0.9, sizeVar: 0.75,
+                                      shell: true, opacity: 0.75 });
+bgScene.add(STARS.points);
+
+// ================================================== AURORA CURTAIN (the hero)
+// The colour at every point of this surface is read from a 128-tap ramp solved
+// in data/solve.py: emission rates for 557.7 / 630.0 / 427.8 nm versus altitude,
+// pushed through the CIE 1931 observer. The green-low / red-high / violet-deep
+// structure is the quenching calculation drawn, not art direction. What IS a
+// choice is exposure -- uInten is set well above 1 so the ACES shoulder lifts the
+// genuinely faint red top into view, exactly as a long exposure would.
+const RAMP = (() => {
+  const r = D.ramp.rgb, n = r.length;
+  const buf = new Float32Array(n * 4);
+  for (let i = 0; i < n; i++) {
+    buf[i * 4] = r[i][0]; buf[i * 4 + 1] = r[i][1];
+    buf[i * 4 + 2] = r[i][2]; buf[i * 4 + 3] = 1;
+  }
+  const t = new THREE.DataTexture(buf, n, 1, THREE.RGBAFormat, THREE.FloatType);
+  t.minFilter = t.magFilter = THREE.LinearFilter;
+  t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+  t.needsUpdate = true;
+  renderer.initTexture(t);
+  return t;
+})();
+
+const CURTAIN_VS = `
+  uniform float uT, uZ0, uZ1, uLen, uZc, uFold, uSeed, uKMU, uLean, uXoff;
+  varying vec2 vUv; varying float vAlt;
+  void main() {
+    vUv = uv;
+    float alt = mix(uZ0, uZ1, uv.y);          // real altitude, km
+    vAlt = alt;
+    float x = (uv.x - 0.5) * uLen + uXoff;
+    // Serpentine fold: three incommensurate spatial frequencies drifting at
+    // different rates, so the sheet curls and never repeats inside 60 s.
+    float a = uv.x * 6.2831853 + uSeed;
+    float zf = uFold * (sin(a * 1.10 + uT * 0.42)
+                      + sin(a * 2.30 - uT * 0.27) * 0.42
+                      + sin(a * 4.10 + uT * 0.61) * 0.17);
+    // Field-aligned lean (11.4 deg off vertical at 68 N).
+    float lean = (alt - uZ0) * uKMU * uLean;
+    gl_Position = projectionMatrix * modelViewMatrix
+                * vec4(x, alt * uKMU, uZc + zf + lean, 1.0);
+  }`;
+
+const CURTAIN_FS = `
+  uniform sampler2D uRamp;
+  uniform float uT, uZ0, uZ1, uInten, uHiLo, uHiHi, uHiAmt, uRayF, uTopFade;
+  varying vec2 vUv; varying float vAlt;
+  float h1(float p) { p = fract(p * 0.1031); p *= p + 33.33; p *= p + p; return fract(p); }
+  float n1(float x) { float i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+                      return mix(h1(i), h1(i + 1.0), f); }
+  void main() {
+    float t = clamp((vAlt - uZ0) / (uZ1 - uZ0), 0.002, 0.998);
+    vec3 col = texture2D(uRamp, vec2(t, 0.5)).rgb;
+
+    // Field-aligned rays: 1D noise in u ONLY, so every striation runs the full
+    // height of the sheet, which is what makes an aurora read as rays and not
+    // as a cloud.
+    float r = 0.0, a = 0.55, f = uRayF;
+    for (int i = 0; i < 5; i++) {
+      r += a * n1(vUv.x * f + uT * 0.018 * float(i + 1) + float(i) * 17.3);
+      a *= 0.56; f *= 2.13;
+    }
+    r = pow(clamp(r * 1.22, 0.0, 1.0), 2.3);
+    float rays = 0.14 + 1.95 * r;
+
+    float ends = smoothstep(0.0, 0.06, vUv.x) * smoothstep(1.0, 0.94, vUv.x);
+    float top = mix(1.0, smoothstep(1.0, 0.35, vUv.y), uTopFade);
+
+    // Altitude-band highlight for the colours beat: lift one slice of the real
+    // altitude axis and sink the rest.
+    float band = smoothstep(uHiLo - 12.0, uHiLo + 7.0, vAlt)
+               * smoothstep(uHiHi + 12.0, uHiHi - 7.0, vAlt);
+    float gain = mix(1.0, mix(0.13, 1.85, band), uHiAmt);
+
+    gl_FragColor = vec4(col * rays * ends * top * gain * uInten, 1.0);
+  }`;
+
+function makeCurtain(o = {}) {
+  const { len = CURT_LEN, z = CURT_Z, seed = 0, fold = 7.0, inten = 6.0,
+          rayF = 9.0, xoff = 0, segU = 340, segV = 80 } = o;
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uRamp: { value: RAMP }, uT: { value: 0 },
+      uZ0: { value: D.ramp.z0 }, uZ1: { value: D.ramp.z1 },
+      uLen: { value: len }, uZc: { value: z }, uFold: { value: fold },
+      uSeed: { value: seed }, uKMU: { value: KMU }, uLean: { value: LEAN },
+      uXoff: { value: xoff }, uInten: { value: inten }, uRayF: { value: rayF },
+      uHiLo: { value: -999 }, uHiHi: { value: 9999 }, uHiAmt: { value: 0 },
+      uTopFade: { value: 0 },
+    },
+    vertexShader: CURTAIN_VS, fragmentShader: CURTAIN_FS,
+    transparent: true, depthWrite: false, depthTest: true,
+    side: THREE.DoubleSide, blending: THREE.AdditiveBlending, toneMapped: false,
+  });
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1, segU, segV), mat);
+  m.frustumCulled = false;             // the vertex shader relocates it entirely
+  m.userData.ignoreClearance = true;
+  gGround.add(m);
+  return { mesh: m, u: mat.uniforms };
+}
+
+// Three sheets. Real displays are several near-parallel arcs at different
+// standoffs; one sheet alone reads as a poster.
+const CURT = [
+  makeCurtain({ seed: 0.0, z: CURT_Z, fold: 13.0, inten: 6.4, rayF: 11.0 }),
+  makeCurtain({ seed: 2.9, z: CURT_Z - 26, fold: 17.0, inten: 3.1, rayF: 8.0,
+                xoff: -30, segU: 240 }),
+  makeCurtain({ seed: 5.1, z: CURT_Z + 21, fold: 5.0, inten: 1.7, rayF: 13.0,
+                xoff: 44, segU: 240 }),
+];
+
+// ---------------------------------------------------------------- TERRAIN
+// Near-black ridge silhouettes. In a real wide-angle aurora frame the land is a
+// couple of degrees of the picture; these are ~2x taller than the terrain they
+// stand in for, which is the one geometric liberty in the ground shots.
+const RIDGES = [];
+{
+  const ridge = (dist, height, seed, hex) => {
+    const N = 220, half = dist * 3.0, pos = [], idx = [];
+    for (let i = 0; i <= N; i++) {
+      const t = i / N, x = (t - 0.5) * 2 * half;
+      let h = 0, amp = height, fr = 3.1;
+      for (let o = 0; o < 5; o++) {
+        h += amp * Math.sin(t * fr + seed * (o + 1) * 2.7 + o);
+        amp *= 0.55; fr *= 2.07;
+      }
+      const y = Math.max(0.06, height * 0.5 + h * 0.5);
+      pos.push(x, y, 0, x, -8, 0);
+    }
+    for (let i = 0; i < N; i++) {
+      const a = i * 2; idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setIndex(idx);
+    const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({
+      color: C(hex), side: THREE.DoubleSide, toneMapped: false }));
+    m.position.z = -dist;
+    m.userData.ignoreClearance = true;   // a wide strip, never a real obstacle
+    gGround.add(m); RIDGES.push(m);
+  };
+  // Progressively lighter with distance -- hand-authored atmospheric perspective,
+  // since global fog is off.
+  ridge(40, 1.85, 3.7, 0x0c1123);
+  ridge(24, 1.20, 8.1, 0x06080f);
+  ridge(14, 0.78, 1.3, 0x010206);
+}
+
+// ------------------------------------------------- PRECIPITATING ELECTRONS
+// Streaks falling down the field lines, terminating at the stopping altitude
+// their energy actually implies (Rees 1963 range matched to the NRLMSIS column
+// mass -- see data/solve.py). Two populations: 1 keV and 10 keV.
+const EBEAM_N = 520;
+const ESTOP_SOFT = D.stopping['1.0'], ESTOP_HARD = D.stopping['10.0'];
+const EBEAM = (() => {
+  const pos = new Float32Array(EBEAM_N * 3);   // x, z, phase
+  const stop = new Float32Array(EBEAM_N);
+  const cls = new Float32Array(EBEAM_N);
+  for (let i = 0; i < EBEAM_N; i++) {
+    const hard = rnd() < 0.55;
+    pos[i * 3] = (rnd() - 0.5) * 88;
+    pos[i * 3 + 1] = (rnd() - 0.5) * 16;
+    pos[i * 3 + 2] = rnd();
+    stop[i] = hard ? ESTOP_HARD : ESTOP_SOFT;
+    cls[i] = hard ? 1 : 0;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('aStop', new THREE.BufferAttribute(stop, 1));
+  geo.setAttribute('aCls', new THREE.BufferAttribute(cls, 1));
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uT: { value: 0 }, uKMU: { value: KMU }, uLean: { value: LEAN },
+                uZc: { value: CURT_Z }, uTop: { value: 620 }, uOp: { value: 0 },
+                uH: { value: H }, uSpeed: { value: 0.055 } },
+    vertexShader: `
+      attribute float aStop, aCls;
+      uniform float uT, uKMU, uLean, uZc, uTop, uSpeed, uH;
+      varying float vF, vC;
+      void main() {
+        float s = fract(position.z + uT * uSpeed);
+        // eased so the streaks visibly decelerate into their stopping altitude
+        float e = 1.0 - pow(1.0 - s, 2.2);
+        float alt = mix(uTop, aStop, e);
+        float lean = (alt - 85.0) * uKMU * uLean;
+        vec4 mv = modelViewMatrix
+                * vec4(position.x, alt * uKMU, uZc + lean + position.y, 1.0);
+        gl_Position = projectionMatrix * mv;
+        gl_PointSize = 0.30 * (0.5 * uH * projectionMatrix[1][1]) / max(0.001, -mv.z);
+        vF = smoothstep(0.0, 0.10, s) * (1.0 - smoothstep(0.80, 1.0, s));
+        vC = aCls;
+      }`,
+    fragmentShader: `
+      uniform float uOp; varying float vF, vC;
+      void main() {
+        float a = smoothstep(0.5, 0.05, length(gl_PointCoord - 0.5));
+        // Schematic: precipitating electrons do not themselves glow. Drawn pale
+        // blue-white so they read as distinct from the light they cause.
+        vec3 c = mix(vec3(0.62, 0.80, 1.00), vec3(0.86, 0.93, 1.00), vC);
+        gl_FragColor = vec4(c, a * vF * uOp);
+      }`,
+    transparent: true, depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+  const pts = new THREE.Points(geo, mat);
+  pts.frustumCulled = false;
+  pts.userData.ignoreClearance = true;
+  gGround.add(pts);
+  return { points: pts, u: mat.uniforms };
+})();
+
+// ------------------------------------------------------------ ALTITUDE GRID
+// Faint rules at 100/200/300/400 km, in the ground area's real altitude scale.
+const ALT_MARKS = [100, 200, 300, 400];
+const ALTGRID = (() => {
+  const v = [];
+  for (const a of ALT_MARKS) {
+    const y = km(a), lean = km(a - 85) * LEAN;
+    v.push(-18, y, CURT_Z + lean + 30, 62, y, CURT_Z + lean + 30);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(v, 3));
+  const m = new THREE.LineSegments(g, new THREE.LineBasicMaterial({
+    color: C(0x7d93c8), transparent: true, opacity: 0, depthWrite: false,
+    blending: THREE.AdditiveBlending, toneMapped: false }));
+  m.userData.ignoreClearance = true;
+  gGround.add(m);
+  return m;
+})();
+
+// ===================================================== SPACE: SUN + WIND
+// The whole space diagram runs bottom-to-top: the Sun's limb crosses the bottom
+// of the 9:16 frame and everything flows up toward Earth. Distances here are
+// NOT to scale -- 1 AU is 23,500 Earth diameters and cannot be drawn. Every
+// quantity quoted on screen for this section is a real measured value.
+const SUN_R = 100, SUN_Y = -190;
+{
+  const sun = new THREE.Mesh(new THREE.SphereGeometry(SUN_R, 96, 64),
+    new THREE.MeshBasicMaterial({ color: C(0xffdca8), toneMapped: false }));
+  sun.position.y = SUN_Y;
+  sun.name = 'sun';
+  gSpace.add(sun);
+  for (const [sc, hex, op] of [[2.15, 0xffc270, 0.62], [3.5, 0xff9438, 0.20],
+                               [5.2, 0xff741e, 0.07]]) {
+    const g = glowSprite(SUN_R * sc, hex, op, GLOW_S);
+    g.position.y = SUN_Y; gSpace.add(g);
+  }
+}
+
+// Solar wind: protons streaming outward. Deflected around the magnetopause,
+// whose shape is the Shue et al. (1997) model solved in data/solve.py.
+const R_E_U = 12;                                  // world units per Earth radius
+const EARTH_Y = 300;
+const MP_R0 = D.magnetosphere.magnetopause_RE * R_E_U;
+const MP_ALPHA = D.magnetosphere.magnetopause_alpha;
+// Shue in cylindrical form for the shader: fit a paraboloid R^2 = K (y + r0) to
+// the model's terminator radius r0 * 2^alpha, which is where the flank matters.
+const MP_K = Math.pow(MP_R0 * Math.pow(2, MP_ALPHA), 2) / MP_R0;
+
+const WIND = (() => {
+  const N = 5000, pos = new Float32Array(N * 3), spd = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    // impact parameter, sampled sqrt-uniform so the disc is uniform in area
+    pos[i * 3] = Math.sqrt(rnd()) * 78;
+    pos[i * 3 + 1] = rnd() * 6.2831853;    // azimuth
+    pos[i * 3 + 2] = rnd();                // phase
+    spd[i] = 0.82 + rnd() * 0.42;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('aSpd', new THREE.BufferAttribute(spd, 1));
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uT: { value: 0 }, uOp: { value: 0 }, uH: { value: H },
+                uY0: { value: SUN_Y + SUN_R }, uY1: { value: 300 },
+                uEarthY: { value: EARTH_Y }, uR0: { value: MP_R0 },
+                uK: { value: MP_K }, uDeflect: { value: 0 }, uSpeed: { value: 0.030 } },
+    vertexShader: `
+      attribute float aSpd;
+      uniform float uT, uH, uY0, uY1, uEarthY, uR0, uK, uDeflect, uSpeed;
+      varying float vF;
+      void main() {
+        float s = fract(position.z + uT * uSpeed * aSpd);
+        float y = mix(uY0, uY1, s);
+        float b = position.x, az = position.y;
+        // Magnetopause deflection. Sunward of the nose there is nothing to
+        // deflect around; downstream the boundary flares as sqrt(y + r0), the
+        // paraboloid fitted to Shue et al. (1997) above.
+        float dy = y - (uEarthY - uR0);
+        float Rm = sqrt(max(0.0, uK * dy));
+        float r = mix(b, max(b, Rm * 1.04), uDeflect);
+        vec4 mv = modelViewMatrix * vec4(r * cos(az), y, r * sin(az), 1.0);
+        gl_Position = projectionMatrix * mv;
+        gl_PointSize = 0.42 * (0.5 * uH * projectionMatrix[1][1]) / max(0.001, -mv.z);
+        vF = smoothstep(0.0, 0.05, s) * (1.0 - smoothstep(0.90, 1.0, s))
+           * (0.30 + 0.95 * fract(aSpd * 17.0));
+      }`,
+    fragmentShader: `
+      uniform float uOp; varying float vF;
+      void main() {
+        float a = smoothstep(0.5, 0.05, length(gl_PointCoord - 0.5));
+        gl_FragColor = vec4(vec3(1.0, 0.87, 0.68) * 6.5, a * vF * uOp);
+      }`,
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  });
+  const pts = new THREE.Points(geo, mat);
+  pts.frustumCulled = false; pts.userData.ignoreClearance = true;
+  gSpace.add(pts);
+  return { points: pts, u: mat.uniforms };
+})();
+
+// ---------------------------------------------------------------- EARTH
+const gEarth = new THREE.Group();
+gEarth.position.y = EARTH_Y;
+// Tilt so the northern auroral oval faces the camera.
+gEarth.rotation.set(-0.62, 0.35, 0.16);
+gSpace.add(gEarth);
+{
+  const cv = document.createElement('canvas'); cv.width = 1024; cv.height = 512;
+  const g = cv.getContext('2d');
+  g.fillStyle = '#16406e'; g.fillRect(0, 0, 1024, 512);
+  const r2 = mulberry32(0x5EA);
+  for (let i = 0; i < 190; i++) {          // suggestion of continents, not a map
+    const x = r2() * 1024, y = 90 + r2() * 330, w = 22 + r2() * 130, h = 14 + r2() * 70;
+    g.fillStyle = `rgba(${44 + r2() * 34 | 0},${72 + r2() * 34 | 0},${52 + r2() * 26 | 0},0.85)`;
+    g.beginPath(); g.ellipse(x, y, w, h, r2() * 3, 0, 6.3); g.fill();
+  }
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  renderer.initTexture(tex);
+  const earth = new THREE.Mesh(new THREE.SphereGeometry(R_E_U, 96, 64),
+    new THREE.MeshStandardMaterial({ map: tex, roughness: 0.94, metalness: 0.0 }));
+  earth.name = 'earth';
+  gEarth.add(earth);
+
+  // limb glow
+  const rim = new THREE.Mesh(new THREE.SphereGeometry(R_E_U * 1.10, 64, 48),
+    new THREE.ShaderMaterial({
+      uniforms: { uC: { value: new THREE.Vector3(0.30, 0.52, 1.0) }, uO: { value: 0.42 } },
+      vertexShader: `varying vec3 vN, vP;
+        void main(){ vN = normalize(normalMatrix * normal);
+          vec4 mv = modelViewMatrix * vec4(position,1.0); vP = mv.xyz;
+          gl_Position = projectionMatrix * mv; }`,
+      fragmentShader: `uniform vec3 uC; uniform float uO; varying vec3 vN, vP;
+        void main(){ float f = pow(1.0 - abs(dot(normalize(vN), normalize(-vP))), 2.1);
+          gl_FragColor = vec4(uC, f * uO); }`,
+      transparent: true, depthWrite: false, side: THREE.BackSide,
+      blending: THREE.AdditiveBlending,
+    }));
+  rim.userData.ignoreClearance = true;
+  gEarth.add(rim);
+
+  // Auroral oval: a ring at the geomagnetic latitude band the solve carries
+  // (65-70 deg). Drawn as points so it can flicker.
+  const [LA, LB] = D.magnetosphere.oval_lat_deg;
+  const ON = 2600, op = new Float32Array(ON * 3), oph = new Float32Array(ON);
+  for (let i = 0; i < ON; i++) {
+    const lat = (LA + rnd() * (LB - LA)) * Math.PI / 180;
+    const lon = rnd() * 6.2831853;
+    const rr = R_E_U * 1.018;
+    op[i * 3] = rr * Math.cos(lat) * Math.cos(lon);
+    op[i * 3 + 1] = rr * Math.sin(lat);
+    op[i * 3 + 2] = rr * Math.cos(lat) * Math.sin(lon);
+    oph[i] = rnd() * 6.2831853;
+  }
+  const og = new THREE.BufferGeometry();
+  og.setAttribute('position', new THREE.BufferAttribute(op, 3));
+  og.setAttribute('aPh', new THREE.BufferAttribute(oph, 1));
+  const om = new THREE.ShaderMaterial({
+    uniforms: { uT: { value: 0 }, uOp: { value: 0 }, uH: { value: H } },
+    vertexShader: `attribute float aPh; uniform float uT, uH; varying float vF;
+      void main(){ vec4 mv = modelViewMatrix * vec4(position,1.0);
+        gl_Position = projectionMatrix * mv;
+        gl_PointSize = 0.055 * (0.5*uH*projectionMatrix[1][1]) / max(0.001,-mv.z);
+        vF = 0.45 + 0.55 * (0.5 + 0.5*sin(aPh + uT*0.22)); }`,
+    fragmentShader: `uniform float uOp; varying float vF;
+      void main(){ float a = smoothstep(0.5,0.05,length(gl_PointCoord-0.5));
+        gl_FragColor = vec4(vec3(0.32,1.0,0.52), a*vF*uOp); }`,
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  });
+  const oval = new THREE.Points(og, om);
+  oval.userData.ignoreClearance = true;
+  gEarth.add(oval);
+  gEarth.userData.oval = om;
+}
+
+// ------------------------------------------------- MAGNETOSPHERE FIELD LINES
+// Closed dipole shells, r = L R_E cos^2(lambda). Accurate close in; the outer
+// shells of a real magnetosphere are stretched into a tail and these are not,
+// so treat the outermost lines as schematic.
+const FIELD = (() => {
+  const verts = [], arcs = [];
+  const shells = [1.9, 2.6, 3.6, 5.0];
+  for (const L of shells) {
+    for (let k = 0; k < 4; k++) {
+      const lon = (k / 4) * Math.PI * 2 + 0.4;
+      const lamMax = Math.acos(Math.sqrt(1 / L));
+      const N = 90, pts = [];
+      for (let i = 0; i <= N; i++) {
+        const lam = -lamMax + (2 * lamMax) * (i / N);
+        const r = L * R_E_U * Math.cos(lam) ** 2;
+        pts.push(new THREE.Vector3(r * Math.cos(lam) * Math.cos(lon),
+                                   r * Math.sin(lam),
+                                   r * Math.cos(lam) * Math.sin(lon)));
+      }
+      for (let i = 0; i < N; i++) {
+        verts.push(pts[i].x, pts[i].y, pts[i].z, pts[i + 1].x, pts[i + 1].y, pts[i + 1].z);
+        // arc parameter measured from the SOUTH foot, so a pulse runs pole to pole
+        arcs.push(i / N, (i + 1) / N);
+      }
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+  g.setAttribute('aS', new THREE.Float32BufferAttribute(arcs, 1));
+  const m = new THREE.ShaderMaterial({
+    uniforms: { uT: { value: 0 }, uOp: { value: 0 }, uPulse: { value: 0 } },
+    vertexShader: `attribute float aS; varying float vS;
+      void main(){ vS = aS; gl_Position = projectionMatrix * modelViewMatrix
+                                        * vec4(position,1.0); }`,
+    fragmentShader: `uniform float uT, uOp, uPulse; varying float vS;
+      void main(){
+        float base = 0.20;
+        // a bright packet running along the line toward the poles
+        float ph = fract(vS * 1.0 - uT * 0.09);
+        float pk = pow(max(0.0, 1.0 - abs(ph - 0.5) * 5.0), 3.0);
+        vec3 c = mix(vec3(0.40,0.62,1.0), vec3(0.55,1.0,0.80), pk);
+        gl_FragColor = vec4(c, (base + pk * uPulse) * uOp);
+      }`,
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  });
+  const ls = new THREE.LineSegments(g, m);
+  ls.userData.ignoreClearance = true;
+  gEarth.add(ls);
+  return m;
+})();
+
+// ------------------------------------------------------------ MAGNETOPAUSE
+// The Shue et al. (1997) surface itself: r = r0 (2/(1+cos theta))^alpha, with
+// r0 and alpha solved for Bz = -5 nT, Dp = 2 nPa in data/solve.py.
+const MPAUSE = (() => {
+  const NT = 120, NP = 64, pos = [], idx = [];
+  for (let i = 0; i <= NT; i++) {
+    const th = (i / NT) * Math.PI * 0.86;          // stop short of the open tail
+    const r = MP_R0 * Math.pow(2 / (1 + Math.cos(th)), MP_ALPHA);
+    for (let j = 0; j <= NP; j++) {
+      const ph = (j / NP) * Math.PI * 2;
+      // theta measured from the SUNWARD direction, which is -y here
+      pos.push(r * Math.sin(th) * Math.cos(ph), -r * Math.cos(th),
+               r * Math.sin(th) * Math.sin(ph));
+    }
+  }
+  for (let i = 0; i < NT; i++) {
+    for (let j = 0; j < NP; j++) {
+      const a = i * (NP + 1) + j;
+      idx.push(a, a + 1, a + NP + 1, a + 1, a + NP + 2, a + NP + 1);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx); g.computeVertexNormals();
+  const m = new THREE.ShaderMaterial({
+    uniforms: { uOp: { value: 0 } },
+    vertexShader: `varying vec3 vN, vP;
+      void main(){ vN = normalize(normalMatrix * normal);
+        vec4 mv = modelViewMatrix * vec4(position,1.0); vP = mv.xyz;
+        gl_Position = projectionMatrix * mv; }`,
+    fragmentShader: `uniform float uOp; varying vec3 vN, vP;
+      void main(){ float f = pow(1.0 - abs(dot(normalize(vN), normalize(-vP))), 3.4);
+        gl_FragColor = vec4(vec3(0.42,0.66,1.0), f * uOp); }`,
+    transparent: true, depthWrite: false, side: THREE.DoubleSide,
+    blending: THREE.AdditiveBlending,
+  });
+  const mesh = new THREE.Mesh(g, m);
+  mesh.position.y = EARTH_Y;
+  mesh.userData.ignoreClearance = true;
+  gSpace.add(mesh);
+  return m;
+})();
+
+// ============================================================== CAPTIONS
+// Drawn in an ortho overlay so they never pick up DoF, but rendered inside the
+// sub-sample loop so their own motion still gets blurred.
+const capScene = new THREE.Scene();
+const capCam = new THREE.OrthographicCamera(-W / 2, W / 2, H / 2, -H / 2, -500, 500);
+const FONT = '"Helvetica Neue", Helvetica, Arial, sans-serif';
+
+/**
+ * One quad per glyph, so characters can be staggered independently -- a single
+ * texture for the whole line cannot do that.
+ */
+function makeCaption(text, opts = {}) {
+  const { size = 78, weight = 700, tracking = 0.02, color = '#efefef',
+          y = 0, maxWidth = SAFE.x1 - SAFE.x0 } = opts;
+
+  const probe = document.createElement('canvas').getContext('2d');
+  const measure = (px) => {
+    probe.font = `${weight} ${px}px ${FONT}`;
+    probe.letterSpacing = `${(tracking * px).toFixed(2)}px`;
+    return probe.measureText(text).width;
+  };
+  // Auto-fit rather than hand-picking a size: type that overflows the safe box
+  // gets clipped by platform UI.
+  let fit = size;
+  if (measure(fit) > maxWidth) {
+    let lo = 10, hi = size;
+    while (hi - lo > 0.5) { const m = (lo + hi) / 2; if (measure(m) > maxWidth) hi = m; else lo = m; }
+    fit = Math.floor(lo);
+  }
+  probe.font = `${weight} ${fit}px ${FONT}`;
+  probe.letterSpacing = `${(tracking * fit).toFixed(2)}px`;
+  const total = probe.measureText(text).width;
+
+  const group = new THREE.Group();
+  group.position.set(LANE_CX - W / 2, y, 0);
+  capScene.add(group);
+
+  const chars = [];
+  let cursor = -total / 2;
+  const PAD = Math.ceil(fit * 0.42);
+  for (const ch of text) {
+    const adv = probe.measureText(ch).width;
+    if (ch !== ' ') {
+      const cw = Math.ceil(adv) + PAD * 2, chh = Math.ceil(fit * 1.7) + PAD;
+      const cv = document.createElement('canvas'); cv.width = cw; cv.height = chh;
+      const g = cv.getContext('2d');
+      g.font = `${weight} ${fit}px ${FONT}`;
+      g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = color;
+      g.fillText(ch, cw / 2, chh / 2);
+      const tex = new THREE.CanvasTexture(cv);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.minFilter = tex.magFilter = THREE.LinearFilter; tex.generateMipmaps = false;
+      renderer.initTexture(tex);   // else a mid-piece first appearance renders blank
+      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(cw, chh),
+        // Normal alpha, not additive: additive glyph edges compound against the
+        // glow behind them and legibility goes. Bloom supplies the halo.
+        new THREE.MeshBasicMaterial({ map: tex, transparent: true,
+          depthTest: false, depthWrite: false, toneMapped: false }));
+      mesh.position.x = cursor + adv / 2;
+      group.add(mesh);
+      chars.push({ mesh });
+    }
+    cursor += adv;
+  }
+
+  return {
+    group, chars, size: fit, width: total,
+    /** in-window [a,b], out-window [c,d]. Ensure d_in = b + n*stagger < c. */
+    play(f, a, b, c, d) {
+      const n = chars.length || 1;
+      // Cap TOTAL stagger, not per-character: at a fixed 1.15 frames/char a
+      // 28-character line takes 2.4s to land and its exit opens first.
+      const SI = Math.min(1.0, 11 / n), SO = Math.min(0.5, 6 / n);
+      let vis = false;
+      for (let i = 0; i < n; i++) {
+        const m = chars[i].mesh;
+        const pi = clamp((f - a - i * SI) / Math.max(1, b - a), 0, 1);
+        const po = clamp((f - c - i * SO) / Math.max(1, d - c), 0, 1);
+        const ei = E.outQuint(pi), eo = E.inCubic(po);
+        const o = ei * (1 - eo);
+        m.material.opacity = o;
+        m.position.y = (1 - ei) * 46 - eo * 30;
+        m.scale.setScalar((0.82 + 0.18 * ei) * (1 - 0.10 * eo));
+        m.rotation.x = (1 - ei) * -0.95 + eo * 0.5;
+        m.visible = o > 0.003;
+        if (m.visible) vis = true;
+      }
+      group.visible = vis;
+    },
+  };
+}
+
+/** Rule that wipes open under a caption. */
+function makeRule(y, w = 320, color = 0xffb347) {
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 3),
+    new THREE.MeshBasicMaterial({ color: C(color), transparent: true, opacity: 0,
+      depthTest: false, toneMapped: false }));
+  mesh.position.set(LANE_CX - W / 2, y, 0);
+  capScene.add(mesh);
+  return { mesh, play(f, a, b, c, d) {
+    const o = span(f, a, b) > 0 ? 1 - E.inCubic(clamp((f - c) / Math.max(1, d - c), 0, 1)) : 0;
+    mesh.scale.x = w * E.outExpo(span(f, a, b));
+    mesh.material.opacity = o * 0.9;
+    mesh.visible = o > 0.004 && mesh.scale.x > 1;
+  } };
+}
+
+
+
+/**
+ * A field of points -- stars, dust, plasma, photons, particles. Every piece
+ * built with this skill has needed one, and hand-rolling it hits two traps.
+ *
+ * 1. three.js PointsMaterial computes gl_PointSize as `size * (scale / -z)`
+ *    with scale fixed at H/2, which IGNORES the field of view. Animate the fov
+ *    and every point silently keeps the size it had at the old fov. The shader
+ *    below multiplies by projectionMatrix[1][1] (= 1/tan(fov/2)) instead, so
+ *    `size` is a true world-space diameter at any fov.
+ * 2. Density intuition is wrong in 9:16. A 32 deg vertical fov on a portrait
+ *    frame sees roughly 2% of a surrounding sphere, so a "few thousand stars"
+ *    scattered on a shell shows about forty. Budget accordingly, or distribute
+ *    into the visible cone rather than over a full sphere.
+ *
+ * SIZE IS IN WORLD UNITS, and the on-screen result is easy to be wrong about by
+ * an order of magnitude in either direction. Compute it, do not guess:
+ *
+ *     px = size * (H/2) * (1/tan(fov/2)) / dist
+ *
+ * At H=1920 and fov=32 deg that is `size * 3348 / dist`. So on a radius-900
+ * star shell, size 4.2 gives 15 px snowballs and size 0.55 gives 2 px -- and
+ * with the default sizeVar the small tail of that distribution goes sub-pixel
+ * and disappears entirely. Aim for 1.5-3 px and check a full-res crop, not a
+ * contact sheet: a downscaled sheet cannot tell you a point field vanished.
+ *
+ * @param opts.size   world-space diameter; see the px formula above
+ * @param opts.shell  scatter on a spherical shell (stars) vs a solid ball (dust)
+ */
+function makePointField(n, opts = {}) {
+  const {
+    radius = 60, inner = 0, size = 0.5, sizeVar = 0.6,
+    color = 0xffffff, opacity = 0.9, shell = false, rng = rnd,
+  } = opts;
+
+  const pos = new Float32Array(n * 3);
+  const sz = new Float32Array(n);
+  const seed = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    // cube-root radial sampling keeps a solid ball uniform in volume; without
+    // it everything piles up at the centre
+    const u = rng(), v = rng(), w = rng();
+    const r = shell ? radius : inner + (radius - inner) * Math.cbrt(w);
+    const th = Math.acos(2 * u - 1), ph = v * Math.PI * 2;
+    pos[i * 3] = r * Math.sin(th) * Math.cos(ph);
+    pos[i * 3 + 1] = r * Math.sin(th) * Math.sin(ph);
+    pos[i * 3 + 2] = r * Math.cos(th);
+    sz[i] = size * (1 - sizeVar + rng() * sizeVar * 2);
+    seed[i] = rng() * 6.283;
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('aSize', new THREE.BufferAttribute(sz, 1));
+  geo.setAttribute('aSeed', new THREE.BufferAttribute(seed, 1));
+
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uH: { value: H }, uOpacity: { value: opacity },
+      uColor: { value: C(color) }, uTwinkle: { value: 0 }, uPhase: { value: 0 },
+    },
+    vertexShader: `
+      attribute float aSize; attribute float aSeed;
+      uniform float uH; varying float vFade;
+      void main() {
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        gl_Position = projectionMatrix * mv;
+        // projectionMatrix[1][1] == 1/tan(fov/2): fov-correct, unlike PointsMaterial
+        gl_PointSize = aSize * (0.5 * uH * projectionMatrix[1][1]) / max(0.001, -mv.z);
+        vFade = aSeed;
+      }`,
+    fragmentShader: `
+      uniform vec3 uColor; uniform float uOpacity, uTwinkle, uPhase;
+      varying float vFade;
+      void main() {
+        vec2 d = gl_PointCoord - 0.5;
+        float a = smoothstep(0.5, 0.06, length(d));       // soft round sprite
+        float tw = 1.0 - uTwinkle * 0.5 * (1.0 + sin(vFade + uPhase));
+        gl_FragColor = vec4(uColor, a * uOpacity * tw);
+      }`,
+    transparent: true, depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+
+  const points = new THREE.Points(geo, mat);
+  points.userData.ignoreClearance = true;   // ambient, never an obstacle
+  return {
+    points, material: mat,
+    set(o = 1, twinkle = 0, phase = 0) {
+      mat.uniforms.uOpacity.value = o;
+      mat.uniforms.uTwinkle.value = twinkle;
+      mat.uniforms.uPhase.value = phase;
+      points.visible = o > 0.004;
+    },
+  };
+}
+
+/**
+ * Scrim: a soft dark gradient behind a caption band. On any scene that is
+ * bright behind the type -- a lit sky, a white flash, a pale subject -- this is
+ * the single biggest legibility fix available, and it costs one quad.
+ */
+function makeScrim(cy, h, color = '#000000') {
+  const n = 256, cv = document.createElement('canvas');
+  cv.width = 4; cv.height = n;
+  const g = cv.getContext('2d');
+  const grd = g.createLinearGradient(0, 0, 0, n);
+  grd.addColorStop(0.00, 'rgba(0,0,0,0)');
+  grd.addColorStop(0.28, 'rgba(0,0,0,0.72)');
+  grd.addColorStop(0.72, 'rgba(0,0,0,0.72)');
+  grd.addColorStop(1.00, 'rgba(0,0,0,0)');
+  g.fillStyle = grd; g.fillRect(0, 0, 4, n);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.generateMipmaps = false;
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(W * 1.1, h),
+    new THREE.MeshBasicMaterial({ map: tex, color: C(parseInt(color.slice(1), 16)),
+      transparent: true, opacity: 0, depthTest: false, depthWrite: false, toneMapped: false }));
+  mesh.position.set(0, cy, -1);      // behind the glyphs in the overlay
+  mesh.renderOrder = -1;
+  capScene.add(mesh);
+  return { mesh, set(v) { mesh.material.opacity = clamp(v, 0, 1); mesh.visible = v > 0.004; } };
+}
+
+/**
+ * A 2D panel drawn with the canvas API and composited in screen space -- graphs,
+ * bars, swatches, axes, legends. Explainers need these constantly and they are
+ * miserable to build out of 3D geometry.
+ *
+ * draw(ctx, w, h) is called once at build. Pass `live: true` and call redraw()
+ * from pose() if the panel animates, but prefer static: redrawing uploads a new
+ * texture every sub-sample, which is 24x per output frame.
+ */
+function makePanel(w, h, draw, opts = {}) {
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const ctx = cv.getContext('2d');
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.generateMipmaps = false;
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  const render = () => { ctx.clearRect(0, 0, w, h); draw(ctx, w, h); tex.needsUpdate = true; };
+  render();
+  renderer.initTexture(tex);
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0,
+      depthTest: false, depthWrite: false, toneMapped: false }));
+  // Default x centres the panel on the SAFE LANE (x 480), not the frame centre
+  // (x 540) -- the safe box stops at 900 to clear TikTok's button rail. Pass
+  // opts.x only when you deliberately want it off-lane.
+  mesh.position.set(opts.x ?? (LANE_CX - W / 2), opts.y ?? 0, 0);
+  capScene.add(mesh);
+  return {
+    mesh, ctx, redraw: render,
+    set(v, dy = 0) {
+      mesh.material.opacity = clamp(v, 0, 1);
+      mesh.position.y = (opts.y ?? 0) + dy;
+      mesh.visible = v > 0.004;
+    },
+  };
+}
+
+/**
+ * A label pinned to a point in the 3D scene but drawn in the overlay, so it
+ * stays crisp instead of being softened by depth of field. Call set() from
+ * pose() AFTER the camera is positioned.
+ */
+function makeAnchoredLabel(text, opts = {}) {
+  const { size = 34, weight = 600, color = '#efefef', tracking = 0.06 } = opts;
+  const cv = document.createElement('canvas');
+  const g = cv.getContext('2d');
+  const font = `${weight} ${size}px ${FONT}`;
+  g.font = font; g.letterSpacing = `${(tracking * size).toFixed(2)}px`;
+  const wpx = Math.ceil(g.measureText(text).width) + 24, hpx = Math.ceil(size * 1.6);
+  cv.width = wpx; cv.height = hpx;
+  g.font = font; g.letterSpacing = `${(tracking * size).toFixed(2)}px`;
+  g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = color;
+  g.fillText(text, wpx / 2, hpx / 2);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.generateMipmaps = false;
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  renderer.initTexture(tex);
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(wpx, hpx),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0,
+      depthTest: false, depthWrite: false, toneMapped: false }));
+  capScene.add(mesh);
+  const _v = new THREE.Vector3();
+  return {
+    mesh,
+    /** @param world THREE.Vector3 anchor  @param off screen-pixel offset */
+    set(world, opacity, off = { x: 0, y: 0 }) {
+      _v.copy(world).project(camera);
+      mesh.position.set(_v.x * W / 2 + off.x, _v.y * H / 2 + off.y, 0);
+      // z > 1 means the anchor is behind the camera; NDC wraps and the label
+      // would appear mirrored on the opposite side of frame.
+      const behind = _v.z > 1;
+      mesh.material.opacity = behind ? 0 : clamp(opacity, 0, 1);
+      mesh.visible = !behind && opacity > 0.004;
+    },
+  };
+}
+
+// ============================================================== >>> AUTHOR
+/** linear sRGB triplet -> '#rrggbb', through the real sRGB transfer function. */
+function srgbHex(lin) {
+  const enc = (c) => {
+    c = clamp(c, 0, 1);
+    const v = c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+    return Math.round(v * 255).toString(16).padStart(2, '0');
+  };
+  return '#' + lin.map(enc).join('');
+}
+
+function roundRect(g, x, y, w, h, r) {
+  g.beginPath();
+  g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r); g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r); g.closePath();
+}
+
+/**
+ * One transition card. Wavelength, spectroscopic notation, radiative lifetime,
+ * and the altitude consequence -- all read from data/aurora.json, and the
+ * swatch is the line's true CIE 1931 colour, so the card cannot disagree with
+ * the curtain beside it.
+ */
+function lineCard(k, consequence) {
+  const L = D.lines[k], Q = D.quench[k];
+  const col = srgbHex(D.swatch[k]);
+  const tau = k === 'blue' ? `${fx(L.tau_ns, 0)} ns`
+            : Q.tau_s < 10 ? `${fx(Q.tau_s, 2)} s`
+            : `${fx(Q.tau_s, 0)} s`;
+  const CW = 820, CH = 318;
+  return makePanel(CW, CH, (g, w, h) => {
+    g.fillStyle = 'rgba(5,8,16,0.82)'; roundRect(g, 0, 0, w, h, 18); g.fill();
+    g.strokeStyle = 'rgba(150,170,205,0.20)'; g.lineWidth = 2;
+    roundRect(g, 1, 1, w - 2, h - 2, 18); g.stroke();
+    g.fillStyle = col; roundRect(g, 0, 14, 10, h - 28, 5); g.fill();
+
+    const X = 48;
+    g.textAlign = 'left'; g.textBaseline = 'alphabetic';
+    g.fillStyle = '#eef2f8';
+    g.font = `700 82px ${FONT}`;
+    g.fillText(`${fx(L.lam_nm, 1)} nm`, X, 92);
+
+    g.fillStyle = '#aebbd2';
+    g.font = `500 40px ${FONT}`;
+    g.fillText(L.short, X, 152);
+
+    g.fillStyle = col;
+    g.font = `700 52px ${FONT}`;
+    g.fillText(`τ = ${tau}`, X, 224);
+
+    g.strokeStyle = 'rgba(150,170,205,0.22)'; g.lineWidth = 2;
+    g.beginPath(); g.moveTo(X, 248); g.lineTo(w - 48, 248); g.stroke();
+
+    g.fillStyle = '#93a3bd';
+    g.font = `500 34px ${FONT}`;
+    g.fillText(consequence, X, 292);
+  }, { y: -462 });
+}
+
+// Short spectroscopic labels. Unicode sub/superscripts, so they render in the
+// same canvas pass as the rest of the card.
+D.lines.blue.short = 'N₂⁺  B → X  (0,1)';
+D.lines.green.short = 'O(¹S) → O(¹D)';
+D.lines.red.short = 'O(¹D) → O(³P)';
+
+const CARD = {
+  blue: lineCard('blue', 'prompt — marks exactly where the electrons stop'),
+  green: lineCard('green', `survives the collisions above ${fx(D.quench.green.z_km, 0)} km`),
+  red: lineCard('red', `needs ${fx(D.quench.red.z_km, 0)} km of quiet to finish`),
+};
+
+// ---------------------------------------------------------------- captions
+const HY = 560, SY = 440;                 // headline / sub-line bands
+const CAP = {
+  h1: makeCaption('NOTHING UP THERE IS BURNING', { y: HY, size: 78 }),
+  h2: makeCaption('the sky is a neon sign', { y: SY, size: 48, weight: 500,
+                                              color: '#8fe6b4', tracking: 0.05 }),
+
+  s1: makeCaption('IT STARTS AT THE SUN', { y: HY, size: 78 }),
+  s2: makeCaption(`solar wind — ${D.solar_wind.v_typ_kms} km/s`,
+                  { y: SY, size: 46, weight: 500, color: '#ffc17a', tracking: 0.05 }),
+  s3: makeCaption(`${fx(D.solar_wind.au_km / 1e6, 0)} MILLION KM`, { y: HY, size: 78 }),
+  s4: makeCaption(`about ${fx(D.solar_wind.transit_400_days, 1)} days in transit`,
+                  { y: SY, size: 46, weight: 500, color: '#ffc17a', tracking: 0.05 }),
+
+  m1: makeCaption('EARTH HAS A SHIELD', { y: HY, size: 78 }),
+  m2: makeCaption(`magnetopause — ${fx(D.magnetosphere.magnetopause_RE, 1)} Earth radii`,
+                  { y: SY, size: 42, weight: 500, color: '#8fb6ff', tracking: 0.05 }),
+  m3: makeCaption('IT LEAKS AT THE POLES', { y: HY, size: 78 }),
+
+  p1: makeCaption('ELECTRONS RAIN DOWN', { y: HY, size: 78 }),
+  p2: makeCaption('1–10 keV, following the field', { y: SY, size: 44, weight: 500,
+                                                     color: '#a9c8ff', tracking: 0.05 }),
+  p3: makeCaption(`10 keV reaches ${fx(D.stopping['10.0'], 0)} km`, { y: HY, size: 66 }),
+  p4: makeCaption(`1 keV stops at ${fx(D.stopping['1.0'], 0)} km`,
+                  { y: SY, size: 48, weight: 500, color: '#a9c8ff', tracking: 0.05 }),
+
+  c0: makeCaption('A LIFETIME PICKS AN ALTITUDE', { y: HY, size: 74 }),
+  c1: makeCaption('and an altitude picks a colour', { y: SY, size: 46, weight: 500,
+                                                      color: '#8fe6b4', tracking: 0.05 }),
+
+  y1: makeCaption('SAME AIR. SAME ELECTRONS.', { y: HY, size: 74 }),
+  y2: makeCaption('different waiting times', { y: SY, size: 48, weight: 500,
+                                               color: '#8fe6b4', tracking: 0.05 }),
+
+  t: makeCaption('AURORA', { y: HY, size: 168, tracking: 0.10 }),
+  t2: makeCaption('557.7  ·  630.0  ·  427.8 nm', { y: SY - 30, size: 42,
+                  weight: 500, color: '#9fd8ff', tracking: 0.14 }),
+};
+const RULE = makeRule(SY - 148, 320, 0x6fe0a8);
+const SCRIM = makeScrim(500, 520);        // behind the headline band
+const SCRIM2 = makeScrim(-462, 430);      // behind the transition cards
+
+// Altitude axis for the precip and colours beats. Anchored to real world points
+// on the altitude scale, but drawn in the overlay so depth of field cannot
+// soften them.
+const ALT_LABELS = ALT_MARKS.map((a) => ({
+  km: a, lab: makeAnchoredLabel(`${a} km`, { size: 34, color: '#a8bcdc', tracking: 0.08 }),
+  at: new THREE.Vector3(-26, km(a), CURT_Z + km(a - 85) * LEAN + 30),
+}));
+
+// Full-frame flash. Kept to a few frames -- a flat wash reads as a cheap cut.
+const flashPlane = new THREE.Mesh(new THREE.PlaneGeometry(4, 4),
+  new THREE.MeshBasicMaterial({ color: C(0xd8ecff), transparent: true, opacity: 0,
+    depthTest: false, toneMapped: false }));
+flashPlane.renderOrder = 999; flashPlane.scale.set(W, H, 1);
+capScene.add(flashPlane);
+
+// ============================================================== POST CHAIN
+const rtOpts = { type: THREE.HalfFloatType, colorSpace: THREE.LinearSRGBColorSpace };
+const sceneTarget = new THREE.WebGLRenderTarget(W, H, { ...rtOpts, samples: 4, depthBuffer: true });
+const accumTarget = new THREE.WebGLRenderTarget(W, H, { ...rtOpts, depthBuffer: false });
+
+const accScene = new THREE.Scene();
+const accCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const accMat = new THREE.ShaderMaterial({
+  uniforms: { tSrc: { value: null }, uW: { value: 1 / SUBSAMPLES } },
+  vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.,1.); }`,
+  // 1/N applied in-shader, not via material opacity: transparent objects in the
+  // scene make opacity-as-weight unreliable.
+  fragmentShader: `uniform sampler2D tSrc; uniform float uW; varying vec2 vUv;
+    void main(){ gl_FragColor = vec4(texture2D(tSrc,vUv).rgb*uW, 1.0); }`,
+  depthTest: false, depthWrite: false,
+  blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor,
+});
+accScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), accMat));
+
+const LookShader = {
+  uniforms: { tDiffuse: { value: null }, uRes: { value: new THREE.Vector2(W, H) },
+              uVig: { value: 0.62 }, uGrain: { value: 0.55 } },
+  vertexShader: `varying vec2 vUv;
+    void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
+  fragmentShader: `
+    uniform sampler2D tDiffuse; uniform vec2 uRes; uniform float uVig, uGrain;
+    varying vec2 vUv;
+    // These constants are in sRGB CODE UNITS but this pass runs before
+    // OutputPass, i.e. in linear space. Adding them raw is a ~13x error near
+    // black. 12.92 is the sRGB linear-segment slope, valid down here.
+    float srgb2lin(float c){ return (c/255.0)/12.92; }
+    float hash(vec2 p){ p=fract(p*vec2(233.34,851.73)); p+=dot(p,p+23.45); return fract(p.x*p.y); }
+    float vnoise(vec2 p){
+      vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+      return mix(mix(hash(i),hash(i+vec2(1,0)),f.x), mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),f.x), f.y);
+    }
+    void main(){
+      vec2 c = vUv-0.5;
+      // Radial chromatic aberration: per-channel scale about frame centre,
+      // separation growing linearly with radius (2.79 px R-B at the corner).
+      vec3 col;
+      col.r = texture2D(tDiffuse, 0.5 + c*1.001369).r;
+      col.g = texture2D(tDiffuse, vUv).g;
+      col.b = texture2D(tDiffuse, 0.5 + c*0.998589).b;
+
+      float r = length(c*vec2(1.0, 0.62));
+      col *= clamp(1.0 - uVig*(r*r*2.15 - 0.06), 0.0, 1.0);
+
+      col += vec3(srgb2lin(3.2), srgb2lin(2.6), srgb2lin(4.4));   // black is not 0
+
+      // Static grain (46.55 px). Static reads as film; animated reads as noise.
+      float n = vnoise(vUv*uRes/46.55) - 0.5;
+      col += vec3(srgb2lin(0.189), srgb2lin(0.24), srgb2lin(0.290))*n*2.0*uGrain*24.0;
+
+      gl_FragColor = vec4(max(col,0.0), 1.0);
+    }`,
+};
+
+const composer = new EffectComposer(renderer);
+composer.setSize(W, H);
+const texPass = new TexturePass(accumTarget.texture);
+composer.addPass(texPass);
+// Threshold is HIGH on purpose. Near zero, every dim pixel enters the mip chain
+// and the frame hazes to milky grey -- the single biggest lever on whether the
+// render looks professional. Threshold and strength are TUNED, not measured.
+const BLOOM_BASE = 0.42;
+const bloom = new UnrealBloomPass(new THREE.Vector2(W, H), BLOOM_BASE, 0.32, 0.70);
+{ // far glow reads violet: blue carries the widest lobes, green only ~73% of blue
+  const tints = [[1,.98,1],[.97,.90,1],[.92,.82,1],[.88,.76,1],[.86,.74,1]]
+    .map(([r, g, b]) => new THREE.Vector3(r, g, b));
+  if (bloom.bloomTintColors) bloom.bloomTintColors = tints;
+  if (bloom.compositeMaterial?.uniforms?.bloomTintColors)
+    bloom.compositeMaterial.uniforms.bloomTintColors.value = tints;
+}
+composer.addPass(bloom);
+composer.addPass(new ShaderPass(LookShader));
+composer.addPass(new OutputPass());
+
+// Halton (2,3) mapped to a disc: aperture offset (depth of field) AND sub-pixel
+// offset (AA), from one fixed table. Not a PRNG -- the render must reproduce.
+const halton = (i, b) => { let f = 1, r = 0, n = i + 1;
+  while (n > 0) { f /= b; r += f * (n % b); n = Math.floor(n / b); } return r; };
+const SAMPLES = Array.from({ length: SUBSAMPLES }, (_, i) => {
+  const u = halton(i, 2), v = halton(i, 3), rr = Math.sqrt(u), th = v * Math.PI * 2;
+  return { dx: Math.cos(th) * rr, dy: Math.sin(th) * rr,
+           jx: halton(i, 5) - .5, jy: halton(i, 7) - .5 };
+});
+
+// ============================================================== CAMERA
+/**
+ * >>> AUTHOR <<<  [frame, x,y,z, tx,ty,tz, aperture, fov, follow]
+ *
+ * follow=1 makes position and target OFFSETS from the subject instead of world
+ * coordinates. This matters beyond convenience: the focal plane sits on the
+ * TARGET, so a target that drifts off the subject renders it soft. Each key is
+ * resolved at the current frame and only then interpolated, so follow and
+ * locked-off keys blend cleanly.
+ *
+ * Portrait is narrow: half-width is d*tan(fov/2)*(9/16) -- about 1.18 units at
+ * d=7, fov=32. Keep offsets generous or a fast subject exits the side.
+ */
+//   [frame, x,y,z,  tx,ty,tz,  aperture, fov, cut]
+//
+// cut=1 means SNAP to this key rather than interpolate into it. The two staging
+// areas are 3000 units apart; interpolating between them would be a several-
+// thousand-unit flythrough. Because sub-samples run from F to F+SHUTTER, a cut
+// at F is clean: every sample of frame F-1 is before it and every sample of
+// frame F is at or after it.
+//
+// Portrait is narrow: half-width is d*tan(fov/2)*(9/16). The ground shots use a
+// 55 deg vertical fov because a real wide-angle aurora frame is mostly sky, with
+// the land occupying only the bottom few degrees.
+const CAMKEYS = [
+  // --- hook: ground, slow push and rise
+  [0,     0, 0.10, 12,    0, 30, CURT_Z,   0.34, 55, 0],
+  [143,   0, 0.34, 5,     0, 33, CURT_Z,   0.34, 55, 0],
+
+  // --- sun: CUT into the space area, then ride the wind outward
+  [144,   0, SPACE_Y - 62,  150,   0, SPACE_Y - 52,  0,   0.9, 44, 1],
+  [383,   0, SPACE_Y + 112, 158,   0, SPACE_Y + 96,  0,   0.9, 42, 0],
+
+  // --- magneto: CUT to the Earth, then push in on the oval
+  [384,   0, SPACE_Y + 258, 300,   0, SPACE_Y + 268, 0,   0.7, 34, 1],
+  [599,   0, SPACE_Y + 296,  92,   0, SPACE_Y + 300, 0,   0.5, 30, 0],
+
+  // --- precip: CUT back to the atmosphere, wide on the altitude scale
+  [600,   0, 62, 205,   0, 54, CURT_Z,   0.30, 36, 1],
+  [791,   0, 54, 182,   0, 48, CURT_Z,   0.30, 33, 0],
+
+  // --- colours: hold the altitude scale, drift laterally so the sheet turns
+  [1223, 24, 44, 148,  14, 41, CURT_Z,   0.40, 30, 0],
+
+  // --- payoff: CUT to the ground and push in under the curtain. z stops at +1
+  // so the camera never reaches the nearest ridge at z = -14.
+  [1224,  0, 0.22, 14,   0, 30, CURT_Z,   0.55, 55, 1],
+  [1367,  0, 0.60, 4,    0, 36, CURT_Z,   0.55, 58, 0],
+  [1439,  0, 0.84, 1,    0, 40, CURT_Z,   0.55, 60, 0],
+];
+const _kp = new THREE.Vector3(), _kt = new THREE.Vector3();
+const _pA = new THREE.Vector3(), _tA = new THREE.Vector3();
+function resolveKey(K, outP, outT) {
+  outP.set(K[1], K[2], K[3]);
+  outT.set(K[4], K[5], K[6]);
+}
+function camAt(frame) {
+  let i = 0;
+  while (i < CAMKEYS.length - 2 && frame > CAMKEYS[i + 1][0]) i++;
+  const A = CAMKEYS[i], B = CAMKEYS[i + 1];
+  const t = B[9] ? (frame >= B[0] ? 1 : 0) : E.inOutCubic(span(frame, A[0], B[0]));
+  resolveKey(A, _pA, _tA);
+  resolveKey(B, _kp, _kt);
+  return { pos: _pA.clone().lerp(_kp, t), tgt: _tA.clone().lerp(_kt, t),
+           ap: lerp(A[7], B[7], t), fov: lerp(A[8], B[8], t) };
+}
+
+// ============================================================== POSE
+const UP = new THREE.Vector3(0, 1, 0), ZERO = new THREE.Vector3();
+const _cF = new THREE.Vector3(), _cR = new THREE.Vector3(), _cU = new THREE.Vector3();
+const _dummy = new THREE.Object3D();
+
+function pose(frame, sample) {
+  const F = Math.floor(frame + 1e-6);
+  const beat = beatAt(frame);
+  const B = beat.id;
+
+  // ---- camera + accumulation depth of field. Offsetting the eye across the
+  // aperture and re-aiming at the same target keeps that plane sharp and blurs
+  // everything off it.
+  const ck = camAt(frame);
+  camera.fov = ck.fov;
+  _cF.subVectors(ck.tgt, ck.pos).normalize();
+  _cR.crossVectors(_cF, UP).normalize();
+  _cU.crossVectors(_cR, _cF).normalize();
+  camera.position.copy(ck.pos)
+    .addScaledVector(_cR, sample.dx * ck.ap)
+    .addScaledVector(_cU, sample.dy * ck.ap);
+  camera.lookAt(ck.tgt);
+  camera.setViewOffset(W, H, sample.jx, sample.jy, W, H);
+  camera.updateProjectionMatrix();
+
+  bgCamera.fov = ck.fov;
+  bgCamera.position.copy(ck.pos);
+  bgCamera.lookAt(ck.tgt);
+  bgCamera.setViewOffset(W, H, sample.jx, sample.jy, W, H);
+  bgCamera.updateProjectionMatrix();
+
+  // ---- staging areas. Hard toggles: they are 3000 units apart and no shot
+  // ever contains both.
+  const inSpace = (B === 'sun' || B === 'magneto');
+  gSpace.visible = inSpace;
+  gGround.visible = !inSpace;
+  // The ridges belong to the ground shots only; from the far atmosphere camera
+  // they render as a black slab across the bottom of frame.
+  const onGround = (B === 'hook' || B === 'payoff' || B === 'title');
+  for (const r of RIDGES) r.visible = onGround;
+
+  // The star shell rides the camera, so it behaves as a sky at infinity for
+  // both areas. It lives in bgScene, so depth of field cannot shred it.
+  STARS.points.position.copy(ck.pos);
+  STARS.set(kf(frame, [[0, 0.62], [143, 0.62], [180, 0.16], [383, 0.30],
+                       [430, 0.55], [599, 0.55], [600, 0.62], [1439, 0.70]]),
+            0.40, frame * 0.05);
+
+  // ---------------------------------------------------------------- curtain
+  // Exposure, not physics: uInten sits well above 1 so the ACES shoulder lifts
+  // the genuinely faint 630.0 nm top into view. Hue is untouched.
+  const cInt = kf(frame, [[0, 1.35], [143, 1.70], [600, 1.15], [791, 1.35],
+                          [860, 1.75], [1223, 1.95], [1290, 2.00], [1439, 2.25]]);
+  // The highlighted altitude band slides UPWARD as the cards go blue -> green
+  // -> red, because that is the argument: longer lifetime, higher floor.
+  const bLo = kf(frame, [[892, 85], [975, 85], [1012, 100], [1085, 100],
+                         [1132, 240], [1223, 240]]);
+  const bHi = kf(frame, [[892, 122], [975, 122], [1012, 168], [1085, 168],
+                         [1132, 420], [1223, 420]]);
+  const bAmt = kf(frame, [[872, 0], [900, 0.92], [1206, 0.92], [1232, 0]]);
+  for (let i = 0; i < CURT.length; i++) {
+    const u = CURT[i].u;
+    u.uT.value = frame;
+    u.uInten.value = cInt * (i === 0 ? 1 : i === 1 ? 0.48 : 0.27);
+    u.uHiLo.value = bLo; u.uHiHi.value = bHi; u.uHiAmt.value = bAmt;
+  }
+
+  // ---------------------------------------------- precipitating electrons
+  EBEAM.u.uT.value = frame;
+  EBEAM.u.uOp.value = kf(frame, [[600, 0], [636, 0.95], [791, 0.95],
+                                 [860, 0.28], [1223, 0.20], [1240, 0]]);
+  ALTGRID.material.opacity = kf(frame, [[604, 0], [650, 0.13], [1200, 0.13],
+                                        [1228, 0]]);
+  ALTGRID.visible = ALTGRID.material.opacity > 0.004;
+
+  // ---------------------------------------------------------------- space
+  WIND.u.uT.value = frame;
+  // Keep the live stretch of the stream wherever the camera actually is, so the
+  // beat is never a black frame with a few specks in it.
+  WIND.u.uY0.value = kf(frame, [[144, -90], [380, -90], [390, 130], [599, 130]]);
+  WIND.u.uY1.value = kf(frame, [[144, 300], [380, 300], [390, 540], [599, 540]]);
+  WIND.u.uOp.value = kf(frame, [[144, 0.30], [190, 0.90], [560, 0.90], [599, 0.55]]);
+  // The wind only meets a boundary once there is an Earth in front of it.
+  WIND.u.uDeflect.value = kf(frame, [[384, 0], [424, 0], [478, 1]]);
+  MPAUSE.uniforms.uOp.value = kf(frame, [[384, 0], [438, 0.45], [520, 0.28], [599, 0.08]]);
+  FIELD.uniforms.uT.value = frame;
+  FIELD.uniforms.uOp.value = kf(frame, [[392, 0], [446, 0.85]]);
+  FIELD.uniforms.uPulse.value = kf(frame, [[452, 0], [512, 1.7]]);
+  gEarth.userData.oval.uniforms.uT.value = frame;
+  gEarth.userData.oval.uniforms.uOp.value = kf(frame, [[474, 0], [536, 2.6]]);
+
+  // ---------------------------------------------------------------- captions
+  // play(frame, inStart, inEnd, outStart, outEnd). Every line below satisfies
+  // in_end + n*stagger < out_start; the stagger cap is min(1.0, 11/n).
+  CAP.h1.play(frame, 10, 34, 104, 122);
+  CAP.h2.play(frame, 44, 66, 104, 122);
+
+  CAP.s1.play(frame, 162, 186, 262, 280);
+  CAP.s2.play(frame, 192, 214, 262, 280);
+  CAP.s3.play(frame, 292, 316, 360, 378);
+  CAP.s4.play(frame, 320, 342, 360, 378);
+
+  CAP.m1.play(frame, 400, 424, 486, 504);
+  CAP.m2.play(frame, 430, 452, 486, 504);
+  CAP.m3.play(frame, 514, 538, 578, 594);
+
+  CAP.p1.play(frame, 614, 638, 688, 706);
+  CAP.p2.play(frame, 644, 666, 688, 706);
+  CAP.p3.play(frame, 716, 740, 768, 786);
+  CAP.p4.play(frame, 724, 746, 768, 786);
+
+  CAP.c0.play(frame, 800, 826, 866, 884);
+  CAP.c1.play(frame, 830, 852, 866, 884);
+
+  CAP.y1.play(frame, 1240, 1264, 1312, 1330);
+  CAP.y2.play(frame, 1270, 1292, 1312, 1330);
+
+  CAP.t.play(frame, 1384, 1408, 3000, 3020);
+  CAP.t2.play(frame, 1402, 1424, 3000, 3020);
+  RULE.play(frame, 9000, 9001, 9002, 9003);
+
+  // Transition cards. Blue -> green -> red is the LIFETIME order, not the
+  // spectrum order, because lifetime is the argument.
+  CARD.blue.set(span(frame, 900, 922) * (1 - span(frame, 980, 998)),
+                (1 - E.outQuint(span(frame, 900, 922))) * 34);
+  CARD.green.set(span(frame, 1012, 1034) * (1 - span(frame, 1090, 1108)),
+                 (1 - E.outQuint(span(frame, 1012, 1034))) * 34);
+  CARD.red.set(span(frame, 1132, 1154) * (1 - span(frame, 1204, 1222)),
+               (1 - E.outQuint(span(frame, 1132, 1154))) * 34);
+
+  // Scrims track whichever band is live. The curtain behind the type is bright,
+  // so on this piece they are doing real legibility work, not decoration.
+  const headWins = [[6, 34, 104, 126], [158, 186, 262, 284], [288, 316, 360, 382],
+                    [396, 424, 486, 508], [510, 538, 578, 598],
+                    [610, 638, 688, 710], [712, 740, 768, 790],
+                    [796, 826, 866, 888], [1236, 1264, 1312, 1334],
+                    [1380, 1408, 3000, 3020]];
+  let sc = 0;
+  for (const [a, b, c, d] of headWins) sc = Math.max(sc, span(frame, a, b) * (1 - span(frame, c, d)));
+  SCRIM.set(sc * 0.62);
+  SCRIM2.set(0.60 * Math.max(
+    span(frame, 896, 922) * (1 - span(frame, 980, 1000)),
+    Math.max(span(frame, 1008, 1034) * (1 - span(frame, 1090, 1110)),
+             span(frame, 1128, 1154) * (1 - span(frame, 1204, 1224)))));
+
+  // Altitude labels. set() must run AFTER the camera is posed, since it
+  // projects through it.
+  // Duck the axis labels while the two stopping-altitude captions are up --
+  // they share the left third of the frame.
+  const altOp = kf(frame, [[608, 0], [654, 0.9], [1200, 0.9], [1226, 0]])
+              * (1 - 0.80 * span(frame, 706, 722) * (1 - span(frame, 776, 792)))
+              * (1 - 0.80 * span(frame, 822, 838) * (1 - span(frame, 872, 890)));
+  for (const L of ALT_LABELS) L.lab.set(L.at, altOp, { x: 0, y: 0 });
+
+  flashPlane.material.opacity = 0;
+  flashPlane.visible = false;
+
+  return beat;
+}
+
+// ============================================================== RENDER
+function renderAtTime(frame) {
+  const beat = beatAt(frame);
+
+  // render() honours autoClear, so leaving it on here wipes the accumulator
+  // before each additive blend -- the frame comes out at 1/N brightness.
+  renderer.autoClear = false;
+  renderer.setRenderTarget(accumTarget);
+  renderer.setClearColor(0x000000, 1);
+  renderer.clear(true, true, true);
+
+  for (let s = 0; s < SUBSAMPLES; s++) {
+    pose(frame + (s / SUBSAMPLES) * SHUTTER, SAMPLES[s]);
+    renderer.setRenderTarget(sceneTarget);
+    renderer.clear(true, true, true);
+    renderer.render(bgScene, bgCamera);     // backdrop first, no aperture offset
+    renderer.render(scene, camera);         // no clear between: composite in order
+    renderer.render(capScene, capCam);
+    accMat.uniforms.tSrc.value = sceneTarget.texture;
+    renderer.setRenderTarget(accumTarget);
+    renderer.render(accScene, accCam);
+  }
+
+  renderer.setRenderTarget(null);
+  renderer.autoClear = true;
+  // Motion blur is accumulated BEFORE the post chain: the smear happens at the
+  // shutter, the glow happens after -- and it is N times cheaper.
+  bloom.strength = BLOOM_BASE * (beat.bloom ?? 1);
+  texPass.map = accumTarget.texture;
+  composer.render();
+}
+
+const _sph = new THREE.Sphere();
+/**
+ * Does the camera fly through anything? Sampling the path and measuring the
+ * nearest surface catches "the camera passes through the subject and fills the
+ * frame with one blown-out object" in a second, instead of after a full render.
+ *
+ * Skips objects larger than `envRadius` (ground planes, sky domes -- the camera
+ * is always inside those) and anything with userData.ignoreClearance. Instanced
+ * meshes report their base geometry, not per-instance, so treat them as a hint.
+ */
+function cameraClearance(stride = 6, warn = 1.5, envRadius = 60) {
+  const hits = [];
+  for (let f = 0; f < FRAMES; f += stride) {
+    pose(f, SAMPLES[0]);
+    scene.updateMatrixWorld(true);
+    const ck = camAt(f);
+    let min = Infinity, who = '';
+    scene.traverse((o) => {
+      if (!o.isMesh || !o.visible || o.userData.ignoreClearance) return;
+      if (!o.geometry.boundingSphere) o.geometry.computeBoundingSphere();
+      _sph.copy(o.geometry.boundingSphere).applyMatrix4(o.matrixWorld);
+      if (_sph.radius > envRadius) return;
+      const d = ck.pos.distanceTo(_sph.center) - _sph.radius;
+      if (d < min) { min = d; who = o.name || o.geometry.type; }
+    });
+    if (min < warn) hits.push({ frame: f, clearance: +min.toFixed(2), object: who });
+  }
+  return hits;
+}
+
+window.__piece = {
+  frames: FRAMES, fps: FPS,
+  seek: (f) => renderAtTime(f),
+  cameraClearance,
+  /** The same frame must render identically twice, seeking away in between. */
+  async determinismCheck(f = Math.floor(FRAMES * 0.6)) {
+    const grab = () => { renderAtTime(f); return renderer.domElement.toDataURL('image/png'); };
+    const a = grab(); renderAtTime(0); const b = grab();
+    return a === b;
+  },
+};
+
+if (new URLSearchParams(location.search).has('render')) {
+  document.body.classList.add('render');
+  renderAtTime(0);
+} else {
+  const t0 = performance.now();
+  const loop = () => { renderAtTime(((performance.now() - t0) / 1000) * FPS % FRAMES);
+                       requestAnimationFrame(loop); };
+  loop();
+}
+window.__ready = true;
+</script>
+</body>
+</html>

@@ -1,0 +1,40 @@
+# Build context is motion/. The image COPYs exactly two things — app/ and
+# docker/package.json — so everything below is either dead weight in the context
+# or a local artifact that would bust the app layer's cache on every render.
+#
+# NOTE: docker only reads an ignore file at the CONTEXT root (motion/.dockerignore)
+# or named after the Dockerfile (motion/docker/Dockerfile.dockerignore). It does
+# NOT read motion/docker/.dockerignore. build_and_push.sh copies this file to the
+# name docker actually reads before every build, so the two cannot drift.
+
+# CDK app: node_modules and cdk.out here run to hundreds of MB and never ship.
+cdk/
+
+# Local iteration leftovers. common.py puts its scratch in SERVE_ROOT/work/<id>,
+# which is motion/work/ when the tools are run from a checkout instead of the
+# image — frames, wavs and mp4s by the gigabyte.
+work/
+app/out/
+app/probe/
+app/frames/
+
+# Never a build input: every wav and mp4 in this tree is render output. Note the
+# absence of a `data/` rule — the pieces fetch `data/<name>.json` relative to the
+# page, so that directory name has to stay copyable.
+**/*.wav
+**/*.mp4
+
+**/node_modules
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.DS_Store
+
+# Not needed inside the image.
+CONTRACT.md
+docker/build_and_push.sh
+docker/Dockerfile.dockerignore
+
+.git
+.gitignore
+*.log

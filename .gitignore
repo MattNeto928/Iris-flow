@@ -35,6 +35,7 @@ output/
 
 # CDK synth output
 serverless/cdk/cdk.out/
+serverless/motion/cdk/cdk.out/
 
 # Local dev workspace (30GB of rendered videos + its own .env)
 iris-local/
@@ -44,3 +45,27 @@ iris-local/
 
 # Local prompt-engineering scratch experiment (renders ~170MB of PNG frames)
 prompt_test/
+
+# motion-video piece workspaces: source is tracked, artifacts are not.
+# Each of these is 1-3 GB of node_modules, virtualenvs and rendered PNG frames.
+*_test/node_modules/
+*_test/.venv/
+*_test/out/frames/
+*_test/out/*.png
+*_test/data/*.png
+serverless/motion/cdk/node_modules/
+serverless/motion/app/__pycache__/
+
+# Rendered video is a build artifact and blows past GitHub's 100 MB file limit.
+*.mp4
+*.wav
+spider_test/out/frames
+
+# The repo ignores *.json globally (line 25), but the motion pipeline ships data
+# files the container cannot run without: the seed scene's physics data and its
+# narration script. Negate them explicitly so they stay tracked.
+!serverless/motion/app/seed_aurora.json
+!serverless/motion/app/seed_narration.json
+!serverless/motion/app/data/aurora.json
+!serverless/motion/cdk/cdk.context.json
+!aurora_test/data/aurora.json

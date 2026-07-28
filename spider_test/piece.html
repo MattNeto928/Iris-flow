@@ -1,0 +1,1664 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>piece</title>
+<style>
+  html,body{margin:0;padding:0;background:#000;overflow:hidden;height:100%}
+  #stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  canvas{display:block;max-width:100vw;max-height:100vh}
+  body.render #stage{align-items:flex-start;justify-content:flex-start}
+  body.render canvas{max-width:none;max-height:none}
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "/node_modules/three/build/three.module.js",
+    "three/addons/": "/node_modules/three/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="stage"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { TexturePass } from 'three/addons/postprocessing/TexturePass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+/* ============================================================================
+   TEMPLATE. Renders as-is -- check that first, so any later breakage is yours.
+   Sections marked >>> AUTHOR <<< are the ones you replace.
+
+   The contract that makes everything else work: pose(frame) is a PURE function
+   of frame. It re-derives all scene state from scratch every call. No `+=`, no
+   Math.random, no Date.now, no reading the previous frame. The renderer seeks
+   out of order for motion-blur sub-samples, so impurity desynchronises silently
+   instead of failing loudly.
+   ========================================================================== */
+
+const W = 1080, H = 1920, FPS = 24;
+const FRAMES = 1440;                                 // 60 s at 24 fps
+// 16 for motion blur alone; 24+ when they also serve as depth-of-field aperture
+// samples (below ~20 the bokeh bands). ?ss=N overrides, so a pipeline can trade
+// quality for render time without editing the piece.
+const SUBSAMPLES = Number(new URLSearchParams(location.search).get('ss')) || 24;
+const SHUTTER = 0.675;                               // ~243deg. 1.0 over-smears by ~50%.
+
+// Social-safe box. Stops at x 900 (not 1020) to clear TikTok's button rail, so
+// it is NOT centred -- compose on LANE_CX, not W/2.
+const SAFE = { x0: 60, x1: 900, y0: 200, y1: 1560 };
+const LANE_CX = (SAFE.x0 + SAFE.x1) / 2;             // 480
+
+// ---------------------------------------------------------------- easing
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const span = (t, a, b) => clamp((t - a) / (b - a), 0, 1);
+const E = {
+  linear: t => t,
+  outQuad: t => 1 - (1 - t) ** 2,
+  inCubic: t => t ** 3,
+  outCubic: t => 1 - (1 - t) ** 3,
+  outQuart: t => 1 - (1 - t) ** 4,
+  outQuint: t => 1 - (1 - t) ** 5,
+  // inOutCubic is the safe default for travel. inOutQuint has a much higher
+  // mid-velocity and will smear a moving subject into an unreadable streak.
+  inOutCubic: t => (t < .5 ? 4 * t ** 3 : 1 - (-2 * t + 2) ** 3 / 2),
+  inOutQuint: t => (t < .5 ? 16 * t ** 5 : 1 - (-2 * t + 2) ** 5 / 2),
+  outExpo: t => (t >= 1 ? 1 : 1 - Math.pow(2, -10 * t)),
+  outBack: t => 1 + 2.2 * (t - 1) ** 3 + 1.2 * (t - 1) ** 2,
+  outSoft: t => 1 - Math.pow(1 - t, 3.4),
+};
+const ease = (f, a, b, fn = E.inOutCubic) => fn(span(f, a, b));
+
+/** Seeded PRNG. Call during build only -- never from pose(). */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rnd = mulberry32(0xC0FFEE);
+
+/** sRGB -> THREE.Color. THREE.Color(r,g,b) treats floats as ALREADY LINEAR. */
+const C = (hex) => new THREE.Color().setHex(hex, THREE.SRGBColorSpace);
+
+// ============================================================== WEB DATA
+// Baked by web_solve.py. Every thread position and every length quoted on
+// screen comes from here, so a wrong number is traceable to the solve rather
+// than hidden in the scene. 1 world unit = 10 mm (WEB.mm_per_unit).
+const WEB = await (await fetch('web.json')).json();
+const U = WEB.mm_per_unit / 1000;                    // world units -> metres
+const V3 = ([x, y, z]) => new THREE.Vector3(x, y, z);
+const V3s = (a) => a.map(V3);
+
+// ============================================================== BEAT TABLE
+// The construction sequence, in the order a real orb weaver works. `bloom` is a
+// per-beat multiplier: a threshold-free bloom scales with lit AREA as well as
+// radiance, so the wide dawn beat needs less gain than the sparse dark ones.
+const BEATS = [
+  { id: 'throw',   from: 0,    to: 119,  bloom: 1.05 },  // bridge line on the breeze
+  { id: 'bridge',  from: 120,  to: 263,  bloom: 1.05 },  // crossed and doubled
+  { id: 'frame',   from: 264,  to: 407,  bloom: 1.00 },  // frame + anchor threads
+  { id: 'radii',   from: 408,  to: 599,  bloom: 1.00 },  // 30 spokes, centre out
+  { id: 'aux',     from: 600,  to: 791,  bloom: 1.00 },  // temporary scaffold spiral
+  { id: 'capture', from: 792,  to: 1055, bloom: 0.70 },  // sticky spiral, outside in
+  // From here the web is dense AND the sky is bright, so lit area explodes and
+  // a constant bloom gain hazes the frame to white. These are tuned.
+  { id: 'dawn',    from: 1056, to: 1175, bloom: 0.34 },  // finished, dew, sunrise
+  { id: 'numbers', from: 1176, to: 1367, bloom: 0.32 },  // silk mechanics panels
+  { id: 'title',   from: 1368, to: 1439, bloom: 0.38 },
+];
+const B = Object.fromEntries(BEATS.map(b => [b.id, b]));
+const beatAt = (frame) => {
+  // Ownership from the OUTPUT frame, never the fractional sub-frame time:
+  // sub-samples run up to SHUTTER past the nominal frame, so `frame <= to`
+  // would cull a beat for most of its own final frame's samples.
+  const f = Math.floor(frame + 1e-6);
+  return BEATS.find(b => f >= b.from && f <= b.to) || BEATS[BEATS.length - 1];
+};
+
+// ============================================================== RENDERER
+const renderer = new THREE.WebGLRenderer({
+  antialias: false, preserveDrawingBuffer: true, powerPreference: 'high-performance',
+});
+renderer.setPixelRatio(1);
+renderer.setSize(W, H);
+renderer.setClearColor(0x000000, 1);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+// A lit scene wants a highlight shoulder. Use NoToneMapping instead only for
+// flat graphic/line work, where a hard clip is correct.
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.92;
+document.getElementById('stage').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+// Density is far lower than the template's 0.012 because this scene works at
+// 1 unit = 10 mm and the wide shots sit ~100 units out; 0.012 would fog the web
+// to nothing at that range.
+scene.fog = new THREE.FogExp2(C(0x101a2e).getHex(), 0.0016);
+const camera = new THREE.PerspectiveCamera(32, W / H, 0.5, 4000);
+
+// Backdrop scene, drawn first with the SAME camera pose but WITHOUT the
+// aperture offset. Anything effectively at infinity -- stars, a sky dome, a
+// distant field -- belongs here.
+//
+// Why: accumulation depth of field works by re-rendering from N points across
+// the aperture. For geometry near the focal plane those copies overlap into
+// smooth blur. For a point sprite 200 units behind it, they do not: you get N
+// discrete copies, and a starfield renders as visible clumps of 24 dots rather
+// than stars. That is what the optics really imply at that aperture, but it is
+// never what you want from a backdrop, and no realistic sample count fixes it.
+const bgScene = new THREE.Scene();
+const bgCamera = new THREE.PerspectiveCamera(32, W / H, 0.5, 8000);
+
+// ============================================================== >>> AUTHOR: SCENE
+//
+// One dense scene, held for the whole piece: an orb web strung between two
+// twigs, shot into a sky that turns from pre-dawn to sunrise. Everything web-
+// and-spider lives in the world XY plane at z = 0, so the spider's "up" is
+// world +z (the web normal). The web is NOT tilted -- the camera comes in
+// obliquely instead, which keeps every bit of gait and construction maths in
+// one flat readable frame.
+
+// The sun sits behind and below-left of the web, so the silk is backlit: that
+// is the only reason a 3 um thread is visible at all, and it is what every
+// photograph of a web actually shows.
+const SUN_DIR = new THREE.Vector3();      // rewritten per frame (it rises)
+const SUN_NDC = new THREE.Vector2();
+
+// ---------------------------------------------------------------- sky
+// A shader dome rather than a texture, so the pre-dawn -> sunrise turn is a
+// uniform lerp instead of a crossfade between two spheres. In bgScene: it is
+// effectively at infinity, and DoF would otherwise re-render it per aperture
+// sample for no benefit.
+const skyU = {
+  uTop: { value: new THREE.Color() }, uMid: { value: new THREE.Color() },
+  uHor: { value: new THREE.Color() }, uGlow: { value: new THREE.Color() },
+  uSun: { value: new THREE.Vector3(0, 0, -1) }, uSunI: { value: 0.4 },
+};
+const sky = new THREE.Mesh(new THREE.SphereGeometry(1600, 48, 32),
+  new THREE.ShaderMaterial({
+    uniforms: skyU, side: THREE.BackSide, depthWrite: false, fog: false,
+    vertexShader: `varying vec3 vD;
+      void main(){ vD = position; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
+    fragmentShader: `
+      uniform vec3 uTop, uMid, uHor, uGlow; uniform vec3 uSun; uniform float uSunI;
+      varying vec3 vD;
+      void main(){
+        vec3 d = normalize(vD);
+        float h = clamp(d.y*0.5+0.5, 0.0, 1.0);
+        vec3 c = mix(uHor, uMid, smoothstep(0.42, 0.56, h));
+        c = mix(c, uTop, smoothstep(0.56, 0.92, h));
+        vec3 sd = normalize(uSun);
+        float s = max(dot(d, sd), 0.0);
+        c += uGlow * pow(s, 4.0)  * uSunI * 0.22;     // broad dawn wash
+        c += uGlow * pow(s, 30.0) * uSunI * 0.34;     // halo
+        // The disc by ANGLE, not pow(cos,N): the sun is 0.53 deg across, which
+        // needs an exponent near 65000 to reproduce and blows out the frame at
+        // anything smaller. Gated on the sun being above the horizon, since the
+        // dome has no ground to occlude it before sunrise.
+        float ang = acos(clamp(s, -1.0, 1.0));
+        float disc = (1.0 - smoothstep(0.0042, 0.0090, ang))
+                   * smoothstep(-0.010, 0.020, sd.y);
+        c += uGlow * disc * uSunI * 2.4;
+        gl_FragColor = vec4(c, 1.0);
+      }`,
+  }));
+sky.userData.ignoreClearance = true;
+bgScene.add(sky);
+
+// The camera looks near-horizontally, so the horizon band fills most of the
+// frame -- a warm value that reads fine on a swatch renders as a full-frame
+// wash. Both dawn values are far darker than they look here for that reason.
+const SKY_NIGHT = { top: 0x02030a, mid: 0x05091a, hor: 0x0c1228, glow: 0x1f2c49, i: 0.30 };
+const SKY_DAWN  = { top: 0x0a1330, mid: 0x1c2848, hor: 0x6d3f1d, glow: 0xffab5e, i: 0.55 };
+
+// Pre-dawn stars, gone by sunrise. makePointField because PointsMaterial has no
+// fov term and this piece animates fov.
+// size is a WORLD diameter at this radius, so 4.2 rendered 15 px dots -- a
+// snowstorm, not a sky. 0.55 gives ~2 px.
+const STARS = makePointField(6000, { radius: 900, size: 1.15, shell: true, opacity: 0.0, sizeVar: 0.5 });
+bgScene.add(STARS.points);
+
+// ---------------------------------------------------------------- lights
+// Backlight dominates. The weak front fill exists only so the spider is not a
+// pure silhouette -- her abdomen markings are the species ID and worth reading.
+const backlight = new THREE.DirectionalLight(C(0xffd9a8), 2.4);
+const frontfill = new THREE.DirectionalLight(C(0x9fc0ff), 0.85);
+frontfill.position.set(26, 30, 70);
+const ambient = new THREE.HemisphereLight(C(0x39507f), C(0x0a0a12), 0.9);
+scene.add(backlight, frontfill, ambient);
+
+// ---------------------------------------------------------------- silk
+// One material factory for every thread. Lines, not tubes: at 3.5 um a real
+// capture thread is ~1/3000 of a pixel wide here, so ANY drawing of a web
+// exaggerates thread width enormously -- a 1 px line is the least dishonest
+// version of that, and bloom supplies the rest of the read.
+function silkMat(color, hot, opacity = 1) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uColor: { value: C(color) }, uHot: { value: C(hot) },
+      uOpacity: { value: opacity }, uSunNdc: { value: SUN_NDC }, uHeat: { value: 1.0 },
+    },
+    vertexShader: `varying vec2 vN;
+      void main(){ vec4 p = projectionMatrix*modelViewMatrix*vec4(position,1.);
+                   vN = p.xy/max(1e-4,p.w); gl_Position = p; }`,
+    // Threads flare where they pass in front of the sun. Distance is corrected
+    // for the 9:16 aspect so the flare is round in pixels, not an ellipse.
+    fragmentShader: `
+      uniform vec3 uColor, uHot; uniform float uOpacity, uHeat; uniform vec2 uSunNdc;
+      varying vec2 vN;
+      void main(){
+        vec2 d = (vN - uSunNdc) * vec2(1.0, 1.7778);
+        float k = exp(-length(d) * 1.15) * uHeat;
+        vec3 c = mix(uColor, uHot, clamp(k, 0.0, 1.0));
+        gl_FragColor = vec4(c * (1.0 + 0.45*k), uOpacity);
+      }`,
+    transparent: true, depthWrite: false, fog: false,
+  });
+}
+const M_STRUCT = silkMat(0xc6d8f6, 0xfff0cf, 0);   // bridge, frame, anchors, radii
+const M_HUB    = silkMat(0xb9c8e6, 0xfff2d8, 0);
+const M_AUX    = silkMat(0x8494b4, 0xe3d3ae, 0);   // scaffold: deliberately duller
+const M_CAP    = silkMat(0xc8d8f5, 0xfff4dd, 0);   // sticky spiral: the bright one
+const M_DRAG   = silkMat(0xdfe9ff, 0xfff6e2, 0);   // the thread being paid out now
+const ALL_SILK = [M_STRUCT, M_HUB, M_AUX, M_CAP, M_DRAG];
+
+/** Polyline that can be revealed vertex-by-vertex with a moving tip. */
+function polyline(pts, mat) {
+  const g = new THREE.BufferGeometry().setFromPoints(pts);
+  const l = new THREE.Line(g, mat);
+  l.frustumCulled = false; l.userData.src = pts; l.visible = false;
+  scene.add(l); return l;
+}
+/** Disjoint segments in LAY ORDER, so drawRange reveals them one at a time. */
+function segments(pairs, mat) {
+  const flat = []; for (const [a, b] of pairs) flat.push(a, b);
+  const g = new THREE.BufferGeometry().setFromPoints(flat);
+  const l = new THREE.LineSegments(g, mat);
+  l.frustumCulled = false; l.userData.src = flat; l.visible = false;
+  scene.add(l); return l;
+}
+const _tip = new THREE.Vector3();
+/**
+ * Reveal a polyline up to `prog` (0..1) with the leading vertex part-way along
+ * its segment. Writes are absolute -- restore-then-set -- so pose() stays pure
+ * and the renderer can seek out of order. Running prog back DOWN is how the
+ * auxiliary spiral gets eaten from its outer end.
+ */
+function revealPoly(line, prog) {
+  const src = line.userData.src, N = src.length;
+  const x = clamp(prog, 0, 1) * (N - 1);
+  const k = Math.floor(x), f = x - k;
+  const pos = line.geometry.attributes.position;
+  for (let i = Math.max(0, k - 1); i <= Math.min(N - 1, k + 2); i++)
+    pos.setXYZ(i, src[i].x, src[i].y, src[i].z);
+  _tip.copy(src[Math.min(k, N - 1)]);
+  if (k + 1 <= N - 1) {
+    _tip.lerp(src[k + 1], f);
+    pos.setXYZ(k + 1, _tip.x, _tip.y, _tip.z);
+  }
+  pos.needsUpdate = true;
+  const count = clamp(k + 2, 0, N);
+  line.geometry.setDrawRange(0, count);
+  line.visible = count >= 2 && line.material.uniforms.uOpacity.value > 0.004;
+  return _tip;
+}
+/** Same idea for LineSegments: `q` counts completed segments, fractionally. */
+function revealSegs(line, q, nMax) {
+  const src = line.userData.src;
+  const k = clamp(Math.floor(q), 0, nMax - 1), f = clamp(q - k, 0, 1);
+  const pos = line.geometry.attributes.position;
+  for (let i = Math.max(0, 2 * (k - 1)); i <= Math.min(src.length - 1, 2 * k + 1); i++)
+    pos.setXYZ(i, src[i].x, src[i].y, src[i].z);
+  _tip.copy(src[2 * k]).lerp(src[2 * k + 1], f);
+  pos.setXYZ(2 * k + 1, _tip.x, _tip.y, _tip.z);
+  pos.needsUpdate = true;
+  line.geometry.setDrawRange(0, q <= 0 ? 0 : 2 * (k + 1));
+  line.visible = q > 0.01 && line.material.uniforms.uOpacity.value > 0.004;
+  return _tip;
+}
+
+// ---- the web itself, straight out of web_solve.py
+const FRAMEP = V3s(WEB.framePts);
+const RADII  = WEB.radii.map(([a, b]) => [V3(a), V3(b)]);
+const ORDER  = WEB.radiiOrder;
+const HUBP   = new THREE.Vector3(0, 0, 0);
+const BRIDGE_A = FRAMEP[1], BRIDGE_B = FRAMEP[2];
+
+// Frame edges, laid in the order the spider walks the polygon.
+const frameSegs = segments(
+  FRAMEP.map((p, i) => [p, FRAMEP[(i + 1) % FRAMEP.length]]), M_STRUCT);
+const anchorSegs = segments(WEB.anchors.map(([a, b]) => [V3(a), V3(b)]), M_STRUCT);
+// Radii reordered into LAY order so drawRange follows the build.
+const radiiSegs = segments(ORDER.map(i => RADII[i]), M_STRUCT);
+const bridgeLine = polyline(
+  Array.from({ length: 24 }, (_, i) => {
+    const t = i / 23, p = BRIDGE_A.clone().lerp(BRIDGE_B, t);
+    p.y -= Math.sin(t * Math.PI) * 0.55;      // a real bridge line sags
+    return p;
+  }), M_STRUCT);
+const dropLine  = polyline([BRIDGE_A.clone().lerp(BRIDGE_B, 0.5), HUBP.clone()], M_STRUCT);
+const hubLine   = polyline(V3s(WEB.hubSpiral), M_HUB);
+const auxLine   = polyline(V3s(WEB.auxSpiral), M_AUX);
+const capLine   = polyline(V3s(WEB.capSpiral), M_CAP);
+const AUX_SRC = auxLine.userData.src, CAP_SRC = capLine.userData.src;
+const AUX_R = AUX_SRC.map(p => Math.hypot(p.x, p.y));
+
+// The thread currently being paid out, spinnerets -> last anchor point. Given a
+// slight sag so it reads as slack silk rather than a laser.
+const dragLine = polyline(Array.from({ length: 10 }, () => new THREE.Vector3()), M_DRAG);
+// The first thread of all: metres of silk let out on the breeze until it snags.
+const DRIFT_N = 56;
+const driftLine = polyline(
+  Array.from({ length: DRIFT_N }, () => new THREE.Vector3()), M_DRAG);
+
+// ---------------------------------------------------------------- droplets
+/**
+ * Glue/dew droplets threaded onto a polyline. Points rather than spheres, with
+ * makePointField's fov-correct sizing copied in (PointsMaterial has no fov
+ * term); aOrder gates each droplet so it appears with the thread that carries
+ * it, and uDew grows them when the dawn condenses onto the web.
+ */
+function makeDrops(src, perSeg, size, color, jitter = 0.05) {
+  const pos = [], ord = [], sc = [];
+  for (let i = 0; i < src.length - 1; i++) {
+    for (let j = 0; j < perSeg; j++) {
+      const t = (j + 0.18 + rnd() * 0.64) / perSeg;
+      pos.push(lerp(src[i].x, src[i + 1].x, t) + (rnd() - .5) * jitter,
+               lerp(src[i].y, src[i + 1].y, t) + (rnd() - .5) * jitter,
+               lerp(src[i].z, src[i + 1].z, t) + (rnd() - .5) * jitter);
+      ord.push((i + t) / (src.length - 1));
+      sc.push(0.55 + rnd() * 0.9);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
+  g.setAttribute('aOrd', new THREE.BufferAttribute(new Float32Array(ord), 1));
+  g.setAttribute('aScl', new THREE.BufferAttribute(new Float32Array(sc), 1));
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uH: { value: H }, uSize: { value: size }, uReveal: { value: 0 },
+                uOpacity: { value: 0 }, uColor: { value: C(color) },
+                uDew: { value: 0 }, uSunNdc: { value: SUN_NDC } },
+    vertexShader: `
+      attribute float aOrd, aScl; uniform float uH, uSize, uReveal, uDew;
+      varying float vOn; varying vec2 vN;
+      void main(){
+        vec4 mv = modelViewMatrix*vec4(position,1.0);
+        vec4 p = projectionMatrix*mv; gl_Position = p; vN = p.xy/max(1e-4,p.w);
+        vOn = step(aOrd, uReveal);
+        gl_PointSize = aScl*uSize*(1.0+1.1*uDew)*(0.5*uH*projectionMatrix[1][1])/max(0.001,-mv.z);
+      }`,
+    fragmentShader: `
+      uniform vec3 uColor; uniform float uOpacity; uniform vec2 uSunNdc;
+      varying float vOn; varying vec2 vN;
+      void main(){
+        if (vOn < 0.5) discard;
+        vec2 d = gl_PointCoord-0.5;
+        float a = smoothstep(0.5, 0.10, length(d));
+        float k = exp(-length((vN-uSunNdc)*vec2(1.0,1.7778))*1.05);
+        gl_FragColor = vec4(uColor*(1.0+0.8*k), a*uOpacity);
+      }`,
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  });
+  const pts = new THREE.Points(g, mat);
+  pts.frustumCulled = false; pts.userData.ignoreClearance = true;
+  scene.add(pts);
+  return { pts, u: mat.uniforms };
+}
+// Sticky capture thread: aqueous glue that beads up. Two per chord.
+const DROPS_CAP = makeDrops(CAP_SRC, 2, 0.26, 0xffe9c4, 0.05);
+// Dawn condensation, on the radii. Built from a synthetic polyline of radial
+// points so the same reveal machinery works.
+const RAD_PTS = [];
+for (const i of ORDER) {
+  const [a, b] = RADII[i];
+  for (let s = 1; s < 14; s++) RAD_PTS.push(a.clone().lerp(b, s / 14));
+}
+const DROPS_RAD = makeDrops(RAD_PTS, 1, 0.22, 0xdcecff, 0.12);
+DROPS_RAD.u.uReveal.value = 1.0;
+
+// ---------------------------------------------------------------- twigs, grass
+// Dark, near-silhouette scenery that anchors the web and gives the sky
+// something to be bright against -- also what keeps the 1st-percentile luma low
+// once the sun is up.
+const barkMat = new THREE.MeshStandardMaterial({ color: C(0x120d0a), roughness: 0.92 });
+function twig(pts, r0, r1) {
+  const curve = new THREE.CatmullRomCurve3(pts, false, 'catmullrom', 0.4);
+  const g = new THREE.TubeGeometry(curve, 26, r0, 7, false);
+  // taper by hand: TubeGeometry has no radius ramp
+  const p = g.attributes.position, tmp = new THREE.Vector3();
+  for (let i = 0; i < p.count; i++) {
+    const t = Math.floor(i / 8) / 26;
+    const c = curve.getPoint(t);
+    tmp.set(p.getX(i) - c.x, p.getY(i) - c.y, p.getZ(i) - c.z)
+       .multiplyScalar(lerp(1, r1 / r0, t));
+    p.setXYZ(i, c.x + tmp.x, c.y + tmp.y, c.z + tmp.z);
+  }
+  g.computeVertexNormals();
+  const m = new THREE.Mesh(g, barkMat); scene.add(m); return m;
+}
+for (const ai of [1, 2, 4]) {              // the anchors that carry the bridge + one low
+  const [a, b] = WEB.anchors[ai].map(V3);
+  const dir = b.clone().sub(a);
+  twig([b.clone().addScaledVector(dir, 1.9).setZ(b.z - 3),
+        b.clone().addScaledVector(dir, 0.55), b.clone(),
+        a.clone().addScaledVector(dir, -0.15).setZ(a.z + 0.4)], 0.42, 0.10);
+  // a side shoot, so it reads as a plant and not a pipe
+  const m = b.clone().addScaledVector(dir, 0.5);
+  twig([m, m.clone().add(new THREE.Vector3(-dir.y * 0.35, dir.x * 0.35, -2.5)),
+        m.clone().add(new THREE.Vector3(-dir.y * 0.7, dir.x * 0.7, -5.5))], 0.16, 0.04);
+}
+// A dark bank BEHIND the web (z = -30), rising to y = -17, just under the
+// lowest frame thread. Two jobs, both load-bearing: it gives the backlit silk
+// something black to be bright against instead of open sky, and it holds the
+// 1st-percentile luma down once the sun is up -- without it the dawn frames are
+// a full-height gradient with no true black anywhere and the gate is right to
+// fail them.
+{
+  const dark = new THREE.MeshBasicMaterial({ color: C(0x04050a), fog: false });
+  const bank = new THREE.Mesh(new THREE.PlaneGeometry(520, 96), dark);
+  bank.position.set(0, -69, -30); bank.userData.ignoreClearance = true;
+  scene.add(bank);
+  // A flat top edge reads as a black bar laid over the picture. Overlapping
+  // squashed spheres straddling that edge give it a skyline instead, for the
+  // cost of 26 draws of an 8-segment sphere.
+  const SPH2 = new THREE.SphereGeometry(1, 10, 7);
+  for (let i = 0; i < 26; i++) {
+    const m = new THREE.Mesh(SPH2, dark);
+    m.position.set((rnd() - 0.5) * 300, -24 - rnd() * 12, -30 + (rnd() - .5) * 8);
+    m.scale.set(14 + rnd() * 22, 5 + rnd() * 9, 6);
+    m.userData.ignoreClearance = true;
+    scene.add(m);
+  }
+}
+for (let i = 0; i < 34; i++) {
+  const x = (rnd() - 0.5) * 240, z = -26 - rnd() * 26, h = 34 + rnd() * 26;
+  const y0 = -66 - rnd() * 10, bend = (rnd() - .5) * 24;
+  twig([new THREE.Vector3(x, y0, z),
+        new THREE.Vector3(x + bend * 0.18, y0 + h * .45, z + 1),
+        new THREE.Vector3(x + bend * 0.55, y0 + h * .82, z + 2),
+        new THREE.Vector3(x + bend, y0 + h, z + 3)], 0.34, 0.014);
+}
+
+// ---------------------------------------------------------------- the spider
+// Araneus diadematus, female: bulbous abdomen with the pale cross that names
+// her, banded legs, longest pair in front and shortest pair third. Built +z
+// forward / +y up, the template's convention.
+const SPIDER = (() => {
+  const root = new THREE.Group(); scene.add(root);
+  const body = new THREE.Group(); root.add(body);
+  const chitin = new THREE.MeshStandardMaterial({ color: C(0x2a1c12), roughness: 0.5, metalness: 0.06 });
+  // Legs get their OWN dark value. At carapace brown they disappeared into the
+  // pre-dawn sky between the pale bands, so the leg read as a row of floating
+  // dashes rather than a limb.
+  const legDark = new THREE.MeshStandardMaterial({ color: C(0x7a5836), roughness: 0.62 });
+  const abdo   = new THREE.MeshStandardMaterial({ color: C(0x4a3018), roughness: 0.72 });
+  const pale   = new THREE.MeshStandardMaterial({ color: C(0xe8dcc0), roughness: 0.62 });
+  const band   = new THREE.MeshStandardMaterial({ color: C(0xc0a074), roughness: 0.66 });
+  const eyeM   = new THREE.MeshStandardMaterial({ color: C(0x08080c), roughness: 0.1, metalness: 0.5 });
+  const SPH = new THREE.SphereGeometry(1, 14, 10);
+  const CYL = new THREE.CylinderGeometry(1, 1, 1, 6, 1, true);
+
+  const ceph = new THREE.Mesh(SPH, chitin);
+  ceph.scale.set(0.30, 0.20, 0.40); ceph.position.set(0, 0, 0.30); body.add(ceph);
+  const AB = new THREE.Vector3(0.44, 0.42, 0.56), AC = new THREE.Vector3(0, 0.08, -0.52);
+  const ab = new THREE.Mesh(SPH, abdo);
+  ab.scale.copy(AB); ab.position.copy(AC); body.add(ab);
+
+  // The cross: five pale patches on the dorsal abdomen, pushed to 0.94 of the
+  // ellipsoid surface so they sit IN the skin. Placed proud of it they read as
+  // stuck-on beads (this is the "pale sphere welded to the subject" failure).
+  const spots = [[0, 1, 0.62], [0, 1, 0.16], [0, 1, -0.30], [0.52, 0.85, 0.05], [-0.52, 0.85, 0.05]];
+  for (const [dx, dy, dz] of spots) {
+    const n = new THREE.Vector3(dx, dy, dz).normalize();
+    const s = new THREE.Mesh(SPH, pale);
+    s.position.set(AC.x + n.x * AB.x * 0.94, AC.y + n.y * AB.y * 0.94, AC.z + n.z * AB.z * 0.94);
+    s.scale.setScalar(0.062); s.scale.z *= 1.5; body.add(s);
+  }
+  // Spinnerets -- where the silk actually comes from. The drag line is anchored
+  // here, not to the body centre.
+  const spin = new THREE.Object3D(); spin.position.set(0, -0.02, AC.z - AB.z * 0.96); body.add(spin);
+  for (let i = 0; i < 3; i++) {
+    const c = new THREE.Mesh(new THREE.ConeGeometry(0.035, 0.11, 6), chitin);
+    c.position.set((i - 1) * 0.045, -0.02, AC.z - AB.z * 0.99);
+    c.rotation.x = -Math.PI / 2 + 0.25; body.add(c);
+  }
+  // Eight eyes, two rows of four, on the front of the carapace.
+  for (let r = 0; r < 2; r++) for (let i = 0; i < 4; i++) {
+    const e = new THREE.Mesh(SPH, eyeM);
+    e.position.set((i - 1.5) * 0.075 * (r ? 1.15 : 0.85), 0.10 - r * 0.055, 0.58 - r * 0.03);
+    e.scale.setScalar(r ? 0.026 : 0.030); body.add(e);
+  }
+  // Chelicerae + pedipalps
+  for (const sx of [-1, 1]) {
+    const ch = new THREE.Mesh(new THREE.ConeGeometry(0.055, 0.20, 6), chitin);
+    ch.position.set(sx * 0.075, -0.10, 0.60); ch.rotation.x = 2.5; body.add(ch);
+    const pp = new THREE.Mesh(CYL, chitin);
+    pp.position.set(sx * 0.13, -0.13, 0.72); pp.scale.set(0.030, 0.30, 0.030);
+    pp.rotation.set(1.25, 0, sx * 0.35); body.add(pp);
+  }
+
+  // Legs. Lengths follow Araneus proportions: I longest, III shortest.
+  const SEG = [[0.86, 0.80, 0.30], [0.74, 0.66, 0.26], [0.54, 0.48, 0.20], [0.72, 0.72, 0.26]];
+  const HIPZ = [0.42, 0.22, 0.02, -0.16];
+  const REST = [[0.98, 1.34], [1.18, 0.56], [1.02, -0.28], [0.96, -1.20]];  // [lateral, forward]
+  const legs = [];
+  for (let s = 0; s < 2; s++) for (let p = 0; p < 4; p++) {
+    const sx = s ? 1 : -1;
+    const mk = (r0, r1, mat) => { const m = new THREE.Mesh(CYL, mat); body.add(m); return m; };
+    legs.push({
+      sx, p, L: SEG[p],
+      hip: new THREE.Vector3(sx * 0.26, -0.02, HIPZ[p]),
+      rest: new THREE.Vector3(sx * REST[p][0], -0.34, REST[p][1]),
+      // femur | pale band | tibia | pale band | tarsus  -- Araneus legs are
+      // conspicuously banded and it is most of what makes the model read.
+      m: [mk(), mk(), mk(), mk(), mk()],
+      r: [[0.066], [0.060], [0.050], [0.044], [0.028]],
+      mat: [legDark, band, legDark, band, legDark],
+      knee: new THREE.Mesh(SPH, chitin),
+    });
+    const L = legs[legs.length - 1];
+    L.m.forEach((m, i) => { m.material = L.mat[i]; });
+    L.knee.scale.setScalar(0.045); body.add(L.knee);
+  }
+  return { root, body, spin, legs, ceph, ab };
+})();
+
+const _a = new THREE.Vector3(), _b = new THREE.Vector3(), _c = new THREE.Vector3();
+const _n = new THREE.Vector3(), _pl = new THREE.Vector3(), _q = new THREE.Quaternion();
+const YAX = new THREE.Vector3(0, 1, 0);
+/** Place a unit cylinder (axis +y, length 1) so it spans a->b with radius r. */
+function setBone(mesh, a, b, r) {
+  _n.subVectors(b, a); const len = _n.length() || 1e-5;
+  mesh.position.copy(a).addScaledVector(_n, 0.5);
+  mesh.quaternion.setFromUnitVectors(YAX, _n.divideScalar(len));
+  mesh.scale.set(r, len, r);
+}
+/**
+ * Two-bone IK. The knee is pushed along `pole` -- for a spider that is up and
+ * outward, which is what gives the high-elbowed crouch rather than a mammal's
+ * leg. Target is clamped to reach so the solve never goes imaginary.
+ */
+function ik(hip, target, L1, L2, pole, outKnee) {
+  _n.subVectors(target, hip); let d = _n.length();
+  const maxd = (L1 + L2) * 0.99, mind = Math.abs(L1 - L2) * 1.02 + 1e-3;
+  if (d > maxd) { _n.multiplyScalar(maxd / d); d = maxd; }
+  if (d < mind) { _n.multiplyScalar(mind / Math.max(d, 1e-5)); d = mind; }
+  _c.copy(_n).divideScalar(d);
+  const a = (L1 * L1 - L2 * L2 + d * d) / (2 * d);
+  const h = Math.sqrt(Math.max(0, L1 * L1 - a * a));
+  _pl.copy(pole).addScaledVector(_c, -pole.dot(_c)).normalize();
+  outKnee.copy(hip).addScaledVector(_c, a).addScaledVector(_pl, h);
+}
+
+// ============================================================== CONSTRUCTION
+// The single source of truth for "how far through the build are we, and where
+// is she". Everything the scene draws -- reveal amounts, spider placement,
+// camera targets -- is derived from this one pure function of frame.
+//
+// Real construction takes ~30-60 min (Foelix 2011; Zschokke & Vollrath 1995),
+// so the whole piece is a time lapse. The radius beat deliberately accelerates
+// through the later spokes rather than pretending each of thirty gets equal
+// screen time; the smear that produces is the point.
+
+const FRAME_PERIM = FRAMEP.reduce((s, p, i) => s + p.distanceTo(FRAMEP[(i + 1) % 6]), 0);
+const CAP_LEN = CAP_SRC.reduce((s, p, i) => i ? s + p.distanceTo(CAP_SRC[i - 1]) : 0, 0);
+const AUX_LEN = AUX_SRC.reduce((s, p, i) => i ? s + p.distanceTo(AUX_SRC[i - 1]) : 0, 0);
+const BRIDGE_SRC = bridgeLine.userData.src;
+const bridgeAt = (t) => {
+  const x = clamp(t, 0, 1) * (BRIDGE_SRC.length - 1), k = Math.min(Math.floor(x), BRIDGE_SRC.length - 2);
+  return BRIDGE_SRC[k].clone().lerp(BRIDGE_SRC[k + 1], x - k);
+};
+const polyAt = (src, t) => {
+  const x = clamp(t, 0, 1) * (src.length - 1), k = Math.min(Math.floor(x), src.length - 2);
+  return src[k].clone().lerp(src[k + 1], x - k);
+};
+const CAP_END = CAP_SRC[CAP_SRC.length - 1];
+
+/**
+ * @returns {pos, fwd, dist, build:{...}, settle}  pos/fwd in the web plane
+ * (z = 0); `dist` is path length walked so far and drives the gait.
+ */
+function spiderState(frame) {
+  const f = frame;
+  // Fresh vectors, not module scratch: pose() calls this more than once per
+  // sub-sample (once for the spider, once nine frames back for the drag line)
+  // and shared temporaries would clobber each other.
+  const st = {
+    pos: new THREE.Vector3(), fwd: new THREE.Vector3(0, -1, 0), dist: 0, laying: 0,
+    drift: 0, bridge: 0, drop: 0, frameQ: 0, anchorQ: 0, radiiQ: 0,
+    hub: 0, aux: 0, cap: 0, lift: 0,
+  };
+  // A zero-length heading normalises to NaN, the NaN reaches the framebuffer,
+  // and UnrealBloom's mip chain then spreads it over the ENTIRE frame -- one
+  // degenerate tangent at the end of a polyline rendered f660 fully black while
+  // f650 and f672 were fine. Keep the previous heading instead.
+  const set = (p, fx, fy) => {
+    st.pos.copy(p);
+    if (Math.hypot(fx, fy) > 1e-6) st.fwd.set(fx, fy, 0).normalize();
+  };
+  // Central difference, so a tangent taken at t = 1 does not collapse to zero.
+  const tangentAt = (src, t) => {
+    const a = polyAt(src, clamp(t - 0.008, 0, 1)), b = polyAt(src, clamp(t + 0.008, 0, 1));
+    return [b.x - a.x, b.y - a.y];
+  };
+
+  if (f < B.bridge.from) {
+    // ---- THROW. She sits on the twig at the bridge anchor, abdomen raised,
+    // paying silk into the moving air until it snags something.
+    st.drift = E.outQuad(span(f, 4, 96));
+    st.bridge = E.outQuart(span(f, 94, 118));
+    st.lift = 0.55 * span(f, 10, 40) * (1 - span(f, 96, 116));
+    const turn = lerp(-0.75, 0.02, E.inOutCubic(span(f, 92, 118)));
+    const d = BRIDGE_B.clone().sub(BRIDGE_A).normalize();
+    set(BRIDGE_A, d.x * Math.cos(turn) - d.y * Math.sin(turn),
+                  d.x * Math.sin(turn) + d.y * Math.cos(turn));
+    st.dist = 0.30 * span(f, 0, 119);
+    st.laying = 0;
+
+  } else if (f < B.frame.from) {
+    // ---- BRIDGE. Crosses it (a real spider walks it and doubles the thread),
+    // then drops on a dragline from the middle: the first radius, and the point
+    // that will become the hub.
+    st.drift = 1 - span(f, 118, 140); st.bridge = 1;
+    const cross = E.inOutCubic(span(f, 124, 208));
+    const back = E.inOutCubic(span(f, 212, 240));
+    st.drop = E.inOutCubic(span(f, 240, 262));
+    const t = lerp(cross, 0.5, back);
+    const p = bridgeAt(t);
+    if (st.drop > 0.001) {
+      const mid = bridgeAt(0.5);
+      st.pos.copy(mid).lerp(HUBP, st.drop);
+      st.fwd.set(0, -1, 0);
+    } else {
+      const q = bridgeAt(clamp(t - 0.02, 0, 1)), sgn = back > 0.001 ? 1 : -1;
+      set(p, (q.x - p.x) * sgn, (q.y - p.y) * sgn);
+    }
+    st.dist = 0.3 * 119 + BRIDGE_A.distanceTo(BRIDGE_B) * (cross + back * 0.5)
+            + st.drop * bridgeAt(0.5).distanceTo(HUBP);
+    st.laying = 1;
+
+  } else if (f < B.radii.from) {
+    // ---- FRAME. Up from the hub, once round the frame polygon laying the
+    // outer threads and their guy lines, back to the hub.
+    st.drift = 0; st.bridge = 1; st.drop = 1;
+    const up = E.inOutCubic(span(f, 266, 292));
+    const q = 6 * E.inOutCubic(span(f, 292, 392));
+    const home = E.inOutCubic(span(f, 394, 407));
+    st.frameQ = q; st.anchorQ = q + 0.4;
+    const k = Math.min(Math.floor(q), 5), u = clamp(q - k, 0, 1);
+    const p = FRAMEP[k].clone().lerp(FRAMEP[(k + 1) % 6], u);
+    if (up < 1) { st.pos.copy(HUBP).lerp(FRAMEP[0], up); st.fwd.copy(FRAMEP[0]).sub(HUBP).setZ(0).normalize(); }
+    else if (home > 0.001) { st.pos.copy(FRAMEP[0]).lerp(HUBP, home); st.fwd.copy(HUBP).sub(FRAMEP[0]).setZ(0).normalize(); }
+    else set(p, FRAMEP[(k + 1) % 6].x - FRAMEP[k].x, FRAMEP[(k + 1) % 6].y - FRAMEP[k].y);
+    st.dist = 60 + FRAME_PERIM * (q / 6);
+    st.laying = 1;
+
+  } else if (f < B.aux.from) {
+    // ---- RADII. Out along a spoke laying it, back to the hub, out along the
+    // next. Lay order is largest-remaining-gap (see web_solve.py), so she
+    // alternates sides the way a real build does. pow(t, 1.5) starts slow and
+    // accelerates: the first spokes read, the last thirty become a time lapse.
+    st.drift = 0; st.bridge = 1; st.drop = 1; st.frameQ = 6; st.anchorQ = 6;
+    // Mix of linear and quadratic: the opening spokes are slow enough to read
+    // as individual trips, the tail still accelerates into a time lapse. A pure
+    // pow(t,1.5) left the web looking empty for most of the beat.
+    const tq = span(f, 412, 594);
+    const q = WEB.n_radii * (0.45 * tq + 0.55 * tq * tq);
+    const j = Math.min(Math.floor(q), WEB.n_radii - 1), u = clamp(q - j, 0, 1);
+    const [h, r] = RADII[ORDER[j]];
+    const OUT = 0.62;                                    // duty split out : back
+    st.radiiQ = j + Math.min(u / OUT, 1);
+    if (u < OUT) { st.pos.copy(h).lerp(r, u / OUT); st.fwd.copy(r).sub(h).setZ(0).normalize(); }
+    else { st.pos.copy(r).lerp(h, (u - OUT) / (1 - OUT)); st.fwd.copy(h).sub(r).setZ(0).normalize(); }
+    st.dist = 60 + FRAME_PERIM + q * 2 * 15;
+    st.laying = u < OUT ? 1 : 0;
+
+  } else if (f < B.capture.from) {
+    // ---- HUB, then the AUXILIARY SPIRAL: temporary, NOT sticky, laid from the
+    // hub outward at roughly one leg span per turn. It is scaffolding and a
+    // spacing gauge, and it is the part almost nobody knows about.
+    st.drift = 0; st.bridge = 1; st.drop = 1; st.frameQ = 6; st.anchorQ = 6;
+    st.radiiQ = WEB.n_radii;
+    st.hub = E.inOutCubic(span(f, 604, 652));
+    st.aux = E.inOutCubic(span(f, 658, 786));
+    const src = st.aux > 0.001 ? AUX_SRC : hubLine.userData.src;
+    const t = st.aux > 0.001 ? st.aux : st.hub;
+    const p = polyAt(src, t), tg = tangentAt(src, t);
+    set(p, tg[0], tg[1]);
+    st.dist = 60 + FRAME_PERIM + WEB.n_radii * 30 + AUX_LEN * st.aux;
+    st.laying = 1;
+
+  } else if (f < B.dawn.from) {
+    // ---- CAPTURE SPIRAL. Sticky, laid from the OUTSIDE IN, using the
+    // auxiliary spiral as a handrail and spacing reference -- and cutting the
+    // auxiliary away behind her as she passes it. auxRemain is not an animation
+    // curve: it is computed from the radius she has reached, so the scaffold
+    // vanishes exactly where she is.
+    st.drift = 0; st.bridge = 1; st.drop = 1; st.frameQ = 6; st.anchorQ = 6;
+    st.radiiQ = WEB.n_radii; st.hub = 1;
+    st.cap = E.inOutCubic(span(f, 806, 1046));
+    const p = polyAt(CAP_SRC, st.cap), tg = tangentAt(CAP_SRC, st.cap);
+    set(p, tg[0], tg[1]);
+    const rNow = Math.hypot(p.x, p.y);
+    let cnt = 0; while (cnt < AUX_R.length && AUX_R[cnt] < rNow - 0.35) cnt++;
+    st.aux = st.cap < 0.004 ? 1 : clamp(cnt / (AUX_R.length - 1), 0, 1);
+    st.dist = 60 + FRAME_PERIM + WEB.n_radii * 30 + AUX_LEN + CAP_LEN * st.cap;
+    st.laying = 1;
+
+  } else {
+    // ---- FINISHED. Back to the hub and head-down, which is how an orb weaver
+    // waits: gravity assists the drop onto anything that hits the sheet.
+    st.drift = 0; st.bridge = 1; st.drop = 1; st.frameQ = 6; st.anchorQ = 6;
+    st.radiiQ = WEB.n_radii; st.hub = 1; st.cap = 1;
+    let cnt = 0; while (cnt < AUX_R.length && AUX_R[cnt] < Math.hypot(CAP_END.x, CAP_END.y) - 0.35) cnt++;
+    st.aux = clamp(cnt / (AUX_R.length - 1), 0, 1) * (1 - span(f, 1056, 1090));
+    const home = E.inOutCubic(span(f, 1058, 1102));
+    st.pos.copy(CAP_END).lerp(HUBP, home);
+    const d = HUBP.clone().sub(CAP_END).setZ(0).normalize();
+    st.fwd.set(lerp(d.x, 0, home), lerp(d.y, -1, home), 0).normalize();
+    st.dist = 60 + FRAME_PERIM + WEB.n_radii * 30 + AUX_LEN + CAP_LEN
+            + home * CAP_END.distanceTo(HUBP);
+    st.laying = 0;
+  }
+  return st;
+}
+
+/** Camera rig hook -- the template's follow keys resolve against this. */
+const _heroV = new THREE.Vector3();
+function heroAt(frame) {
+  const s = spiderState(frame);
+  return _heroV.set(s.pos.x, s.pos.y, s.pos.z + 0.34);
+}
+
+// ============================================================== POSING THE SPIDER
+const BODY_H = 0.34, STRIDE = 1.25, LIFT = 0.30;
+const WEB_UP = new THREE.Vector3(0, 0, 1);            // the web plane's normal
+const _m4 = new THREE.Matrix4(), _right = new THREE.Vector3();
+const _hip = new THREE.Vector3(), _foot = new THREE.Vector3(), _ank = new THREE.Vector3();
+const _knee = new THREE.Vector3(), _pole = new THREE.Vector3(), _mid = new THREE.Vector3();
+
+function poseSpider(st, frame) {
+  const S = SPIDER;
+  S.root.position.copy(st.pos).addScaledVector(WEB_UP, BODY_H);
+  _right.copy(WEB_UP).cross(st.fwd).normalize();
+  _m4.makeBasis(_right, WEB_UP, st.fwd);
+  S.root.quaternion.setFromRotationMatrix(_m4);
+
+  // Gait phase from distance walked, not from frame: feet then stay planted
+  // through stance because the body advances exactly one STRIDE per cycle.
+  // Where the distance estimate is approximate (the spiral beats) the feet slip
+  // slightly -- invisible at 24 fps behind a 243 deg shutter, and cheaper than
+  // arc-length-parameterising four different paths.
+  const gp = st.dist / STRIDE;
+  S.body.position.set(0, Math.sin(gp * Math.PI * 4) * 0.022, 0);
+  S.body.rotation.set(-st.lift, 0, Math.sin(gp * Math.PI * 2) * 0.045);
+
+  for (const L of S.legs) {
+    // Alternating tetrapod: L1,L3,R2,R4 swing together, then the other four.
+    const off = ((L.p + (L.sx > 0 ? 1 : 0)) % 2) * 0.5;
+    const u = (gp + off) % 1;
+    let fwdOff, lift;
+    if (u < 0.5) { fwdOff = STRIDE * (0.25 - u); lift = 0; }
+    else { const v = (u - 0.5) * 2; fwdOff = STRIDE * (-0.25 + 0.5 * E.inOutCubic(v)); lift = LIFT * Math.sin(v * Math.PI); }
+    if (st.dist < 0.02) { fwdOff = 0; lift = 0; }        // standing still
+
+    _foot.set(L.rest.x + Math.sin(gp * 2.1 + L.p) * 0.03,
+              L.rest.y + lift, L.rest.z + fwdOff);
+    _hip.copy(L.hip);
+    const [L1, L2, L3] = L.L;
+    _ank.set(_foot.x, _foot.y + L3 * 0.86, _foot.z - L3 * 0.18);
+    _pole.set(L.sx * 0.5, 1, 0.12);
+    ik(_hip, _ank, L1, L2, _pole, _knee);
+
+    const r = L.r;
+    _mid.copy(_hip).lerp(_knee, 0.80);
+    setBone(L.m[0], _hip, _mid, r[0][0]);
+    setBone(L.m[1], _mid, _knee, r[1][0]);
+    _mid.copy(_knee).lerp(_ank, 0.78);
+    setBone(L.m[2], _knee, _mid, r[2][0]);
+    setBone(L.m[3], _mid, _ank, r[3][0]);
+    setBone(L.m[4], _ank, _foot, r[4][0]);
+    L.knee.position.copy(_knee);
+  }
+}
+
+/** Soft radial glow sprite. A flat disc reads as a coin; the falloff reads as light. */
+function glowTexture(power = 2.4) {
+  const n = 256, cv = document.createElement('canvas'); cv.width = cv.height = n;
+  const g = cv.getContext('2d');
+  const grd = g.createRadialGradient(n / 2, n / 2, 0, n / 2, n / 2, n / 2);
+  for (let i = 0; i <= 16; i++) {
+    const t = i / 16;
+    grd.addColorStop(t, `rgba(255,255,255,${Math.pow(1 - t, power).toFixed(4)})`);
+  }
+  g.fillStyle = grd; g.fillRect(0, 0, n, n);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.generateMipmaps = false;
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  return tex;
+}
+
+// ============================================================== CAPTIONS
+// Drawn in an ortho overlay so they never pick up DoF, but rendered inside the
+// sub-sample loop so their own motion still gets blurred.
+const capScene = new THREE.Scene();
+const capCam = new THREE.OrthographicCamera(-W / 2, W / 2, H / 2, -H / 2, -500, 500);
+const FONT = '"Helvetica Neue", Helvetica, Arial, sans-serif';
+
+/**
+ * One quad per glyph, so characters can be staggered independently -- a single
+ * texture for the whole line cannot do that.
+ */
+function makeCaption(text, opts = {}) {
+  const { size = 78, weight = 700, tracking = 0.02, color = '#efefef',
+          y = 0, maxWidth = SAFE.x1 - SAFE.x0 } = opts;
+
+  const probe = document.createElement('canvas').getContext('2d');
+  const measure = (px) => {
+    probe.font = `${weight} ${px}px ${FONT}`;
+    probe.letterSpacing = `${(tracking * px).toFixed(2)}px`;
+    return probe.measureText(text).width;
+  };
+  // Auto-fit rather than hand-picking a size: type that overflows the safe box
+  // gets clipped by platform UI.
+  let fit = size;
+  if (measure(fit) > maxWidth) {
+    let lo = 10, hi = size;
+    while (hi - lo > 0.5) { const m = (lo + hi) / 2; if (measure(m) > maxWidth) hi = m; else lo = m; }
+    fit = Math.floor(lo);
+  }
+  probe.font = `${weight} ${fit}px ${FONT}`;
+  probe.letterSpacing = `${(tracking * fit).toFixed(2)}px`;
+  const total = probe.measureText(text).width;
+
+  const group = new THREE.Group();
+  group.position.set(LANE_CX - W / 2, y, 0);
+  capScene.add(group);
+
+  const chars = [];
+  let cursor = -total / 2;
+  const PAD = Math.ceil(fit * 0.42);
+  for (const ch of text) {
+    const adv = probe.measureText(ch).width;
+    if (ch !== ' ') {
+      const cw = Math.ceil(adv) + PAD * 2, chh = Math.ceil(fit * 1.7) + PAD;
+      const cv = document.createElement('canvas'); cv.width = cw; cv.height = chh;
+      const g = cv.getContext('2d');
+      g.font = `${weight} ${fit}px ${FONT}`;
+      g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = color;
+      g.fillText(ch, cw / 2, chh / 2);
+      const tex = new THREE.CanvasTexture(cv);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.minFilter = tex.magFilter = THREE.LinearFilter; tex.generateMipmaps = false;
+      renderer.initTexture(tex);   // else a mid-piece first appearance renders blank
+      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(cw, chh),
+        // Normal alpha, not additive: additive glyph edges compound against the
+        // glow behind them and legibility goes. Bloom supplies the halo.
+        new THREE.MeshBasicMaterial({ map: tex, transparent: true,
+          depthTest: false, depthWrite: false, toneMapped: false }));
+      mesh.position.x = cursor + adv / 2;
+      group.add(mesh);
+      chars.push({ mesh });
+    }
+    cursor += adv;
+  }
+
+  return {
+    group, chars, size: fit, width: total,
+    /** in-window [a,b], out-window [c,d]. Ensure d_in = b + n*stagger < c. */
+    play(f, a, b, c, d) {
+      const n = chars.length || 1;
+      // Cap TOTAL stagger, not per-character: at a fixed 1.15 frames/char a
+      // 28-character line takes 2.4s to land and its exit opens first.
+      const SI = Math.min(1.0, 11 / n), SO = Math.min(0.5, 6 / n);
+      let vis = false;
+      for (let i = 0; i < n; i++) {
+        const m = chars[i].mesh;
+        const pi = clamp((f - a - i * SI) / Math.max(1, b - a), 0, 1);
+        const po = clamp((f - c - i * SO) / Math.max(1, d - c), 0, 1);
+        const ei = E.outQuint(pi), eo = E.inCubic(po);
+        const o = ei * (1 - eo);
+        m.material.opacity = o;
+        m.position.y = (1 - ei) * 46 - eo * 30;
+        m.scale.setScalar((0.82 + 0.18 * ei) * (1 - 0.10 * eo));
+        m.rotation.x = (1 - ei) * -0.95 + eo * 0.5;
+        m.visible = o > 0.003;
+        if (m.visible) vis = true;
+      }
+      group.visible = vis;
+    },
+  };
+}
+
+/** Rule that wipes open under a caption. */
+function makeRule(y, w = 320, color = 0xffb347) {
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 3),
+    new THREE.MeshBasicMaterial({ color: C(color), transparent: true, opacity: 0,
+      depthTest: false, toneMapped: false }));
+  mesh.position.set(LANE_CX - W / 2, y, 0);
+  capScene.add(mesh);
+  return { mesh, play(f, a, b, c, d) {
+    const o = span(f, a, b) > 0 ? 1 - E.inCubic(clamp((f - c) / Math.max(1, d - c), 0, 1)) : 0;
+    mesh.scale.x = w * E.outExpo(span(f, a, b));
+    mesh.material.opacity = o * 0.9;
+    mesh.visible = o > 0.004 && mesh.scale.x > 1;
+  } };
+}
+
+
+
+/**
+ * A field of points -- stars, dust, plasma, photons, particles. Every piece
+ * built with this skill has needed one, and hand-rolling it hits two traps.
+ *
+ * 1. three.js PointsMaterial computes gl_PointSize as `size * (scale / -z)`
+ *    with scale fixed at H/2, which IGNORES the field of view. Animate the fov
+ *    and every point silently keeps the size it had at the old fov. The shader
+ *    below multiplies by projectionMatrix[1][1] (= 1/tan(fov/2)) instead, so
+ *    `size` is a true world-space diameter at any fov.
+ * 2. Density intuition is wrong in 9:16. A 32 deg vertical fov on a portrait
+ *    frame sees roughly 2% of a surrounding sphere, so a "few thousand stars"
+ *    scattered on a shell shows about forty. Budget accordingly, or distribute
+ *    into the visible cone rather than over a full sphere.
+ *
+ * @param opts.shell  scatter on a spherical shell (stars) vs a solid ball (dust)
+ */
+function makePointField(n, opts = {}) {
+  const {
+    radius = 60, inner = 0, size = 0.5, sizeVar = 0.6,
+    color = 0xffffff, opacity = 0.9, shell = false, rng = rnd,
+  } = opts;
+
+  const pos = new Float32Array(n * 3);
+  const sz = new Float32Array(n);
+  const seed = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    // cube-root radial sampling keeps a solid ball uniform in volume; without
+    // it everything piles up at the centre
+    const u = rng(), v = rng(), w = rng();
+    const r = shell ? radius : inner + (radius - inner) * Math.cbrt(w);
+    const th = Math.acos(2 * u - 1), ph = v * Math.PI * 2;
+    pos[i * 3] = r * Math.sin(th) * Math.cos(ph);
+    pos[i * 3 + 1] = r * Math.sin(th) * Math.sin(ph);
+    pos[i * 3 + 2] = r * Math.cos(th);
+    sz[i] = size * (1 - sizeVar + rng() * sizeVar * 2);
+    seed[i] = rng() * 6.283;
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('aSize', new THREE.BufferAttribute(sz, 1));
+  geo.setAttribute('aSeed', new THREE.BufferAttribute(seed, 1));
+
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uH: { value: H }, uOpacity: { value: opacity },
+      uColor: { value: C(color) }, uTwinkle: { value: 0 }, uPhase: { value: 0 },
+    },
+    vertexShader: `
+      attribute float aSize; attribute float aSeed;
+      uniform float uH; varying float vFade;
+      void main() {
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        gl_Position = projectionMatrix * mv;
+        // projectionMatrix[1][1] == 1/tan(fov/2): fov-correct, unlike PointsMaterial
+        gl_PointSize = aSize * (0.5 * uH * projectionMatrix[1][1]) / max(0.001, -mv.z);
+        vFade = aSeed;
+      }`,
+    fragmentShader: `
+      uniform vec3 uColor; uniform float uOpacity, uTwinkle, uPhase;
+      varying float vFade;
+      void main() {
+        vec2 d = gl_PointCoord - 0.5;
+        float a = smoothstep(0.5, 0.06, length(d));       // soft round sprite
+        float tw = 1.0 - uTwinkle * 0.5 * (1.0 + sin(vFade + uPhase));
+        gl_FragColor = vec4(uColor, a * uOpacity * tw);
+      }`,
+    transparent: true, depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+
+  const points = new THREE.Points(geo, mat);
+  points.userData.ignoreClearance = true;   // ambient, never an obstacle
+  return {
+    points, material: mat,
+    set(o = 1, twinkle = 0, phase = 0) {
+      mat.uniforms.uOpacity.value = o;
+      mat.uniforms.uTwinkle.value = twinkle;
+      mat.uniforms.uPhase.value = phase;
+      points.visible = o > 0.004;
+    },
+  };
+}
+
+/**
+ * Scrim: a soft dark gradient behind a caption band. On any scene that is
+ * bright behind the type -- a lit sky, a white flash, a pale subject -- this is
+ * the single biggest legibility fix available, and it costs one quad.
+ */
+function makeScrim(cy, h, color = '#000000') {
+  const n = 256, cv = document.createElement('canvas');
+  cv.width = 4; cv.height = n;
+  const g = cv.getContext('2d');
+  const grd = g.createLinearGradient(0, 0, 0, n);
+  grd.addColorStop(0.00, 'rgba(0,0,0,0)');
+  grd.addColorStop(0.28, 'rgba(0,0,0,0.72)');
+  grd.addColorStop(0.72, 'rgba(0,0,0,0.72)');
+  grd.addColorStop(1.00, 'rgba(0,0,0,0)');
+  g.fillStyle = grd; g.fillRect(0, 0, 4, n);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.generateMipmaps = false;
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(W * 1.1, h),
+    new THREE.MeshBasicMaterial({ map: tex, color: C(parseInt(color.slice(1), 16)),
+      transparent: true, opacity: 0, depthTest: false, depthWrite: false, toneMapped: false }));
+  mesh.position.set(0, cy, -1);      // behind the glyphs in the overlay
+  mesh.renderOrder = -1;
+  capScene.add(mesh);
+  return { mesh, set(v) { mesh.material.opacity = clamp(v, 0, 1); mesh.visible = v > 0.004; } };
+}
+
+/**
+ * A 2D panel drawn with the canvas API and composited in screen space -- graphs,
+ * bars, swatches, axes, legends. Explainers need these constantly and they are
+ * miserable to build out of 3D geometry.
+ *
+ * draw(ctx, w, h) is called once at build. Pass `live: true` and call redraw()
+ * from pose() if the panel animates, but prefer static: redrawing uploads a new
+ * texture every sub-sample, which is 24x per output frame.
+ */
+function makePanel(w, h, draw, opts = {}) {
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const ctx = cv.getContext('2d');
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.generateMipmaps = false;
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  const render = () => { ctx.clearRect(0, 0, w, h); draw(ctx, w, h); tex.needsUpdate = true; };
+  render();
+  renderer.initTexture(tex);
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0,
+      depthTest: false, depthWrite: false, toneMapped: false }));
+  mesh.position.set(opts.x ?? (LANE_CX - W / 2), opts.y ?? 0, 0);
+  capScene.add(mesh);
+  return {
+    mesh, ctx, redraw: render,
+    set(v, dy = 0) {
+      mesh.material.opacity = clamp(v, 0, 1);
+      mesh.position.y = (opts.y ?? 0) + dy;
+      mesh.visible = v > 0.004;
+    },
+  };
+}
+
+/**
+ * A label pinned to a point in the 3D scene but drawn in the overlay, so it
+ * stays crisp instead of being softened by depth of field. Call set() from
+ * pose() AFTER the camera is positioned.
+ */
+function makeAnchoredLabel(text, opts = {}) {
+  const { size = 34, weight = 600, color = '#efefef', tracking = 0.06 } = opts;
+  const cv = document.createElement('canvas');
+  const g = cv.getContext('2d');
+  const font = `${weight} ${size}px ${FONT}`;
+  g.font = font; g.letterSpacing = `${(tracking * size).toFixed(2)}px`;
+  const wpx = Math.ceil(g.measureText(text).width) + 24, hpx = Math.ceil(size * 1.6);
+  cv.width = wpx; cv.height = hpx;
+  g.font = font; g.letterSpacing = `${(tracking * size).toFixed(2)}px`;
+  g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = color;
+  g.fillText(text, wpx / 2, hpx / 2);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.generateMipmaps = false;
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  renderer.initTexture(tex);
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(wpx, hpx),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0,
+      depthTest: false, depthWrite: false, toneMapped: false }));
+  capScene.add(mesh);
+  const _v = new THREE.Vector3();
+  return {
+    mesh,
+    /** @param world THREE.Vector3 anchor  @param off screen-pixel offset */
+    set(world, opacity, off = { x: 0, y: 0 }) {
+      _v.copy(world).project(camera);
+      mesh.position.set(_v.x * W / 2 + off.x, _v.y * H / 2 + off.y, 0);
+      // z > 1 means the anchor is behind the camera; NDC wraps and the label
+      // would appear mirrored on the opposite side of frame.
+      const behind = _v.z > 1;
+      mesh.material.opacity = behind ? 0 : clamp(opacity, 0, 1);
+      mesh.visible = !behind && opacity > 0.004;
+    },
+  };
+}
+
+// >>> AUTHOR <<<  Captions live LOW here, not at the template's +560: the web is
+// the subject and it wants the upper two thirds. Overlay y -300 is screen y
+// 1260 px, y -520 is 1480 px -- both inside the safe box (y 200-1560).
+const CY_HI = -300, CY_LO = -412, CY_FOOT = -516;
+const S = WEB.silk, ST = WEB.stats;
+
+/**
+ * Every line, with its window. `in` is when the headline starts arriving, `out`
+ * when it starts leaving. Sub-lines are offset +16 so the pair staggers.
+ * Longest headline is 34 chars: stagger is capped at 11/n frames total, so a
+ * line is fully in 22 + 11 = 33 frames after `in`, well before any `out`.
+ *
+ * Numbers are interpolated from web.json -- a caption physically cannot drift
+ * from the solve.
+ */
+const SCRIPT = [
+  { in: 12,   out: 100,  hi: 'IT STARTS WITH A THROW',
+                         lo: 'silk paid out into moving air, until it catches' },
+  { in: 134,  out: 248,  hi: 'THE BRIDGE LINE',
+                         lo: 'she walks across it and doubles it' },
+  { in: 280,  out: 396,  hi: 'A FRAME, GUYED TO THE TWIGS',
+                         lo: 'this part she will still be using tomorrow' },
+  { in: 426,  out: 584,  hi: `${WEB.n_radii} SPOKES, CENTRE OUT`,
+                         lo: 'out, anchor, walk back. thirty times.' },
+  { in: 664,  out: 780,  hi: 'THEN A TEMPORARY SPIRAL',
+                         lo: 'not sticky — scaffolding, and a spacing gauge' },
+  { in: 820,  out: 928,  hi: 'THE STICKY ONE GOES ON LAST',
+                         lo: 'laid from the outside in' },
+  { in: 948,  out: 1044, hi: 'AND THE SCAFFOLD COMES OUT',
+                         lo: 'she cuts it away as she passes it' },
+  { in: 1072, out: 1166, hi: 'ABOUT AN HOUR OF WORK',
+                         lo: `${ST.L_permanent_m.toFixed(0)} m of silk · `
+                           + `${(ST.web_diameter_mm / 10).toFixed(0)} cm across · `
+                           + `${WEB.web_mass_mg.toFixed(1)} mg` },
+  { in: 1196, out: 1266, hi: 'A HAIR IS 20 TIMES THICKER',
+                         lo: `dragline silk: ${S.fibre_um} µm` },
+  { in: 1286, out: 1358, hi: 'AND TOUGHER THAN KEVLAR',
+                         lo: 'energy soaked up before it breaks' },
+];
+for (const L of SCRIPT) {
+  L.A = makeCaption(L.hi, { y: CY_HI, size: 80 });
+  L.B = makeCaption(L.lo, { y: CY_LO, size: 40, weight: 500,
+                            color: '#f2c58b', tracking: 0.05 });
+}
+const TITLE = makeCaption("SHE'LL EAT IT AND RESPIN", { y: CY_HI + 26, size: 92, tracking: 0.02 });
+const FOOT  = makeCaption('most nights · araneus diadematus', {
+  y: CY_FOOT + 60, size: 36, weight: 500, color: '#f2c58b', tracking: 0.10 });
+const RULE  = makeRule(CY_HI - 76, 320);   // only used under the title
+const SCRIM = makeScrim(CY_HI - 60, 560);        // behind the caption band
+const SCRIM2 = makeScrim(360, 700);              // behind the data panels
+
+/** Live-ness of the caption band, so the scrim only darkens when type is up. */
+function scriptOpacity(f) {
+  let v = 0;
+  for (const L of SCRIPT) v = Math.max(v, span(f, L.in - 4, L.in + 16) * (1 - span(f, L.out, L.out + 14)));
+  return Math.max(v, span(f, 1378, 1398));
+}
+
+// ---------------------------------------------------------------- data panels
+// Both drawn to TRUE relative scale. The comparison IS the graphic, so a bar or
+// a circle that is not proportional would be the piece lying in the one place a
+// viewer can check it.
+const PANEL_Y = 360, PW = 800, PH = 470;
+const PANEL_FIBRE = makePanel(PW, PH, (g, w, h) => {
+  const hairD = 210, silkD = hairD * (S.fibre_um / S.hair_um);   // exactly 1/20
+  g.textAlign = 'center';
+  g.fillStyle = '#cfd8e8'; g.font = '600 27px ' + FONT; g.letterSpacing = '3px';
+  g.fillText('SHOWN TO SCALE', w / 2, 34);
+  const cxA = w * 0.30, cxB = w * 0.74, cy = h * 0.50;
+  g.strokeStyle = '#8fa2c0'; g.lineWidth = 3;
+  g.beginPath(); g.arc(cxA, cy, hairD / 2, 0, 7); g.stroke();
+  g.fillStyle = 'rgba(143,162,192,0.16)'; g.fill();
+  g.fillStyle = '#ffe6b8';
+  g.beginPath(); g.arc(cxB, cy, Math.max(silkD / 2, 2.5), 0, 7); g.fill();
+  // A ring at 6x, so the eye can find a 10 px dot. Labelled, so the ring is not
+  // mistaken for the fibre.
+  g.strokeStyle = 'rgba(255,214,150,0.42)'; g.lineWidth = 2;
+  g.setLineDash([5, 6]);
+  g.beginPath(); g.arc(cxB, cy, silkD * 3, 0, 7); g.stroke();
+  g.setLineDash([]);
+  g.font = '700 34px ' + FONT; g.letterSpacing = '1px';
+  g.fillStyle = '#e8eef8'; g.fillText('HUMAN HAIR', cxA, cy + hairD / 2 + 58);
+  g.fillStyle = '#ffd79a'; g.fillText('DRAGLINE', cxB, cy + hairD / 2 + 58);
+  g.font = '500 30px ' + FONT;
+  g.fillStyle = '#9fb0c8'; g.fillText(`${S.hair_um} µm`, cxA, cy + hairD / 2 + 96);
+  g.fillStyle = '#c9a877'; g.fillText(`${S.fibre_um} µm`, cxB, cy + hairD / 2 + 96);
+  g.font = '400 22px ' + FONT; g.fillStyle = '#7d8ba3';
+  g.fillText('hair: Wolfram 2003 (60–80 µm) · silk: Araneus adult female', w / 2, h - 12);
+}, { y: PANEL_Y });
+
+const PANEL_TOUGH = makePanel(PW, PH, (g, w, h) => {
+  const rows = [
+    ['SPIDER DRAGLINE', S.toughness_MJm3, '#ffd79a'],
+    ['KEVLAR 49', S.kevlar_toughness_MJm3, '#8fa2c0'],
+    ['HIGH-TENSILE STEEL', S.steel_toughness_MJm3, '#6b7a92'],
+  ];
+  const maxV = rows[0][1], x0 = 34, x1 = w - 44, bh = 54;
+  g.textAlign = 'left';
+  g.fillStyle = '#cfd8e8'; g.font = '600 26px ' + FONT; g.letterSpacing = '3px';
+  g.fillText('TOUGHNESS — MJ PER m³', x0, 34);
+  rows.forEach(([name, v, col], i) => {
+    const y = 92 + i * 118;
+    g.fillStyle = '#e8eef8'; g.font = '700 30px ' + FONT; g.letterSpacing = '1px';
+    g.fillText(name, x0, y);
+    g.fillStyle = 'rgba(255,255,255,0.07)';
+    g.fillRect(x0, y + 14, x1 - x0, bh);
+    g.fillStyle = col;
+    g.fillRect(x0, y + 14, (x1 - x0) * (v / maxV), bh);          // true proportion
+    g.font = '700 34px ' + FONT; g.fillStyle = '#0d1018';
+    const bw = (x1 - x0) * (v / maxV);
+    if (bw > 110) g.fillText(String(v), x0 + 16, y + 14 + bh - 16);
+    else { g.fillStyle = col; g.fillText(String(v), x0 + bw + 16, y + 14 + bh - 16); }
+  });
+  g.font = '400 22px ' + FONT; g.fillStyle = '#7d8ba3';
+  g.fillText('Gosline et al. 1999, J Exp Biol 202, Table 1', x0, h - 12);
+}, { y: PANEL_Y });
+
+// Full-frame flash. Keep it to a few frames -- a flat wash reads as a cheap cut,
+// and a radial burst at the thing that caused it is usually better.
+const flashPlane = new THREE.Mesh(new THREE.PlaneGeometry(4, 4),
+  new THREE.MeshBasicMaterial({ color: C(0xfff0d8), transparent: true, opacity: 0,
+    depthTest: false, toneMapped: false }));
+flashPlane.renderOrder = 999; flashPlane.scale.set(W, H, 1);
+capScene.add(flashPlane);
+
+// ============================================================== POST CHAIN
+const rtOpts = { type: THREE.HalfFloatType, colorSpace: THREE.LinearSRGBColorSpace };
+const sceneTarget = new THREE.WebGLRenderTarget(W, H, { ...rtOpts, samples: 4, depthBuffer: true });
+const accumTarget = new THREE.WebGLRenderTarget(W, H, { ...rtOpts, depthBuffer: false });
+
+const accScene = new THREE.Scene();
+const accCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const accMat = new THREE.ShaderMaterial({
+  uniforms: { tSrc: { value: null }, uW: { value: 1 / SUBSAMPLES } },
+  vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.,1.); }`,
+  // 1/N applied in-shader, not via material opacity: transparent objects in the
+  // scene make opacity-as-weight unreliable.
+  fragmentShader: `uniform sampler2D tSrc; uniform float uW; varying vec2 vUv;
+    void main(){ gl_FragColor = vec4(texture2D(tSrc,vUv).rgb*uW, 1.0); }`,
+  depthTest: false, depthWrite: false,
+  blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor,
+});
+accScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), accMat));
+
+const LookShader = {
+  uniforms: { tDiffuse: { value: null }, uRes: { value: new THREE.Vector2(W, H) },
+              uVig: { value: 0.74 }, uGrain: { value: 0.55 } },
+  vertexShader: `varying vec2 vUv;
+    void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
+  fragmentShader: `
+    uniform sampler2D tDiffuse; uniform vec2 uRes; uniform float uVig, uGrain;
+    varying vec2 vUv;
+    // These constants are in sRGB CODE UNITS but this pass runs before
+    // OutputPass, i.e. in linear space. Adding them raw is a ~13x error near
+    // black. 12.92 is the sRGB linear-segment slope, valid down here.
+    float srgb2lin(float c){ return (c/255.0)/12.92; }
+    float hash(vec2 p){ p=fract(p*vec2(233.34,851.73)); p+=dot(p,p+23.45); return fract(p.x*p.y); }
+    float vnoise(vec2 p){
+      vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+      return mix(mix(hash(i),hash(i+vec2(1,0)),f.x), mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),f.x), f.y);
+    }
+    void main(){
+      vec2 c = vUv-0.5;
+      // Radial chromatic aberration: per-channel scale about frame centre,
+      // separation growing linearly with radius (2.79 px R-B at the corner).
+      vec3 col;
+      col.r = texture2D(tDiffuse, 0.5 + c*1.001369).r;
+      col.g = texture2D(tDiffuse, vUv).g;
+      col.b = texture2D(tDiffuse, 0.5 + c*0.998589).b;
+
+      float r = length(c*vec2(1.0, 0.62));
+      col *= clamp(1.0 - uVig*(r*r*2.15 - 0.06), 0.0, 1.0);
+
+      col += vec3(srgb2lin(3.2), srgb2lin(2.6), srgb2lin(4.4));   // black is not 0
+
+      // Static grain (46.55 px). Static reads as film; animated reads as noise.
+      float n = vnoise(vUv*uRes/46.55) - 0.5;
+      col += vec3(srgb2lin(0.189), srgb2lin(0.24), srgb2lin(0.290))*n*2.0*uGrain*24.0;
+
+      gl_FragColor = vec4(max(col,0.0), 1.0);
+    }`,
+};
+
+const composer = new EffectComposer(renderer);
+composer.setSize(W, H);
+const texPass = new TexturePass(accumTarget.texture);
+composer.addPass(texPass);
+// Threshold is HIGH on purpose. Near zero, every dim pixel enters the mip chain
+// and the frame hazes to milky grey -- the single biggest lever on whether the
+// render looks professional. Threshold and strength are TUNED, not measured.
+const BLOOM_BASE = 0.26;
+const bloom = new UnrealBloomPass(new THREE.Vector2(W, H), BLOOM_BASE, 0.32, 0.70);
+{ // far glow reads violet: blue carries the widest lobes, green only ~73% of blue
+  const tints = [[1,.98,1],[.97,.90,1],[.92,.82,1],[.88,.76,1],[.86,.74,1]]
+    .map(([r, g, b]) => new THREE.Vector3(r, g, b));
+  if (bloom.bloomTintColors) bloom.bloomTintColors = tints;
+  if (bloom.compositeMaterial?.uniforms?.bloomTintColors)
+    bloom.compositeMaterial.uniforms.bloomTintColors.value = tints;
+}
+composer.addPass(bloom);
+composer.addPass(new ShaderPass(LookShader));
+composer.addPass(new OutputPass());
+
+// Halton (2,3) mapped to a disc: aperture offset (depth of field) AND sub-pixel
+// offset (AA), from one fixed table. Not a PRNG -- the render must reproduce.
+const halton = (i, b) => { let f = 1, r = 0, n = i + 1;
+  while (n > 0) { f /= b; r += f * (n % b); n = Math.floor(n / b); } return r; };
+const SAMPLES = Array.from({ length: SUBSAMPLES }, (_, i) => {
+  const u = halton(i, 2), v = halton(i, 3), rr = Math.sqrt(u), th = v * Math.PI * 2;
+  return { dx: Math.cos(th) * rr, dy: Math.sin(th) * rr,
+           jx: halton(i, 5) - .5, jy: halton(i, 7) - .5 };
+});
+
+// ============================================================== CAMERA
+/**
+ * >>> AUTHOR <<<  [frame, x,y,z, tx,ty,tz, aperture, fov, follow]
+ *
+ * follow=1 makes position and target OFFSETS from the subject instead of world
+ * coordinates. This matters beyond convenience: the focal plane sits on the
+ * TARGET, so a target that drifts off the subject renders it soft. Each key is
+ * resolved at the current frame and only then interpolated, so follow and
+ * locked-off keys blend cleanly.
+ *
+ * Portrait is narrow: half-width is d*tan(fov/2)*(9/16) -- about 1.18 units at
+ * d=7, fov=32. Keep offsets generous or a fast subject exits the side.
+ */
+//
+// Distances here are sized for the web: at fov 33 the half-width is
+// d*tan(16.5)*(9/16) = 0.166*d, so the whole 31-unit-radius web needs d ~ 95
+// and a spider-filling close-up needs d ~ 13. Everything in between is one
+// continuous move -- there are no cuts in this piece.
+const CAMKEYS = [
+  [0,    -8.0, 3.2, 11.5,   0.0, 0.25, 0,  0.09, 34, 1],   // front-3/4 on the twig
+  [118,  -9.0, 4.0, 15.5,   0.0, 0.20, 0,  0.13, 34, 1],
+  [206,   5.0, 2.6, 20.0,   0,   0,    0,  0.16, 34, 1],   // walking the bridge
+  [263,   7.5, 3.8, 32.0,   0,   0,    0,  0.24, 33, 1],   // the drop to the hub
+  [340,   8.0, 4.0, 34.0,   0,   0,    0,  0.24, 33, 1],
+  [407,  20.0, 8.0, 72.0,   0,   0,    0,  0.40, 33, 0],   // frame + radii, wide
+  [520,  15.0, 6.0, 74.0,   0,   0,    0,  0.40, 33, 0],
+  [599,   8.0, 4.0, 70.0,   0,   0,    0,  0.38, 33, 0],
+  [700,   3.0, 2.2, 31.0,   0,   0,    0,  0.20, 33, 1],   // in on the scaffold
+  [791,   2.8, 1.9, 32.0,   0,   0,    0,  0.19, 33, 1],
+  [900,   3.6, 2.4, 37.0,   0,   0,    0,  0.22, 33, 1],   // riding the capture spiral
+  // Follow -> locked. Each key is resolved at the current frame and only then
+  // interpolated, and because she is spiralling in toward the hub the two
+  // targets converge rather than the camera aiming at nothing mid-blend.
+  [1010,  8.0, 3.0, 74.0,   0,   0,    0,  0.40, 33, 0],
+  [1120, -3.0, 1.5, 100.0,  0,   0,    0,  0.55, 32, 0],   // finished, near face-on
+  [1175, -4.0, 2.5, 114.0,  0,   2.5,  0,  0.55, 32, 0],
+  [1240, -6.0, 6.0, 124.0,  0,   6.0,  0,  0.55, 32, 0],   // web pushed low for panels
+  [1367, -9.0, 6.0, 126.0,  0,   6.0,  0,  0.55, 32, 0],
+  [1439, -16.0, 4.0, 138.0, 0,   2.0,  0,  0.60, 34, 0],
+];
+const _kp = new THREE.Vector3(), _kt = new THREE.Vector3();
+const _pA = new THREE.Vector3(), _tA = new THREE.Vector3();
+function resolveKey(K, frame, outP, outT) {
+  if (K[9]) {
+    const s = heroAt(frame);
+    outP.set(s.x + K[1], s.y + K[2], s.z + K[3]);
+    outT.set(s.x + K[4], s.y + K[5], s.z + K[6]);
+  } else {
+    outP.set(K[1], K[2], K[3]);
+    outT.set(K[4], K[5], K[6]);
+  }
+}
+function camAt(frame) {
+  let i = 0;
+  while (i < CAMKEYS.length - 2 && frame > CAMKEYS[i + 1][0]) i++;
+  const A = CAMKEYS[i], B = CAMKEYS[i + 1];
+  const t = E.inOutCubic(span(frame, A[0], B[0]));
+  resolveKey(A, frame, _pA, _tA);
+  resolveKey(B, frame, _kp, _kt);
+  return { pos: _pA.clone().lerp(_kp, t), tgt: _tA.clone().lerp(_kt, t),
+           ap: lerp(A[7], B[7], t), fov: lerp(A[8], B[8], t) };
+}
+
+// ============================================================== POSE
+const UP = new THREE.Vector3(0, 1, 0), ZERO = new THREE.Vector3();
+const _cF = new THREE.Vector3(), _cR = new THREE.Vector3(), _cU = new THREE.Vector3();
+const _sunP = new THREE.Vector3(), _sunP2 = new THREE.Vector3();
+const _wind = new THREE.Vector3(), _perp = new THREE.Vector3();
+const _wv = new THREE.Vector3(), _up0 = new THREE.Vector3();
+// Sky colours pre-resolved: C() allocates, and pose() runs 24x per output frame.
+const KN = { top: C(SKY_NIGHT.top), mid: C(SKY_NIGHT.mid), hor: C(SKY_NIGHT.hor), glow: C(SKY_NIGHT.glow) };
+const KD = { top: C(SKY_DAWN.top), mid: C(SKY_DAWN.mid), hor: C(SKY_DAWN.hor), glow: C(SKY_DAWN.glow) };
+
+function pose(frame, sample) {
+  const F = Math.floor(frame + 1e-6);
+  const beat = beatAt(frame);
+
+  // ---- camera + accumulation depth of field. Offsetting the eye across the
+  // aperture and re-aiming at the same target keeps that plane sharp and blurs
+  // everything off it: real DoF, free, because the samples already exist.
+  const ck = camAt(frame);
+  camera.fov = ck.fov;
+  _cF.subVectors(ck.tgt, ck.pos).normalize();
+  _cR.crossVectors(_cF, UP).normalize();
+  _cU.crossVectors(_cR, _cF).normalize();
+  camera.position.copy(ck.pos)
+    .addScaledVector(_cR, sample.dx * ck.ap)
+    .addScaledVector(_cU, sample.dy * ck.ap);
+  camera.lookAt(ck.tgt);
+  camera.setViewOffset(W, H, sample.jx, sample.jy, W, H);   // sub-pixel AA
+  camera.updateProjectionMatrix();
+
+  // Same pose, no aperture offset -- keeps sub-pixel jitter (so AA still works)
+  // and full parallax, but no bokeh multiplication of distant points.
+  bgCamera.fov = ck.fov;
+  bgCamera.position.copy(ck.pos);
+  bgCamera.lookAt(ck.tgt);
+  bgCamera.setViewOffset(W, H, sample.jx, sample.jy, W, H);
+  bgCamera.updateProjectionMatrix();
+
+  // ---- >>> AUTHOR: scene state. Everything written, never accumulated.
+
+  // Dawn. The sun climbs from below the horizon to ~2 deg above it, arriving
+  // just as the capture spiral closes -- the light and the payoff land together.
+  const dawn = E.inOutCubic(span(frame, 840, 1120));
+  SUN_DIR.set(-0.11, lerp(-0.17, 0.035, dawn), -0.99).normalize();
+  skyU.uSun.value.copy(SUN_DIR);
+  skyU.uTop.value.copy(KN.top).lerp(KD.top, dawn);
+  skyU.uMid.value.copy(KN.mid).lerp(KD.mid, dawn);
+  skyU.uHor.value.copy(KN.hor).lerp(KD.hor, dawn);
+  skyU.uGlow.value.copy(KN.glow).lerp(KD.glow, dawn);
+  skyU.uSunI.value = lerp(SKY_NIGHT.i, SKY_DAWN.i, dawn);
+  backlight.position.copy(SUN_DIR).multiplyScalar(-600);
+  backlight.intensity = lerp(0.8, 3.4, dawn);
+  // Boosted through the beats where she is the subject at close range: at
+  // pre-dawn levels she is a black lump on a black web.
+  frontfill.intensity = lerp(1.9, 0.75, dawn)
+                      + 1.5 * span(frame, 560, 640) * (1 - span(frame, 980, 1060));
+  ambient.intensity = lerp(0.9, 1.5, dawn);
+  STARS.set(0.80 * (1 - E.outQuad(span(frame, 820, 1040))), 0.45, frame * 0.05);
+
+  // Where the sun lands on screen, for the silk backlight shader. Taken from a
+  // point 5000 units down the sun direction rather than from the dome, so it is
+  // correct for whatever fov and aperture offset this sub-sample has.
+  _sunP.copy(camera.position).addScaledVector(SUN_DIR, 5000).project(camera);
+  SUN_NDC.set(_sunP.x, _sunP.y);
+
+  // ---- the build
+  const st = spiderState(frame);
+  poseSpider(st, frame);
+
+  const on = clamp(span(frame, 92, 118), 0, 1);
+  M_STRUCT.uniforms.uOpacity.value = 0.96 * on;
+  M_HUB.uniforms.uOpacity.value = 0.90;
+  M_CAP.uniforms.uOpacity.value = 0.92;
+  M_AUX.uniforms.uOpacity.value = 0.72 * (st.aux > 0.02 ? 1 : 0);
+  M_DRAG.uniforms.uOpacity.value = 0.95;
+  for (const m of ALL_SILK) m.uniforms.uHeat.value = lerp(0.55, 1.0, dawn);
+
+  revealPoly(bridgeLine, st.bridge);
+  revealSegs(frameSegs, st.frameQ, 6);
+  revealSegs(anchorSegs, st.anchorQ, 6);
+  revealSegs(radiiSegs, st.radiiQ, WEB.n_radii);
+  revealPoly(dropLine, st.drop);
+  revealPoly(hubLine, st.hub);
+  revealPoly(auxLine, st.aux);
+  revealPoly(capLine, st.cap);
+  bridgeLine.visible = bridgeLine.visible && st.bridge > 0.01;
+  dropLine.visible = dropLine.visible && st.drop > 0.01;
+  auxLine.visible = auxLine.visible && st.aux > 0.02;
+  capLine.visible = capLine.visible && st.cap > 0.002;
+  // Zschokke & Vollrath: after the sticky spiral she bites out and eats the
+  // CENTRE of the hub and replaces it with a few threads. Removing from index 0
+  // outward is exactly that, because the hub spiral is stored innermost-first.
+  {
+    const src = hubLine.userData.src;
+    const bite = Math.floor(E.outCubic(span(frame, 1062, 1104)) * 36);
+    if (st.hub >= 1 && bite > 0) hubLine.geometry.setDrawRange(bite, src.length - bite);
+  }
+
+  // ---- the thread currently being paid out, spinnerets to last anchor point.
+  SPIDER.root.updateMatrixWorld(true);
+  SPIDER.spin.getWorldPosition(_sunP2);
+  const tail = spiderState(Math.max(0, frame - 9)).pos;
+  const dsrc = dragLine.userData.src;
+  for (let i = 0; i < dsrc.length; i++) {
+    const t = i / (dsrc.length - 1);
+    dsrc[i].lerpVectors(_sunP2, tail, t);
+    dsrc[i].y -= Math.sin(t * Math.PI) * 0.10 * _sunP2.distanceTo(tail);
+  }
+  dragLine.geometry.setFromPoints(dsrc);
+  dragLine.geometry.setDrawRange(0, dsrc.length);
+  dragLine.visible = st.laying > 0.5 && _sunP2.distanceTo(tail) > 0.15;
+
+  // ---- the first thread of all: silk let out into the air. Waves travel down
+  // it while it is loose; as it snags, the whole shape lerps onto the taut
+  // bridge line, which is the "catch" beat.
+  if (st.drift > 0.002) {
+    const src = driftLine.userData.src;
+    const len = BRIDGE_A.distanceTo(BRIDGE_B) * 1.04;
+    _wind.copy(BRIDGE_B).sub(BRIDGE_A).setZ(len * 0.22).normalize();
+    _perp.set(-_wind.y, _wind.x, 0).normalize();
+    for (let i = 0; i < DRIFT_N; i++) {
+      const t = i / (DRIFT_N - 1), a = t * len;
+      _wv.copy(_sunP2).addScaledVector(_wind, a)
+         .addScaledVector(_perp, Math.sin(t * 5.6 - frame * 0.10) * 1.9 * t * t)
+         .add(_up0.set(0, -a * a * 0.010, Math.cos(t * 3.9 - frame * 0.075) * 2.4 * t * t));
+      src[i].copy(_wv).lerp(bridgeAt(t), E.inOutCubic(st.bridge));
+    }
+    driftLine.geometry.setFromPoints(src);
+  }
+  revealPoly(driftLine, st.drift);
+  driftLine.visible = st.drift > 0.01 && st.bridge < 0.995;
+
+  // ---- droplets. Glue beads ride the capture thread as it is laid; dew
+  // condenses onto the radii at first light.
+  DROPS_CAP.u.uReveal.value = st.cap;
+  DROPS_CAP.u.uOpacity.value = 0.42 * clamp(span(frame, 800, 830), 0, 1);
+  DROPS_CAP.u.uDew.value = 0.8 * dawn;
+  DROPS_RAD.u.uOpacity.value = 0.30 * span(frame, 1070, 1160);
+  DROPS_RAD.u.uDew.value = 0.5 * dawn;
+
+  // ---- >>> AUTHOR: captions. play(frame, inStart, inEnd, outStart, outEnd).
+  SCRIM.set(0.88 * scriptOpacity(frame));
+  for (const L of SCRIPT) {
+    L.A.play(frame, L.in, L.in + 22, L.out, L.out + 14);
+    L.B.play(frame, L.in + 16, L.in + 38, L.out, L.out + 14);
+  }
+  PANEL_FIBRE.set(span(frame, 1190, 1212) * (1 - span(frame, 1262, 1278)),
+                  (1 - E.outCubic(span(frame, 1190, 1212))) * -26);
+  PANEL_TOUGH.set(span(frame, 1280, 1302) * (1 - span(frame, 1352, 1366)),
+                  (1 - E.outCubic(span(frame, 1280, 1302))) * -26);
+  SCRIM2.set(0.90 * Math.max(span(frame, 1186, 1206) * (1 - span(frame, 1262, 1276)),
+                             span(frame, 1276, 1298) * (1 - span(frame, 1352, 1366))));
+  TITLE.play(frame, 1378, 1400, 1900, 1920);
+  FOOT.play(frame, 1398, 1420, 1900, 1920);
+  RULE.play(frame, 1392, 1412, 1900, 1920);
+
+  flashPlane.material.opacity = 0;
+  flashPlane.visible = false;
+
+  return beat;
+}
+
+// ============================================================== RENDER
+function renderAtTime(frame) {
+  const beat = beatAt(frame);
+
+  // render() honours autoClear, so leaving it on here wipes the accumulator
+  // before each additive blend -- the frame comes out at 1/N brightness.
+  renderer.autoClear = false;
+  renderer.setRenderTarget(accumTarget);
+  renderer.setClearColor(0x000000, 1);
+  renderer.clear(true, true, true);
+
+  for (let s = 0; s < SUBSAMPLES; s++) {
+    pose(frame + (s / SUBSAMPLES) * SHUTTER, SAMPLES[s]);
+    renderer.setRenderTarget(sceneTarget);
+    renderer.clear(true, true, true);
+    renderer.render(bgScene, bgCamera);     // backdrop first, no aperture offset
+    renderer.render(scene, camera);         // no clear between: composite in order
+    renderer.render(capScene, capCam);
+    accMat.uniforms.tSrc.value = sceneTarget.texture;
+    renderer.setRenderTarget(accumTarget);
+    renderer.render(accScene, accCam);
+  }
+
+  renderer.setRenderTarget(null);
+  renderer.autoClear = true;
+  // Motion blur is accumulated BEFORE the post chain: the smear happens at the
+  // shutter, the glow happens after -- and it is N times cheaper.
+  bloom.strength = BLOOM_BASE * (beat.bloom ?? 1);
+  texPass.map = accumTarget.texture;
+  composer.render();
+}
+
+const _sph = new THREE.Sphere();
+/**
+ * Does the camera fly through anything? Sampling the path and measuring the
+ * nearest surface catches "the camera passes through the subject and fills the
+ * frame with one blown-out object" in a second, instead of after a full render.
+ *
+ * Skips objects larger than `envRadius` (ground planes, sky domes -- the camera
+ * is always inside those) and anything with userData.ignoreClearance. Instanced
+ * meshes report their base geometry, not per-instance, so treat them as a hint.
+ */
+function cameraClearance(stride = 6, warn = 1.5, envRadius = 60) {
+  const hits = [];
+  for (let f = 0; f < FRAMES; f += stride) {
+    pose(f, SAMPLES[0]);
+    scene.updateMatrixWorld(true);
+    const ck = camAt(f);
+    let min = Infinity, who = '';
+    scene.traverse((o) => {
+      if (!o.isMesh || !o.visible || o.userData.ignoreClearance) return;
+      if (!o.geometry.boundingSphere) o.geometry.computeBoundingSphere();
+      _sph.copy(o.geometry.boundingSphere).applyMatrix4(o.matrixWorld);
+      if (_sph.radius > envRadius) return;
+      const d = ck.pos.distanceTo(_sph.center) - _sph.radius;
+      if (d < min) { min = d; who = o.name || o.geometry.type; }
+    });
+    if (min < warn) hits.push({ frame: f, clearance: +min.toFixed(2), object: who });
+  }
+  return hits;
+}
+
+window.__piece = {
+  frames: FRAMES, fps: FPS,
+  seek: (f) => renderAtTime(f),
+  cameraClearance,
+  /** The same frame must render identically twice, seeking away in between. */
+  async determinismCheck(f = Math.floor(FRAMES * 0.6)) {
+    const grab = () => { renderAtTime(f); return renderer.domElement.toDataURL('image/png'); };
+    const a = grab(); renderAtTime(0); const b = grab();
+    return a === b;
+  },
+};
+
+if (new URLSearchParams(location.search).has('render')) {
+  document.body.classList.add('render');
+  renderAtTime(0);
+} else {
+  const t0 = performance.now();
+  const loop = () => { renderAtTime(((performance.now() - t0) / 1000) * FPS % FRAMES);
+                       requestAnimationFrame(loop); };
+  loop();
+}
+window.__ready = true;
+</script>
+</body>
+</html>

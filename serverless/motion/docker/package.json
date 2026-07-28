@@ -1,0 +1,23 @@
+{
+  "name": "iris-motion-renderer",
+  "version": "1.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "comment": [
+    "three is pinned exactly: the pieces' importmap is written against 0.181's",
+    "addon layout (three/addons/postprocessing/OutputPass.js).",
+    "puppeteer-core is pinned exactly because three of render.mjs's assumptions",
+    "are launcher-version-specific: `headless: 'shell'` maps to --headless,",
+    "--disable-dev-shm-usage is a default arg, and PUPPETEER_DANGEROUS_NO_SANDBOX",
+    "is what puts --no-sandbox in the argv. 25.4.0 does all three. Eight render",
+    "shards must agree frame for frame, so neither of these floats."
+  ],
+  "dependencies": {
+    "three": "0.181.2",
+    "puppeteer-core": "25.4.0"
+  }
+}

@@ -1,0 +1,1030 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>cmb</title>
+<style>
+  html,body{margin:0;padding:0;background:#000;overflow:hidden;height:100%}
+  #stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  canvas{display:block;max-width:100vw;max-height:100vh}
+  body.render #stage{align-items:flex-start;justify-content:flex-start}
+  body.render canvas{max-width:none;max-height:none}
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "/node_modules/three/build/three.module.js",
+    "three/addons/": "/node_modules/three/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="stage"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { TexturePass } from 'three/addons/postprocessing/TexturePass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+/* ============================================================================
+   THE COSMIC MICROWAVE BACKGROUND -- 60 s / 1440 frames / 1080x1920 / 24 fps
+
+   Every number on screen comes from data/cmb.json, which solve.py writes from a
+   CAMB Boltzmann solve seeded with Planck 2018 parameters plus CODATA
+   constants. Nothing here hard-codes a physical value; caption strings are
+   interpolated from D so a caption cannot drift from the solve.
+
+   pose(frame) is PURE in frame -- no accumulation, no wall clock, no PRNG.
+   ========================================================================== */
+
+const W = 1080, H = 1920, FPS = 24;
+const FRAMES = 1440;
+const SUBSAMPLES = 24;
+const SHUTTER = 0.675;                               // ~243deg
+
+const SAFE = { x0: 60, x1: 900, y0: 200, y1: 1560 };
+const LANE_CX = (SAFE.x0 + SAFE.x1) / 2;             // 480
+
+// ---------------------------------------------------------------- easing
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const span = (t, a, b) => clamp((t - a) / (b - a), 0, 1);
+const E = {
+  linear: t => t,
+  outQuad: t => 1 - (1 - t) ** 2,
+  inQuad: t => t * t,
+  inCubic: t => t ** 3,
+  outCubic: t => 1 - (1 - t) ** 3,
+  outQuart: t => 1 - (1 - t) ** 4,
+  outQuint: t => 1 - (1 - t) ** 5,
+  inOutCubic: t => (t < .5 ? 4 * t ** 3 : 1 - (-2 * t + 2) ** 3 / 2),
+  outExpo: t => (t >= 1 ? 1 : 1 - Math.pow(2, -10 * t)),
+  outSoft: t => 1 - Math.pow(1 - t, 3.4),
+};
+const ease = (f, a, b, fn = E.inOutCubic) => fn(span(f, a, b));
+/** Smooth pulse: 0 -> 1 over [a,b], 1 -> 0 over [c,d]. */
+const pulse = (f, a, b, c, d) => E.outCubic(span(f, a, b)) * (1 - E.inCubic(span(f, c, d)));
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+/** Build-time only. Never called from pose(). */
+const rnd = mulberry32(0x0CB9E51);
+
+/** sRGB -> THREE.Color. THREE.Color(r,g,b) treats floats as ALREADY LINEAR. */
+const C = (hex) => new THREE.Color().setHex(hex, THREE.SRGBColorSpace);
+
+// ============================================================== DATA
+const D = await (await fetch('data/cmb.json')).json();
+const loadImg = (src) => new Promise((res, rej) => {
+  const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = src;
+});
+
+// Every number the piece shows, read from the solve -- never retyped.
+const N = {
+  tStarYr: D.recomb.t_star_yr,
+  tStarRound: D.recomb.t_star_kyr_round * 1000,
+  zStar: Math.round(D.recomb.z_star),
+  TStar: D.recomb.T_star_K,
+  T0: D.today.T0_K,
+  stretch: D.stretch,
+  lamPeak: D.today.lam_peak_mm,
+  nuPeak: D.today.nu_peak_GHz,
+  ppm: D.today.firas_ppm,
+  rms: D.aniso.rms_uK,
+  partIn: D.aniso.one_part_in,
+  clip: D.aniso.clip_uK,
+  age: D.today.age_Gyr,
+};
+const commas = (n) => Math.round(n).toLocaleString('en-US');
+
+// ============================================================== BEAT TABLE
+const BEATS = [
+  // A threshold-free bloom scales with lit AREA as well as radiance, so the
+  // dense beats need less gain than the sparse ones. Tuned, not measured.
+  { id: 'plasma',   from: 0,    to: 263,  bloom: 0.80 },   //  0.0 - 11.0 s
+  { id: 'recomb',   from: 264,  to: 527,  bloom: 0.85 },   // 11.0 - 22.0 s
+  { id: 'stretch',  from: 528,  to: 815,  bloom: 1.00 },   // 22.0 - 34.0 s
+  { id: 'spectrum', from: 816,  to: 1043, bloom: 1.00 },   // 34.0 - 43.5 s
+  { id: 'ripples',  from: 1044, to: 1307, bloom: 0.60 },   // 43.5 - 54.5 s
+  { id: 'title',    from: 1308, to: 1439, bloom: 0.70 },   // 54.5 - 60.0 s
+];
+const beatAt = (frame) => {
+  const f = Math.floor(frame + 1e-6);
+  return BEATS.find(b => f >= b.from && f <= b.to) || BEATS[BEATS.length - 1];
+};
+
+// ============================================================== RENDERER
+const renderer = new THREE.WebGLRenderer({
+  antialias: false, preserveDrawingBuffer: true, powerPreference: 'high-performance',
+});
+renderer.setPixelRatio(1);
+renderer.setSize(W, H);
+renderer.setClearColor(0x000000, 1);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.10;
+document.getElementById('stage').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+// Fog IS the physics here: an opaque plasma is literally a scattering medium.
+// Density is animated in pose() from thick to zero. Tuned against the camera
+// distance (26-42 units): e^(-0.038*44) = 0.19 across the far side of the cloud.
+scene.fog = new THREE.FogExp2(C(0x2a0d08).getHex(), 0.038);
+const camera = new THREE.PerspectiveCamera(42, W / H, 0.4, 3000);
+
+// ============================================================== GLOW SPRITES
+function glowTexture(power = 2.6, n = 128) {
+  const cv = document.createElement('canvas'); cv.width = cv.height = n;
+  const g = cv.getContext('2d');
+  const grd = g.createRadialGradient(n / 2, n / 2, 0, n / 2, n / 2, n / 2);
+  for (let i = 0; i <= 16; i++) {
+    const t = i / 16;
+    grd.addColorStop(t, `rgba(255,255,255,${Math.pow(1 - t, power).toFixed(4)})`);
+  }
+  g.fillStyle = grd; g.fillRect(0, 0, n, n);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.generateMipmaps = false;
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  renderer.initTexture(tex);
+  return tex;
+}
+const GLOW = glowTexture(2.6);
+const GLOW_TIGHT = glowTexture(4.2);
+
+// ====================================================== THE PLASMA / ATOMS
+// One shared position buffer, two point clouds over it: hot ionised particles,
+// and the neutral atoms they become. Cross-fading two materials avoids
+// rewriting 2600 per-instance colours on every one of 24 sub-samples.
+// SIZING POINTS. three's size attenuation is gl_PointSize = size * (scale/-z)
+// with scale = H/2 = 960 -- it does NOT involve the FOV. So the on-screen size
+// is size*960/distance px, which is ~2.6x smaller than the geometric projection
+// at fov 42 would suggest. Getting this wrong first put 240 px blobs across the
+// lens, then made the star field so small (4 px) that the dead-frame gate fired
+// on a frame that was supposed to be full of stars.
+const NPART = 5200;
+const PLASMA_R = 11;
+const partPos = new Float32Array(NPART * 3);
+const partSeed = new Float32Array(NPART * 3);
+for (let i = 0; i < NPART; i++) {
+  const u = rnd(), v = rnd(), w = rnd();
+  const r = PLASMA_R * Math.pow(u, 0.40);
+  const ct = 2 * v - 1, st = Math.sqrt(1 - ct * ct), ph = w * Math.PI * 2;
+  partPos[i * 3] = r * st * Math.cos(ph);
+  partPos[i * 3 + 1] = r * st * Math.sin(ph);
+  partPos[i * 3 + 2] = r * ct;
+  partSeed[i * 3] = rnd() * 6.283;
+  partSeed[i * 3 + 1] = 0.4 + rnd() * 1.6;
+  partSeed[i * 3 + 2] = rnd() * 6.283;
+}
+const partGeom = new THREE.BufferGeometry();
+partGeom.setAttribute('position', new THREE.BufferAttribute(partPos.slice(), 3));
+partGeom.boundingSphere = new THREE.Sphere(new THREE.Vector3(), PLASMA_R + 2);
+
+const hotMat = new THREE.PointsMaterial({
+  map: GLOW, color: C(0xffe2bc), size: 0.80, sizeAttenuation: true,
+  transparent: true, opacity: 0.30, depthWrite: false, fog: true,
+});
+const coldMat = new THREE.PointsMaterial({
+  map: GLOW, color: C(0x7d9ed0), size: 0.85, sizeAttenuation: true,
+  transparent: true, opacity: 0.0, depthWrite: false, fog: true,
+});
+const hotPts = new THREE.Points(partGeom, hotMat);
+const coldPts = new THREE.Points(partGeom, coldMat);
+hotPts.frustumCulled = false; coldPts.frustumCulled = false;
+scene.add(hotPts, coldPts);
+const partAttr = partGeom.getAttribute('position');
+
+// A far, sparse field so the frame is never empty once the plasma has gone --
+// the first cut went fully black at f816 between the plasma fading and the
+// spectrum panel arriving, which the dead-frame gate caught.
+const NSTAR = 9000;
+const starPos = new Float32Array(NSTAR * 3);
+for (let i = 0; i < NSTAR; i++) {
+  const r = 70 + rnd() * 450;
+  const ct = 2 * rnd() - 1, st = Math.sqrt(1 - ct * ct), ph = rnd() * Math.PI * 2;
+  starPos[i * 3] = r * st * Math.cos(ph);
+  starPos[i * 3 + 1] = r * st * Math.sin(ph);
+  starPos[i * 3 + 2] = r * ct;
+}
+const starGeom = new THREE.BufferGeometry();
+starGeom.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
+starGeom.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 540);
+const starMat = new THREE.PointsMaterial({
+  map: GLOW, color: C(0xc2d2ee), size: 2.6, sizeAttenuation: true,
+  transparent: true, opacity: 0, depthWrite: false, fog: false,
+});
+const starPts = new THREE.Points(starGeom, starMat);
+starPts.frustumCulled = false;
+scene.add(starPts);
+
+// ====================================================== PHOTON TRAJECTORIES
+// The hero image: a photon random-walks while the universe is ionised, then --
+// at recombination -- stops scattering and flies straight ever after. The walk
+// is a real seeded random walk built once; the exit is a straight ray. Revealed
+// with setDrawRange, which for a TubeGeometry runs along the tube because its
+// indices are ordered by tubular segment.
+const NPHOT = 6;
+const WALK_STEPS = 96, WALK_LEN = 0.70, RAY_LEN = 340, TUBE_SEG = 300, RAD_SEG = 8;
+const IDX_PER_SEG = RAD_SEG * 6;
+const photons = [];
+for (let p = 0; p < NPHOT; p++) {
+  const pts = [];
+  const cur = new THREE.Vector3((rnd() - .5) * 3, (rnd() - .5) * 3, (rnd() - .5) * 3);
+  pts.push(cur.clone());
+  for (let s = 0; s < WALK_STEPS; s++) {
+    const ct = 2 * rnd() - 1, st = Math.sqrt(1 - ct * ct), ph = rnd() * Math.PI * 2;
+    const step = WALK_LEN * (0.55 + rnd() * 0.9);
+    cur.x += step * st * Math.cos(ph);
+    cur.y += step * st * Math.sin(ph);
+    cur.z += step * ct;
+    // Weak confinement. The real medium is uniform; recentring is a STAGING
+    // choice so the walk stays inside the plasma ball, applied as a pull
+    // rather than a wall.
+    if (cur.length() > 6.0) cur.multiplyScalar(0.945);
+    pts.push(cur.clone());
+  }
+  const exitDir = new THREE.Vector3(rnd() - .5, (rnd() - .5) * 0.75, rnd() - .5).normalize();
+  exitDir.addScaledVector(cur.clone().normalize(), 0.85).normalize();
+  for (let k = 1; k <= 24; k++) pts.push(cur.clone().addScaledVector(exitDir, RAY_LEN * (k / 24)));
+
+  const curve = new THREE.CatmullRomCurve3(pts, false, 'catmullrom', 0.15);
+  const lens = curve.getLengths(600);
+  const total = lens[lens.length - 1];
+  let walkArc = 0;
+  for (let i = 1; i <= WALK_STEPS; i++) walkArc += pts[i].distanceTo(pts[i - 1]);
+  const uWalk = clamp(walkArc / total, 0.05, 0.9);
+
+  const mat = new THREE.MeshBasicMaterial({
+    color: new THREE.Color(0.62, 0.42, 0.25),  // >1 on purpose: linear, feeds bloom
+    transparent: true, opacity: 0, depthWrite: false, fog: false,
+    blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+  });
+  const mesh = new THREE.Mesh(new THREE.TubeGeometry(curve, TUBE_SEG, 0.055, RAD_SEG, false), mat);
+  mesh.frustumCulled = false;
+  mesh.userData.ignoreClearance = true;   // a thin tube's bounding sphere is meaningless
+  scene.add(mesh);
+
+  const head = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: GLOW_TIGHT, color: new THREE.Color(2.0, 1.55, 1.05), transparent: true,
+    opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending, fog: false,
+  }));
+  head.scale.setScalar(0.9);
+  scene.add(head);
+
+  photons.push({ curve, mesh, mat, head, uWalk, phase: rnd() });
+}
+
+// ====================================================== SKY SPHERE
+const skyTex = await new THREE.TextureLoader().loadAsync('data/sky_equirect.png');
+skyTex.colorSpace = THREE.SRGBColorSpace;
+skyTex.minFilter = skyTex.magFilter = THREE.LinearFilter;
+skyTex.generateMipmaps = false;
+renderer.initTexture(skyTex);
+const skyMat = new THREE.MeshBasicMaterial({
+  map: skyTex, side: THREE.BackSide, transparent: true, opacity: 0, fog: false,
+});
+const skySphere = new THREE.Mesh(new THREE.SphereGeometry(600, 64, 48), skyMat);
+skySphere.frustumCulled = false;
+skySphere.userData.ignoreClearance = true;   // the camera is meant to be inside it
+scene.add(skySphere);
+
+// ====================================================== STRUCTURE SEEDS
+// Sachs-Wolfe on large scales gives dT/T = -Phi/3, so the COLD spots are the
+// OVERDENSE ones. Seeds are therefore taken from the lowest cells of the
+// smoothed map, not the highest.
+const SG = D.seedgrid;
+const order = Array.from({ length: SG.v.length }, (_, i) => i).sort((a, b) => SG.v[a] - SG.v[b]);
+const NSEED = 300;
+const seedPos = new Float32Array(NSEED * 3);
+for (let i = 0; i < NSEED; i++) {
+  const c = order[i];
+  const ix = c % SG.w, iy = Math.floor(c / SG.w);
+  const lon = (ix / SG.w) * Math.PI * 2 - Math.PI;
+  const lat = Math.PI / 2 - (iy + 0.5) / SG.h * Math.PI;
+  const r = 90 + rnd() * 170;
+  seedPos[i * 3] = r * Math.cos(lat) * Math.cos(lon);
+  seedPos[i * 3 + 1] = r * Math.sin(lat);
+  seedPos[i * 3 + 2] = r * Math.cos(lat) * Math.sin(lon);
+}
+const seedGeom = new THREE.BufferGeometry();
+seedGeom.setAttribute('position', new THREE.BufferAttribute(seedPos, 3));
+seedGeom.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 340);
+// Size in WORLD units again: these sit at r = 120-320, where one unit is only
+// ~2.5 px, so 1.8 is a ~5 px glint, not the 9-unit (~25 px) blob first tried.
+const seedMat = new THREE.PointsMaterial({
+  map: GLOW_TIGHT, color: new THREE.Color(3.1, 2.35, 1.60), size: 2.1,
+  sizeAttenuation: true, transparent: true, opacity: 0, depthWrite: false,
+  fog: false, blending: THREE.AdditiveBlending,
+});
+const seedPts = new THREE.Points(seedGeom, seedMat);
+seedPts.frustumCulled = false;
+scene.add(seedPts);
+
+// ============================================================== CAPTIONS
+const capScene = new THREE.Scene();
+const capCam = new THREE.OrthographicCamera(-W / 2, W / 2, H / 2, -H / 2, -500, 500);
+const FONT = '"Helvetica Neue", Helvetica, Arial, sans-serif';
+const MONO = '"SF Mono", Menlo, Consolas, monospace';
+
+function makeCaption(text, opts = {}) {
+  const { size = 78, weight = 700, tracking = 0.02, color = '#efefef',
+          y = 0, maxWidth = SAFE.x1 - SAFE.x0 } = opts;
+  const probe = document.createElement('canvas').getContext('2d');
+  const measure = (px) => {
+    probe.font = `${weight} ${px}px ${FONT}`;
+    probe.letterSpacing = `${(tracking * px).toFixed(2)}px`;
+    return probe.measureText(text).width;
+  };
+  let fit = size;
+  if (measure(fit) > maxWidth) {
+    let lo = 10, hi = size;
+    while (hi - lo > 0.5) { const m = (lo + hi) / 2; if (measure(m) > maxWidth) hi = m; else lo = m; }
+    fit = Math.floor(lo);
+  }
+  probe.font = `${weight} ${fit}px ${FONT}`;
+  probe.letterSpacing = `${(tracking * fit).toFixed(2)}px`;
+  const total = probe.measureText(text).width;
+
+  const group = new THREE.Group();
+  group.position.set(LANE_CX - W / 2, y, 0);
+  capScene.add(group);
+
+  const chars = [];
+  let cursor = -total / 2;
+  const PAD = Math.ceil(fit * 0.42);
+  for (const ch of text) {
+    const adv = probe.measureText(ch).width;
+    if (ch !== ' ') {
+      const cw = Math.ceil(adv) + PAD * 2, chh = Math.ceil(fit * 1.7) + PAD;
+      const cv = document.createElement('canvas'); cv.width = cw; cv.height = chh;
+      const g = cv.getContext('2d');
+      g.font = `${weight} ${fit}px ${FONT}`;
+      g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = color;
+      g.fillText(ch, cw / 2, chh / 2);
+      const tex = new THREE.CanvasTexture(cv);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.minFilter = tex.magFilter = THREE.LinearFilter; tex.generateMipmaps = false;
+      renderer.initTexture(tex);
+      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(cw, chh),
+        new THREE.MeshBasicMaterial({ map: tex, transparent: true,
+          depthTest: false, depthWrite: false, toneMapped: false }));
+      mesh.position.x = cursor + adv / 2;
+      group.add(mesh);
+      chars.push({ mesh });
+    }
+    cursor += adv;
+  }
+  return {
+    group, chars, size: fit, width: total,
+    play(f, a, b, c, d) {
+      const n = chars.length || 1;
+      const SI = Math.min(1.0, 11 / n), SO = Math.min(0.5, 6 / n);
+      let vis = false;
+      for (let i = 0; i < n; i++) {
+        const m = chars[i].mesh;
+        const pi = clamp((f - a - i * SI) / Math.max(1, b - a), 0, 1);
+        const po = clamp((f - c - i * SO) / Math.max(1, d - c), 0, 1);
+        const ei = E.outQuint(pi), eo = E.inCubic(po);
+        const o = ei * (1 - eo);
+        m.material.opacity = o;
+        m.position.y = (1 - ei) * 46 - eo * 30;
+        m.scale.setScalar((0.82 + 0.18 * ei) * (1 - 0.10 * eo));
+        m.rotation.x = (1 - ei) * -0.95 + eo * 0.5;
+        m.visible = o > 0.003;
+        if (m.visible) vis = true;
+      }
+      group.visible = vis;
+    },
+  };
+}
+
+function makeScrim(cy, h) {
+  const n = 256, cv = document.createElement('canvas');
+  cv.width = 4; cv.height = n;
+  const g = cv.getContext('2d');
+  const grd = g.createLinearGradient(0, 0, 0, n);
+  grd.addColorStop(0.00, 'rgba(0,0,0,0)');
+  grd.addColorStop(0.26, 'rgba(0,0,0,0.82)');
+  grd.addColorStop(0.74, 'rgba(0,0,0,0.82)');
+  grd.addColorStop(1.00, 'rgba(0,0,0,0)');
+  g.fillStyle = grd; g.fillRect(0, 0, 4, n);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.generateMipmaps = false;
+  renderer.initTexture(tex);
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(W * 1.1, h),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0,
+      depthTest: false, depthWrite: false, toneMapped: false }));
+  mesh.position.set(0, cy, -1);
+  mesh.renderOrder = -2;
+  capScene.add(mesh);
+  return { mesh, set(v) { mesh.material.opacity = clamp(v, 0, 1); mesh.visible = v > 0.004; } };
+}
+
+/**
+ * Screen-space canvas panel. draw(ctx, w, h, t) may depend on t, but the texture
+ * is only re-uploaded when t crosses a 1/240 quantum -- otherwise an animated
+ * panel costs 24 uploads per output frame instead of 1.
+ */
+function makePanel(w, h, draw, opts = {}) {
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const ctx = cv.getContext('2d');
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.generateMipmaps = false;
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  let lastKey = -1;
+  const render = (t) => { ctx.clearRect(0, 0, w, h); draw(ctx, w, h, t); tex.needsUpdate = true; };
+  render(opts.t0 ?? 1);
+  renderer.initTexture(tex);
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0,
+      depthTest: false, depthWrite: false, toneMapped: false }));
+  mesh.position.set(opts.x ?? (LANE_CX - W / 2), opts.y ?? 0, 0);
+  capScene.add(mesh);
+  return {
+    mesh, redraw: render,
+    set(v, t = null, dy = 0) {
+      if (t !== null) {
+        const k = Math.round(clamp(t, 0, 1) * 240);
+        if (k !== lastKey) { lastKey = k; render(k / 240); }
+      }
+      mesh.material.opacity = clamp(v, 0, 1);
+      mesh.position.y = (opts.y ?? 0) + dy;
+      mesh.visible = v > 0.004;
+    },
+  };
+}
+
+// ---------------------------------------------------------- panel drawing kit
+const INK = '#e8e6e2', DIM = '#8f8d99', ACC = '#ffb45c', COOL = '#79c7ff';
+function axes(g, x0, y0, x1, y1) {
+  g.strokeStyle = 'rgba(210,210,220,0.42)'; g.lineWidth = 2;
+  g.beginPath(); g.moveTo(x0, y0); g.lineTo(x0, y1); g.lineTo(x1, y1); g.stroke();
+}
+function lab(g, t, x, y, o = {}) {
+  const { size = 22, col = DIM, align = 'center', font = FONT, weight = 500 } = o;
+  g.font = `${weight} ${size}px ${font}`; g.fillStyle = col;
+  g.textAlign = align; g.textBaseline = 'middle'; g.fillText(t, x, y);
+}
+/** Polyline revealed to fraction t of its point count. */
+function polyReveal(g, pts, t, style, width) {
+  const n = Math.max(2, Math.floor(pts.length * clamp(t, 0, 1)));
+  if (n < 2) return;
+  g.strokeStyle = style; g.lineWidth = width; g.lineJoin = 'round'; g.lineCap = 'round';
+  g.beginPath(); g.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < n; i++) g.lineTo(pts[i][0], pts[i][1]);
+  g.stroke();
+}
+
+// ---------------------------------------------------------- PANEL: ionisation
+const pIon = makePanel(880, 470, (g, w, h, t) => {
+  const x0 = 96, x1 = w - 34, y0 = 62, y1 = h - 82;
+  const z = D.curves.xe_z, xe = D.curves.xe, vis = D.curves.vis;
+  const za = 2000, zb = 700;                    // redshift falls to the right
+  const X = (zz) => x0 + (zz - za) / (zb - za) * (x1 - x0);
+  const Y = (v) => y1 - v * (y1 - y0);
+
+  // Visibility function: where the photons we actually see last scattered.
+  g.beginPath(); g.moveTo(X(za), y1);
+  for (let i = 0; i < z.length; i++) if (z[i] <= za && z[i] >= zb) g.lineTo(X(z[i]), Y(vis[i] * 0.84));
+  g.lineTo(X(zb), y1); g.closePath();
+  g.fillStyle = 'rgba(255,180,92,0.18)'; g.fill();
+
+  axes(g, x0, y0, x1, y1);
+  const pts = [];
+  for (let i = z.length - 1; i >= 0; i--) if (z[i] <= za && z[i] >= zb) pts.push([X(z[i]), Y(xe[i])]);
+  polyReveal(g, pts, t, COOL, 5);
+
+  if (t > 0.62) {
+    g.globalAlpha = clamp((t - 0.62) / 0.2, 0, 1);
+    g.strokeStyle = 'rgba(255,180,92,0.9)'; g.lineWidth = 2; g.setLineDash([7, 7]);
+    g.beginPath(); g.moveTo(X(N.zStar), y0 - 4); g.lineTo(X(N.zStar), y1); g.stroke();
+    g.setLineDash([]);
+    lab(g, `z = ${N.zStar}`, X(N.zStar), y0 - 26, { size: 26, col: ACC, weight: 700 });
+    lab(g, 'last scattering', X(N.zStar) - 16, Y(0.52), { size: 21, col: ACC, align: 'right' });
+    g.globalAlpha = 1;
+  }
+  lab(g, 'FREE ELECTRONS', x0 + 10, y0 + 18, { size: 25, col: COOL, align: 'left', weight: 700 });
+  lab(g, 'per hydrogen nucleus', x0 + 10, y0 + 46, { size: 20, col: DIM, align: 'left' });
+  lab(g, '1', x0 - 20, y0, { size: 22, align: 'right' });
+  lab(g, '0', x0 - 20, y1, { size: 22, align: 'right' });
+  lab(g, `z ${za}`, x0 + 2, y1 + 34, { size: 21, align: 'left' });
+  lab(g, `z ${zb}`, x1 - 2, y1 + 34, { size: 21, align: 'right' });
+  lab(g, 'TIME  →', (x0 + x1) / 2, y1 + 34, { size: 21, col: '#b9b7c2', weight: 600 });
+}, { y: -180, t0: 0 });
+
+// ---------------------------------------------------------- PANEL: redshift
+// A wave whose wavelength grows by exactly 1+z_* while its temperature falls by
+// the same factor. Both readouts are interpolated logarithmically between the
+// solved endpoints -- they ARE the solve, not a decorative counter.
+const lamStar_nm = 2.897771955e6 / N.TStar;    // Wien peak at T_star, in nm
+function bbColorAt(T) {
+  const Ts = D.curves.bb_T, rgbs = D.curves.bb_rgb;    // descending in T
+  if (T >= Ts[0]) return rgbs[0];
+  if (T <= Ts[Ts.length - 1]) return rgbs[rgbs.length - 1];
+  let i = 0; while (i < Ts.length - 2 && Ts[i + 1] > T) i++;
+  const f = (Ts[i] - T) / (Ts[i] - Ts[i + 1]);
+  return rgbs[i].map((v, k) => v + (rgbs[i + 1][k] - v) * f);
+}
+const pWave = makePanel(880, 430, (g, w, h, t) => {
+  const s = Math.pow(N.stretch, t);            // scale factor since last scattering
+  const T = N.TStar / s;
+  const lam_nm = lamStar_nm * s;
+  const cx = w / 2, cy = 152;
+
+  // On-screen wavelength grows by the SAME factor s as the physics, starting at
+  // 12 px so a full cycle stays visible for the first ~60% of the beat. The
+  // upper CAP is a drawing limit only -- a true 1091x would end at 13,000 px,
+  // 15 panel-widths, and read as a flat line. The READOUTS are never capped.
+  const lamPx = Math.min(26 * s, 2400);
+  const amp = 44 * (1 - 0.22 * t);
+  const col = bbColorAt(T);
+  const hex = `rgb(${Math.round(col[0] * 255)},${Math.round(col[1] * 255)},${Math.round(col[2] * 255)})`;
+  // Below ~900 K a blackbody emits essentially nothing the eye can see, so its
+  // true colour is black. Past that the wave is drawn in FALSE COLOUR and said
+  // to be, rather than silently pretending microwaves look violet.
+  const isFalse = T < 900;
+  const drawCol = isFalse ? '#b98cff' : hex;
+
+  g.save();
+  g.beginPath(); g.rect(20, cy - 86, w - 40, 172); g.clip();
+  g.strokeStyle = drawCol; g.lineWidth = 6; g.lineJoin = 'round'; g.lineCap = 'round';
+  g.shadowColor = drawCol; g.shadowBlur = 24;
+  g.beginPath();
+  for (let x = 20; x <= w - 20; x += 1) {
+    const y = cy + Math.sin((x - cx) / lamPx * Math.PI * 2) * amp;
+    if (x === 20) g.moveTo(x, y); else g.lineTo(x, y);
+  }
+  g.stroke();
+  g.restore();
+
+  if (isFalse) {
+    lab(g, 'FALSE COLOUR — THIS LIGHT IS NOW INVISIBLE', w / 2, cy + 108,
+      { size: 21, col: '#a894d0', weight: 700 });
+  }
+  const Tstr = T >= 100 ? `${commas(T)} K`
+    : T >= 10 ? `${T.toFixed(1)} K` : T >= 3 ? `${T.toFixed(2)} K` : `${T.toFixed(4)} K`;
+  const lstr = lam_nm < 1000 ? `${Math.round(lam_nm)} nm`
+    : lam_nm < 1e6 ? `${(lam_nm / 1000).toFixed(lam_nm < 1e4 ? 2 : 1)} µm`
+      : `${(lam_nm / 1e6).toFixed(3)} mm`;
+  lab(g, 'TEMPERATURE', w * 0.26, h - 122, { size: 21, col: DIM, weight: 600 });
+  lab(g, Tstr, w * 0.26, h - 64, { size: 58, col: INK, weight: 700, font: MONO });
+  lab(g, 'PEAK WAVELENGTH', w * 0.74, h - 122, { size: 21, col: DIM, weight: 600 });
+  lab(g, lstr, w * 0.74, h - 64, { size: 58, col: ACC, weight: 700, font: MONO });
+  g.strokeStyle = 'rgba(200,200,215,0.20)'; g.lineWidth = 2;
+  g.beginPath(); g.moveTo(w / 2, h - 146); g.lineTo(w / 2, h - 32); g.stroke();
+}, { y: -230, t0: 0 });
+
+// ---------------------------------------------------------- PANEL: spectrum
+const pSpec = makePanel(880, 560, (g, w, h, t) => {
+  const x0 = 100, x1 = w - 30, y0 = 82, y1 = h - 96;
+  const nu = D.curves.nu_GHz, I = D.curves.I_MJy;
+  const numax = 700, Imax = 430;
+  const X = (v) => x0 + v / numax * (x1 - x0);
+  const Y = (v) => y1 - v / Imax * (y1 - y0);
+  axes(g, x0, y0, x1, y1);
+  for (const v of [200, 400, 600]) {
+    g.strokeStyle = 'rgba(200,200,220,0.10)'; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(X(v), y0); g.lineTo(X(v), y1); g.stroke();
+    lab(g, `${v}`, X(v), y1 + 28, { size: 21 });
+  }
+  lab(g, 'GHz', x1, y1 + 60, { size: 21, align: 'right' });
+  lab(g, 'MJy/sr', x0 - 14, y0 - 10, { size: 20, align: 'right' });
+  lab(g, `${D.today.peak_MJy_sr}`, x0 - 14, Y(D.today.peak_MJy_sr), { size: 21, align: 'right' });
+
+  const pts = nu.map((v, i) => [X(v), Y(I[i])]);
+  const n = Math.max(2, Math.floor(pts.length * clamp(t, 0, 1)));
+  g.beginPath(); g.moveTo(pts[0][0], y1);
+  for (let i = 0; i < n; i++) g.lineTo(pts[i][0], pts[i][1]);
+  g.lineTo(pts[n - 1][0], y1); g.closePath();
+  const grd = g.createLinearGradient(0, y0, 0, y1);
+  grd.addColorStop(0, 'rgba(255,180,92,0.32)'); grd.addColorStop(1, 'rgba(255,120,60,0.02)');
+  g.fillStyle = grd; g.fill();
+  polyReveal(g, pts, t, ACC, 5);
+
+  if (t > 0.55) {
+    g.globalAlpha = clamp((t - 0.55) / 0.22, 0, 1);
+    g.strokeStyle = 'rgba(255,255,255,0.45)'; g.lineWidth = 2; g.setLineDash([6, 6]);
+    g.beginPath(); g.moveTo(X(N.nuPeak), y1); g.lineTo(X(N.nuPeak), Y(D.today.peak_MJy_sr)); g.stroke();
+    g.setLineDash([]);
+    lab(g, `${N.nuPeak} GHz`, X(N.nuPeak) + 42, Y(D.today.peak_MJy_sr) - 30,
+      { size: 27, col: INK, align: 'left', weight: 700 });
+    lab(g, `${N.lamPeak} mm`, X(N.nuPeak) + 42, Y(D.today.peak_MJy_sr) + 2,
+      { size: 24, col: DIM, align: 'left', weight: 600 });
+    g.globalAlpha = 1;
+  }
+  lab(g, `BLACKBODY AT ${N.T0} K`, x0 + 4, y0 - 40, { size: 27, col: INK, align: 'left', weight: 700 });
+  if (t > 0.84) {
+    g.globalAlpha = clamp((t - 0.84) / 0.16, 0, 1);
+    lab(g, `deviation < ${N.ppm} ppm`, x1 - 4, y0 + 26,
+      { size: 25, col: COOL, align: 'right', weight: 700 });
+    lab(g, 'thinner than this curve is drawn', x1 - 4, y0 + 56,
+      { size: 20, col: DIM, align: 'right' });
+    g.globalAlpha = 1;
+  }
+}, { y: -150, t0: 0 });
+
+// ---------------------------------------------------------- PANEL: sky map
+const mollImg = await loadImg('data/sky_moll.png');
+const pMoll = makePanel(900, 580, (g, w, h, t) => {
+  const iw = 856, ih = iw / 2;
+  const ix = (w - iw) / 2, iy = 56;
+  g.save();
+  g.globalAlpha = clamp(t * 1.7, 0, 1);
+  g.drawImage(mollImg, ix, iy, iw, ih);
+  g.restore();
+  lab(g, 'THE WHOLE SKY, ONE IMAGE', w / 2, 28, { size: 26, col: INK, weight: 700 });
+  const bw = 430, bx = (w - bw) / 2, by = iy + ih + 30;
+  const grd = g.createLinearGradient(bx, 0, bx + bw, 0);
+  ['#050847', '#1a52b8', '#6bb8ed', '#f5f5eb', '#fcc75c', '#ed5c1c', '#8c0d0d']
+    .forEach((c, i, a) => grd.addColorStop(i / (a.length - 1), c));
+  g.fillStyle = grd; g.fillRect(bx, by, bw, 20);
+  g.strokeStyle = 'rgba(220,220,230,0.35)'; g.lineWidth = 1.5; g.strokeRect(bx, by, bw, 20);
+  lab(g, `−${N.clip} µK`, bx - 16, by + 10, { size: 23, align: 'right', font: MONO });
+  lab(g, `+${N.clip} µK`, bx + bw + 16, by + 10, { size: 23, align: 'left', font: MONO });
+  lab(g, 'colder · denser', bx + bw * 0.15, by + 46, { size: 19 });
+  lab(g, 'hotter', bx + bw * 0.87, by + 46, { size: 19 });
+}, { y: -150, t0: 0 });
+
+// ---------------------------------------------------------- CAPTION LINES
+const CAP = {
+  a1: makeCaption('THE UNIVERSE BEGAN OPAQUE', { y: 600, size: 74 }),
+  a2: makeCaption('light could not cross it', { y: 494, size: 42, weight: 500, color: '#ffb45c', tracking: 0.05 }),
+  a3: makeCaption(`FOR ${commas(Math.round(N.tStarYr / 1000) * 1000)} YEARS`, { y: 600, size: 76 }),
+  a4: makeCaption('every photon bounced off a free electron', { y: 494, size: 36, weight: 500, color: '#ffb45c', tracking: 0.04 }),
+
+  b1: makeCaption(`THEN IT COOLED TO ${commas(N.TStar)} K`, { y: 600, size: 68 }),
+  b2: makeCaption('electrons locked onto protons', { y: 494, size: 40, weight: 500, color: '#79c7ff', tracking: 0.05 }),
+  b3: makeCaption('THE FOG CLEARED', { y: 600, size: 84 }),
+  b4: makeCaption('and the light flew free', { y: 494, size: 42, weight: 500, color: '#79c7ff', tracking: 0.05 }),
+
+  c1: makeCaption('SPACE STRETCHED IT', { y: 610, size: 82 }),
+  c2: makeCaption(`wavelength grew ×${commas(N.stretch)}`, { y: 506, size: 42, weight: 500, color: '#ffb45c', tracking: 0.05 }),
+  c3: makeCaption(`${commas(N.TStar)} K → ${N.T0} K`, { y: 610, size: 70 }),
+  c4: makeCaption('the same light, only colder', { y: 506, size: 40, weight: 500, color: '#ffb45c', tracking: 0.05 }),
+
+  d1: makeCaption('A PERFECT BLACKBODY', { y: 660, size: 74 }),
+  d2: makeCaption('the most exact ever measured', { y: 560, size: 40, weight: 500, color: '#79c7ff', tracking: 0.05 }),
+  d3: makeCaption('MICROWAVES, EVERYWHERE', { y: 660, size: 66 }),
+
+  e1: makeCaption('BUT NOT QUITE SMOOTH', { y: 610, size: 78 }),
+  e2: makeCaption(`${N.rms} µK ripples — 1 part in ${commas(Math.round(N.partIn / 1000) * 1000)}`, { y: 508, size: 34, weight: 500, color: '#ffb45c', tracking: 0.04 }),
+  e3: makeCaption('THESE ARE THE SEEDS', { y: 610, size: 82 }),
+  e4: makeCaption('every galaxy grew from one', { y: 508, size: 42, weight: 500, color: '#ffb45c', tracking: 0.05 }),
+
+  t1: makeCaption('THE COSMIC', { y: 300, size: 94, tracking: 0.04 }),
+  t2: makeCaption('MICROWAVE', { y: 186, size: 94, tracking: 0.04 }),
+  t3: makeCaption('BACKGROUND', { y: 72, size: 94, tracking: 0.04 }),
+  // 13.797 Gyr rounded for a title card; the solve's full value is in the JSON.
+  t4: makeCaption(`${N.age.toFixed(1)} BILLION YEARS OLD`, { y: -70, size: 40, weight: 600, color: '#ffb45c', tracking: 0.08 }),
+  t5: makeCaption('arriving right now, from every direction', { y: -152, size: 31, weight: 500, color: '#c9c7d4', tracking: 0.04 }),
+};
+const SCRIM_HI = makeScrim(550, 470);      // headline band, beats 1-3
+const SCRIM_LO = makeScrim(608, 430);      // headline band, beats 4-5
+const SCRIM_T = makeScrim(110, 900);       // title block
+
+// The one flash in the piece, at recombination. A FLAT full-frame plane here
+// read as a half-second grey veil over everything -- the "cheap wash" -- and
+// honestly tripped the black-level gate at p1 137 against a limit of 24. A
+// radial ADDITIVE burst centred on the cloud is a better cut and leaves the
+// frame edges black, because additive over black is still black.
+const flashPlane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
+  new THREE.MeshBasicMaterial({ map: GLOW, color: new THREE.Color(1.55, 1.34, 1.02),
+    transparent: true, opacity: 0, depthTest: false, depthWrite: false,
+    toneMapped: false, blending: THREE.AdditiveBlending }));
+flashPlane.renderOrder = 999;
+capScene.add(flashPlane);
+
+// ============================================================== POST CHAIN
+const rtOpts = { type: THREE.HalfFloatType, colorSpace: THREE.LinearSRGBColorSpace };
+const sceneTarget = new THREE.WebGLRenderTarget(W, H, { ...rtOpts, samples: 4, depthBuffer: true });
+const accumTarget = new THREE.WebGLRenderTarget(W, H, { ...rtOpts, depthBuffer: false });
+
+const accScene = new THREE.Scene();
+const accCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const accMat = new THREE.ShaderMaterial({
+  uniforms: { tSrc: { value: null }, uW: { value: 1 / SUBSAMPLES } },
+  vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.,1.); }`,
+  fragmentShader: `uniform sampler2D tSrc; uniform float uW; varying vec2 vUv;
+    void main(){ gl_FragColor = vec4(texture2D(tSrc,vUv).rgb*uW, 1.0); }`,
+  depthTest: false, depthWrite: false,
+  blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor,
+});
+accScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), accMat));
+
+const LookShader = {
+  uniforms: { tDiffuse: { value: null }, uRes: { value: new THREE.Vector2(W, H) },
+              uVig: { value: 0.66 }, uGrain: { value: 0.55 } },
+  vertexShader: `varying vec2 vUv;
+    void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
+  fragmentShader: `
+    uniform sampler2D tDiffuse; uniform vec2 uRes; uniform float uVig, uGrain;
+    varying vec2 vUv;
+    // sRGB CODE UNITS, but this pass runs before OutputPass i.e. in LINEAR
+    // space. 12.92 is the sRGB linear-segment slope, valid down near black.
+    float srgb2lin(float c){ return (c/255.0)/12.92; }
+    float hash(vec2 p){ p=fract(p*vec2(233.34,851.73)); p+=dot(p,p+23.45); return fract(p.x*p.y); }
+    float vnoise(vec2 p){
+      vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+      return mix(mix(hash(i),hash(i+vec2(1,0)),f.x), mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),f.x), f.y);
+    }
+    void main(){
+      vec2 c = vUv-0.5;
+      vec3 col;
+      col.r = texture2D(tDiffuse, 0.5 + c*1.001369).r;
+      col.g = texture2D(tDiffuse, vUv).g;
+      col.b = texture2D(tDiffuse, 0.5 + c*0.998589).b;
+      float r = length(c*vec2(1.0, 0.62));
+      col *= clamp(1.0 - uVig*(r*r*2.15 - 0.06), 0.0, 1.0);
+      col += vec3(srgb2lin(3.2), srgb2lin(2.6), srgb2lin(4.4));   // black is not 0
+      float n = vnoise(vUv*uRes/46.55) - 0.5;                     // static = film
+      col += vec3(srgb2lin(0.189), srgb2lin(0.24), srgb2lin(0.290))*n*2.0*uGrain*24.0;
+      gl_FragColor = vec4(max(col,0.0), 1.0);
+    }`,
+};
+
+const composer = new EffectComposer(renderer);
+composer.setSize(W, H);
+const texPass = new TexturePass(accumTarget.texture);
+composer.addPass(texPass);
+// Threshold is HIGH on purpose -- near zero every dim pixel enters the mip chain
+// and the frame hazes to milky grey. Threshold and strength are TUNED.
+const BLOOM_BASE = 0.42;
+const bloom = new UnrealBloomPass(new THREE.Vector2(W, H), BLOOM_BASE, 0.32, 0.70);
+{
+  const tints = [[1,.98,1],[.97,.90,1],[.92,.82,1],[.88,.76,1],[.86,.74,1]]
+    .map(([r, g, b]) => new THREE.Vector3(r, g, b));
+  if (bloom.bloomTintColors) bloom.bloomTintColors = tints;
+  if (bloom.compositeMaterial?.uniforms?.bloomTintColors)
+    bloom.compositeMaterial.uniforms.bloomTintColors.value = tints;
+}
+composer.addPass(bloom);
+composer.addPass(new ShaderPass(LookShader));
+composer.addPass(new OutputPass());
+
+const halton = (i, b) => { let f = 1, r = 0, n = i + 1;
+  while (n > 0) { f /= b; r += f * (n % b); n = Math.floor(n / b); } return r; };
+const SAMPLES = Array.from({ length: SUBSAMPLES }, (_, i) => {
+  const u = halton(i, 2), v = halton(i, 3), rr = Math.sqrt(u), th = v * Math.PI * 2;
+  return { dx: Math.cos(th) * rr, dy: Math.sin(th) * rr,
+           jx: halton(i, 5) - .5, jy: halton(i, 7) - .5 };
+});
+
+// ============================================================== CAMERA
+// [frame, x,y,z, tx,ty,tz, aperture, fov] -- all world coordinates. There is no
+// single travelling subject, so nothing follows. The focal plane sits on the
+// TARGET, so each target is the thing that must stay sharp.
+// The first cut put the camera INSIDE the walk cluster at r=3. Every tube then
+// passed within a fraction of a unit of the lens and the frame went to white.
+// The cloud is 17 units across, so the camera stands off it and pulls back.
+const CAMKEYS = [
+  [0,      0.0,  2.6, 25.0,    0.0,  0.0,   0.0,  0.11, 42],  // facing the plasma
+  [263,    7.0,  3.6, 27.0,    0.0,  0.0,   0.0,  0.11, 42],
+  [400,   10.5,  4.6, 30.0,    0.0,  0.0,   0.0,  0.09, 42],  // recombination
+  [527,   13.0,  7.0, 39.0,    0.0,  0.0,   0.0,  0.07, 40],  // fog gone
+  [700,    6.0, 13.0, 60.0,    0.0,  0.0,   0.0,  0.05, 38],  // rays streaming out
+  [815,   -5.0, 15.0, 76.0,    0.0,  0.0,   0.0,  0.05, 38],
+  [1043,   0.0,  1.0,  8.0,    0.0,  0.0, -40.0,  0.03, 46],  // heading back in
+  [1180,   0.0,  0.0,  0.0,  -26.0,  4.0, -62.0,  0.02, 70],  // inside the sky
+  [1307,   0.0,  0.0,  0.0,  -36.0,  4.0, -57.0,  0.02, 72],
+  [1439,   0.0,  0.0,  0.0,  -44.0,  3.0, -51.0,  0.02, 74],
+];
+const _kp = new THREE.Vector3(), _kt = new THREE.Vector3();
+const _pA = new THREE.Vector3(), _tA = new THREE.Vector3();
+function camAt(frame) {
+  let i = 0;
+  while (i < CAMKEYS.length - 2 && frame > CAMKEYS[i + 1][0]) i++;
+  const A = CAMKEYS[i], B = CAMKEYS[i + 1];
+  const t = E.inOutCubic(span(frame, A[0], B[0]));
+  _pA.set(A[1], A[2], A[3]); _tA.set(A[4], A[5], A[6]);
+  _kp.set(B[1], B[2], B[3]); _kt.set(B[4], B[5], B[6]);
+  return { pos: _pA.clone().lerp(_kp, t), tgt: _tA.clone().lerp(_kt, t),
+           ap: lerp(A[7], B[7], t), fov: lerp(A[8], B[8], t) };
+}
+
+// ============================================================== POSE
+const UP = new THREE.Vector3(0, 1, 0);
+const _cF = new THREE.Vector3(), _cR = new THREE.Vector3(), _cU = new THREE.Vector3();
+const _hp = new THREE.Vector3();
+const FOG_HOT = C(0x2a0d08), FOG_COLD = C(0x05060d);
+
+/** Recombination: the one moment everything else keys to. */
+const F_REC = 396;
+
+function pose(frame, sample) {
+  const beat = beatAt(frame);
+
+  // ---- camera + accumulation depth of field
+  const ck = camAt(frame);
+  camera.fov = ck.fov;
+  _cF.subVectors(ck.tgt, ck.pos).normalize();
+  _cR.crossVectors(_cF, UP).normalize();
+  _cU.crossVectors(_cR, _cF).normalize();
+  camera.position.copy(ck.pos)
+    .addScaledVector(_cR, sample.dx * ck.ap)
+    .addScaledVector(_cU, sample.dy * ck.ap);
+  camera.lookAt(ck.tgt);
+  camera.setViewOffset(W, H, sample.jx, sample.jy, W, H);
+  camera.updateProjectionMatrix();
+
+  // ---- opacity of the universe
+  const cleared = ease(frame, F_REC - 46, F_REC + 96, E.inOutCubic);
+  scene.fog.density = lerp(0.038, 0.0, cleared);
+  scene.fog.color.copy(FOG_HOT).lerp(FOG_COLD, cleared);
+
+  // ---- plasma jitter (written, never accumulated)
+  const jit = 0.55 * (1 - cleared * 0.75);
+  const arr = partAttr.array;
+  for (let i = 0; i < NPART; i++) {
+    const b = i * 3;
+    const s0 = partSeed[b], sp = partSeed[b + 1], s2 = partSeed[b + 2];
+    arr[b]     = partPos[b]     + Math.sin(frame * 0.055 * sp + s0) * jit;
+    arr[b + 1] = partPos[b + 1] + Math.sin(frame * 0.041 * sp + s2) * jit;
+    arr[b + 2] = partPos[b + 2] + Math.cos(frame * 0.048 * sp + s0) * jit;
+  }
+  partAttr.needsUpdate = true;
+
+  const gone = ease(frame, 540, 690, E.inOutCubic);
+  hotMat.opacity = 0.30 * (1 - ease(frame, F_REC - 30, F_REC + 40)) * (1 - gone);
+  hotMat.size = lerp(0.80, 0.62, cleared);
+  coldMat.opacity = 0.34 * ease(frame, F_REC - 10, F_REC + 60) * (1 - gone);
+  hotPts.visible = hotMat.opacity > 0.004;
+  coldPts.visible = coldMat.opacity > 0.004;
+  // Takes over from the plasma so nothing is ever staring at an empty frame.
+  starMat.opacity = 0.85 * pulse(frame, 400, 560, 1080, 1160);
+  starPts.visible = starMat.opacity > 0.004;
+
+  // ---- photons: random walk, then straight flight
+  const photVis = pulse(frame, -8, 18, 800, 860);
+  for (let i = 0; i < NPHOT; i++) {
+    const P = photons[i];
+    const off = P.phase * 26;
+    const uw = ease(frame - off, -46, F_REC - 14, E.linear) * P.uWalk;
+    const uo = ease(frame - off, F_REC - 10, 800, E.outQuad) * (1 - P.uWalk);
+    const u = clamp(uw + uo, 0, 0.9995);
+    const seg = Math.floor(u * TUBE_SEG);
+    // A long trailing tail: the accumulated zigzag reads as history while the
+    // photon is trapped, and as a streak once it is flying.
+    // A tail of 0.10 of the curve (~47 units). The first cut used 0.40, which
+    // showed every photon's entire walk at once and read as white spaghetti.
+    const tail = 0.055 + 0.22 * ease(frame, F_REC, 620, E.outQuad);
+    const startSeg = Math.max(0, Math.floor((u - tail) * TUBE_SEG));
+    P.mesh.geometry.setDrawRange(startSeg * IDX_PER_SEG,
+                                 Math.max(1, seg - startSeg) * IDX_PER_SEG);
+    P.mat.opacity = photVis * 0.80;
+    P.mesh.visible = P.mat.opacity > 0.004;
+    P.curve.getPointAt(u, _hp);
+    P.head.position.copy(_hp);
+    P.head.material.opacity = photVis * 0.9;
+    P.head.scale.setScalar(lerp(0.9, 2.6, ease(frame, F_REC, 700, E.outQuad)));
+    P.head.visible = photVis > 0.004;
+  }
+
+  // ---- the CMB sky, seen from inside. Deliberately dim: at full brightness a
+  // full-frame map leaves nothing dark on screen and reads as a wall, not a
+  // sky, and the captions have nothing to sit against. Starts only after the
+  // spectrum panel has left at f1036, so the two never fight.
+  skyMat.opacity = pulse(frame, 1040, 1140, 1400, 1440) * 0.26
+                   * (1 - 0.32 * ease(frame, 1200, 1290, E.outCubic));
+  skySphere.visible = skyMat.opacity > 0.004;
+  skySphere.rotation.y = frame * 0.0006;
+
+  seedMat.opacity = pulse(frame, 1180, 1250, 1382, 1432);
+  seedMat.size = lerp(1.0, 5.0, ease(frame, 1180, 1290, E.outCubic));
+  seedPts.visible = seedMat.opacity > 0.004;
+  seedPts.rotation.y = frame * 0.0006;
+
+  // ---- panels
+  const F = Math.floor(frame + 1e-6);
+  pIon.set(pulse(frame, 300, 340, 470, 505), ease(F, 310, 452, E.outQuad));
+  pWave.set(pulse(frame, 560, 600, 770, 806), ease(F, 574, 768, E.inOutCubic));
+  pSpec.set(pulse(frame, 806, 846, 1000, 1036), ease(F, 812, 990, E.outQuad));
+  pMoll.set(pulse(frame, 1064, 1108, 1188, 1230), ease(F, 1070, 1152, E.outQuad));
+
+  // ---- captions
+  SCRIM_HI.set(0.84 * Math.max(
+    pulse(frame, 16, 46, 132, 156), pulse(frame, 168, 196, 248, 268),
+    pulse(frame, 292, 320, 368, 390), pulse(frame, 410, 440, 502, 524),
+    pulse(frame, 546, 576, 648, 670), pulse(frame, 686, 716, 794, 812)));
+  SCRIM_LO.set(0.84 * Math.max(
+    pulse(frame, 838, 868, 930, 952), pulse(frame, 962, 992, 1030, 1042),
+    pulse(frame, 1062, 1092, 1154, 1176), pulse(frame, 1202, 1232, 1288, 1304)));
+  SCRIM_T.set(0.86 * pulse(frame, 1318, 1352, 1436, 1440));
+
+  CAP.a1.play(frame, 8, 32, 132, 152);
+  CAP.a2.play(frame, 30, 54, 132, 152);
+  CAP.a3.play(frame, 172, 196, 248, 266);
+  CAP.a4.play(frame, 190, 214, 248, 266);
+  CAP.b1.play(frame, 296, 320, 368, 388);
+  CAP.b2.play(frame, 312, 336, 368, 388);
+  CAP.b3.play(frame, 414, 438, 502, 522);
+  CAP.b4.play(frame, 432, 456, 502, 522);
+  CAP.c1.play(frame, 550, 574, 648, 668);
+  CAP.c2.play(frame, 566, 590, 648, 668);
+  CAP.c3.play(frame, 690, 714, 794, 810);
+  CAP.c4.play(frame, 706, 730, 794, 810);
+  CAP.d1.play(frame, 842, 866, 930, 950);
+  CAP.d2.play(frame, 858, 882, 930, 950);
+  CAP.d3.play(frame, 966, 990, 1030, 1042);
+  CAP.e1.play(frame, 1066, 1090, 1154, 1174);
+  CAP.e2.play(frame, 1082, 1106, 1154, 1174);
+  CAP.e3.play(frame, 1206, 1230, 1288, 1302);
+  CAP.e4.play(frame, 1222, 1246, 1288, 1302);
+  CAP.t1.play(frame, 1322, 1346, 1600, 1620);
+  CAP.t2.play(frame, 1332, 1356, 1600, 1620);
+  CAP.t3.play(frame, 1342, 1366, 1600, 1620);
+  CAP.t4.play(frame, 1372, 1396, 1600, 1620);
+  CAP.t5.play(frame, 1386, 1410, 1600, 1620);
+
+  // Fast in, fast out: ~7 frames end to end, and it expands as it fades.
+  const fl = E.outQuad(span(frame, F_REC - 4, F_REC)) * (1 - E.inQuad(span(frame, F_REC, F_REC + 7)));
+  flashPlane.material.opacity = fl * 0.95;
+  const fs = lerp(620, 2500, E.outQuad(span(frame, F_REC - 4, F_REC + 7)));
+  flashPlane.scale.set(fs, fs, 1);
+  flashPlane.visible = flashPlane.material.opacity > 0.004;
+
+  return beat;
+}
+
+// ============================================================== RENDER
+function renderAtTime(frame) {
+  const beat = beatAt(frame);
+  // render() honours autoClear, so leaving it on wipes the accumulator before
+  // each additive blend and the frame comes out at 1/N brightness.
+  renderer.autoClear = false;
+  renderer.setRenderTarget(accumTarget);
+  renderer.setClearColor(0x000000, 1);
+  renderer.clear(true, true, true);
+
+  for (let s = 0; s < SUBSAMPLES; s++) {
+    pose(frame + (s / SUBSAMPLES) * SHUTTER, SAMPLES[s]);
+    renderer.setRenderTarget(sceneTarget);
+    renderer.clear(true, true, true);
+    renderer.render(scene, camera);
+    renderer.render(capScene, capCam);
+    accMat.uniforms.tSrc.value = sceneTarget.texture;
+    renderer.setRenderTarget(accumTarget);
+    renderer.render(accScene, accCam);
+  }
+
+  renderer.setRenderTarget(null);
+  renderer.autoClear = true;
+  // Blur accumulates BEFORE the post chain: smear at the shutter, glow after.
+  bloom.strength = BLOOM_BASE * (beat.bloom ?? 1);
+  texPass.map = accumTarget.texture;
+  composer.render();
+}
+
+const _sph = new THREE.Sphere();
+function cameraClearance(stride = 12, warn = 1.5, envRadius = 60) {
+  const hits = [];
+  for (let f = 0; f < FRAMES; f += stride) {
+    pose(f, SAMPLES[0]);
+    scene.updateMatrixWorld(true);
+    const ck = camAt(f);
+    let min = Infinity, who = '';
+    scene.traverse((o) => {
+      if (!o.isMesh || !o.visible || o.userData.ignoreClearance) return;
+      if (!o.geometry.boundingSphere) o.geometry.computeBoundingSphere();
+      _sph.copy(o.geometry.boundingSphere).applyMatrix4(o.matrixWorld);
+      if (_sph.radius > envRadius) return;
+      const d = ck.pos.distanceTo(_sph.center) - _sph.radius;
+      if (d < min) { min = d; who = o.name || o.geometry.type; }
+    });
+    if (min < warn) hits.push({ frame: f, clearance: +min.toFixed(2), object: who });
+  }
+  return hits;
+}
+
+window.__piece = {
+  frames: FRAMES, fps: FPS,
+  seek: (f) => renderAtTime(f),
+  cameraClearance,
+  async determinismCheck(f = Math.floor(FRAMES * 0.6)) {
+    const grab = () => { renderAtTime(f); return renderer.domElement.toDataURL('image/png'); };
+    const a = grab(); renderAtTime(0); const b = grab();
+    return a === b;
+  },
+};
+
+if (new URLSearchParams(location.search).has('render')) {
+  document.body.classList.add('render');
+  renderAtTime(0);
+} else {
+  const t0 = performance.now();
+  const loop = () => { renderAtTime(((performance.now() - t0) / 1000) * FPS % FRAMES);
+                       requestAnimationFrame(loop); };
+  loop();
+}
+window.__ready = true;
+</script>
+</body>
+</html>

@@ -1,0 +1,1315 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>why the sky is blue</title>
+<style>
+  html,body{margin:0;padding:0;background:#000;overflow:hidden;height:100%}
+  #stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  canvas{display:block;max-width:100vw;max-height:100vh}
+  body.render #stage{align-items:flex-start;justify-content:flex-start}
+  body.render canvas{max-width:none;max-height:none}
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "/node_modules/three/build/three.module.js",
+    "three/addons/": "/node_modules/three/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="stage"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { TexturePass } from 'three/addons/postprocessing/TexturePass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import * as BGU from 'three/addons/utils/BufferGeometryUtils.js';
+
+/* ============================================================================
+   WHY THE SKY IS BLUE -- 1440 frames @ 24fps = 60.0s, 1080x1920.
+
+   Every quantity shown on screen comes from data/physics.json, written by
+   tools/physics.py. Nothing here re-derives a number; if a value is wrong it is
+   wrong in the solver, not in the renderer.
+
+   pose(frame) is a PURE function of frame. No +=, no Math.random, no clock.
+   ========================================================================== */
+
+const DATA = await (await fetch('/data/physics.json')).json();
+const NUM = DATA.numbers, COL = DATA.colours;
+
+const W = 1080, H = 1920, FPS = 24;
+const FRAMES = 1440;
+const SUBSAMPLES = 24;
+const SHUTTER = 0.675;                       // ~243deg, not 360
+
+const SAFE = { x0: 60, x1: 900, y0: 200, y1: 1560 };
+const LANE_CX = (SAFE.x0 + SAFE.x1) / 2;     // 480 -- the safe box is NOT centred
+// Shift the 3D view window so world-centred content lands on the lane rather
+// than on frame centre. +x in setViewOffset moves content LEFT on screen.
+const LANE_SHIFT = W / 2 - LANE_CX;          // +60 px
+
+// ---------------------------------------------------------------- easing
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const span = (t, a, b) => clamp((t - a) / (b - a), 0, 1);
+const E = {
+  linear: t => t,
+  outQuad: t => 1 - (1 - t) ** 2,
+  inCubic: t => t ** 3,
+  outCubic: t => 1 - (1 - t) ** 3,
+  outQuint: t => 1 - (1 - t) ** 5,
+  inOutCubic: t => (t < .5 ? 4 * t ** 3 : 1 - (-2 * t + 2) ** 3 / 2),
+  outExpo: t => (t >= 1 ? 1 : 1 - Math.pow(2, -10 * t)),
+  outSoft: t => 1 - Math.pow(1 - t, 3.4),
+};
+const ease = (f, a, b, fn = E.inOutCubic) => fn(span(f, a, b));
+/** Rise 0->1 over [a,b], hold, fall 1->0 over [c,d]. Beat visibility envelope. */
+const pulse = (f, a, b, c, d, fn = E.inOutCubic) => fn(span(f, a, b)) * (1 - fn(span(f, c, d)));
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rnd = mulberry32(0x5C1B1E);
+
+/** sRGB hex -> THREE.Color. The float constructor would treat it as linear. */
+const C = (hex) => new THREE.Color().setHex(typeof hex === 'string'
+  ? parseInt(hex.replace('#', ''), 16) : hex, THREE.SRGBColorSpace);
+
+/**
+ * Raise a derived spectral colour to full display brightness. HUE is physics
+ * (the CIE integration in physics.py); LUMINANCE is a presentation choice --
+ * monochromatic light is genuinely dark, and 440 nm at its true relative
+ * luminance is nearly invisible on a phone.
+ */
+function vivid(hex, k = 1.0) {
+  const n = parseInt(hex.replace('#', ''), 16);
+  const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  const m = Math.max(r, g, b, 1);
+  return `#${[r, g, b].map(v => Math.round(clamp(v / m * 255 * k, 0, 255))
+    .toString(16).padStart(2, '0')).join('')}`;
+}
+
+/** Nearest swatch in the derived spectrum strip to a given wavelength. */
+const atNm = (nm) => COL && DATA.spectrum_strip.reduce(
+  (best, e) => (Math.abs(e[0] - nm) < Math.abs(best[0] - nm) ? e : best))[1];
+
+const CL = {
+  sky:      COL.sky_single_scatter,   // #8bb1ff  derived: solar x sigma_R -> CIE -> sRGB
+  sunHigh:  COL.sun_am1,              // #ffecd7  derived: direct sun at airmass 1
+  sunLow:   COL.sun_horizon,          // #ff7500  derived: direct sun at airmass 37.9
+  waveBlue: vivid(atNm(470)),         // hue from 470 nm, brightened for screen
+  waveRed:  vivid(COL.red_660),       // hue from 660 nm, brightened for screen
+  violet:   vivid(COL.violet_410),
+};
+
+// ============================================================== BEAT TABLE
+const BEATS = [
+  { id: 'hook',     from: 0,    to: 125,  bloom: 1.00 },
+  { id: 'spectrum', from: 126,  to: 330,  bloom: 0.82 },
+  { id: 'scale',    from: 331,  to: 500,  bloom: 1.00 },
+  { id: 'law',      from: 501,  to: 760,  bloom: 0.90 },
+  { id: 'skyfill',  from: 761,  to: 1000, bloom: 0.86 },
+  { id: 'violet',   from: 1001, to: 1160, bloom: 0.86 },
+  { id: 'sunset',   from: 1161, to: 1360, bloom: 0.80 },
+  { id: 'title',    from: 1361, to: 1439, bloom: 0.95 },
+];
+const beatAt = (frame) => {
+  // Ownership from the OUTPUT frame: sub-samples run up to SHUTTER past the
+  // nominal frame, so `frame <= to` would cull a beat mid-way through its own
+  // last frame's samples.
+  const f = Math.floor(frame + 1e-6);
+  return BEATS.find(b => f >= b.from && f <= b.to) || BEATS[BEATS.length - 1];
+};
+
+// ============================================================== RENDERER
+const renderer = new THREE.WebGLRenderer({
+  antialias: false, preserveDrawingBuffer: true, powerPreference: 'high-performance',
+});
+renderer.setPixelRatio(1);
+renderer.setSize(W, H);
+renderer.setClearColor(0x000000, 1);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.06;
+document.getElementById('stage').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(32, W / H, 0.2, 6000);
+
+const key  = new THREE.DirectionalLight(C(0xfff2e0), 2.4); key.position.set(30, 60, 40);
+const rim  = new THREE.DirectionalLight(C(0x88bbff), 1.5); rim.position.set(-40, 10, -50);
+const fill = new THREE.HemisphereLight(C(0x4a6bb0), C(0x0a0a14), 0.9);
+scene.add(key, rim, fill);
+
+// ============================================================== SKY DOME
+// One inverted sphere carries the whole "is there air here" story: uFill 0 is
+// airless black, uFill 1 is the derived Rayleigh sky. uSunset re-tints the
+// bottom of the dome toward the airmass-38 sun colour.
+const DOME_R = 2600;
+const domeMat = new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite: false, fog: false,
+  uniforms: {
+    uSky: { value: C(CL.sky) }, uSpace: { value: C(0x03040a) },
+    uHorizon: { value: C(0x6f97d8) }, uSunsetCol: { value: C(CL.sunLow) },
+    uFill: { value: 0 }, uSunset: { value: 0 },
+    uSunDir: { value: new THREE.Vector3(0, 1, 0) }, uGain: { value: 1 },
+  },
+  vertexShader: `varying vec3 vP;
+    void main(){ vP = normalize(position); gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
+  fragmentShader: `
+    varying vec3 vP;
+    uniform vec3 uSky, uSpace, uHorizon, uSunsetCol;
+    uniform float uFill, uSunset, uGain;
+    uniform vec3 uSunDir;
+    void main(){
+      float up = clamp(vP.y, -1.0, 1.0);
+      // real sky pales toward the horizon (longer path, multiple scattering).
+      // Approximated with a gradient, not solved.
+      vec3 day = mix(uHorizon, uSky, smoothstep(-0.02, 0.62, up));
+      // GRADE: the dome is deliberately rendered far below the derived sky
+      // luminance. #8bb1ff at full value fills a 9:16 frame with pale grey-blue
+      // and kills both contrast and caption legibility. The TRUE derived colour
+      // is presented exactly, at full value, in the swatch panel instead.
+      day *= 0.34;
+      // deepen toward the zenith the way a polarising filter does
+      day *= mix(1.15, 0.62, smoothstep(0.0, 0.9, up));
+      float toSun = clamp(dot(normalize(vP), normalize(uSunDir)), 0.0, 1.0);
+      float lowBand = 1.0 - smoothstep(-0.05, 0.40, up);
+      vec3 warm = mix(day, uSunsetCol*0.95, clamp(lowBand*(0.30 + 0.70*pow(toSun,3.0)), 0.0, 1.0));
+      vec3 col = mix(day, warm, uSunset);
+      col = mix(uSpace, col, uFill);
+      gl_FragColor = vec4(col*uGain, 1.0);
+    }`,
+});
+const dome = new THREE.Mesh(new THREE.SphereGeometry(DOME_R, 48, 32), domeMat);
+scene.add(dome);
+
+// ============================================================== SUN
+const SUN_R = 420;                     // distance from origin, not a radius
+const sunGroup = new THREE.Group(); scene.add(sunGroup);
+const sunBody = new THREE.Mesh(new THREE.SphereGeometry(18, 32, 24),
+  new THREE.MeshBasicMaterial({ color: C(CL.sunHigh), transparent: true, toneMapped: false }));
+sunGroup.add(sunBody);
+
+/** Radial falloff sprite. A flat disc reads as a coin; the falloff reads as light. */
+function glowTexture(power = 2.4) {
+  const n = 256, cv = document.createElement('canvas'); cv.width = cv.height = n;
+  const g = cv.getContext('2d');
+  const grd = g.createRadialGradient(n / 2, n / 2, 0, n / 2, n / 2, n / 2);
+  for (let i = 0; i <= 20; i++) {
+    const t = i / 20;
+    grd.addColorStop(t, `rgba(255,255,255,${Math.pow(1 - t, power).toFixed(4)})`);
+  }
+  g.fillStyle = grd; g.fillRect(0, 0, n, n);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.generateMipmaps = false;
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  return tex;
+}
+const sunGlow = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: glowTexture(2.6), color: C(CL.sunHigh), transparent: true, opacity: 0.85,
+  blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false, toneMapped: false }));
+sunGlow.scale.set(190, 190, 1);
+sunGroup.add(sunGlow);
+
+/** Sun position from zenith angle in degrees. 0 = overhead, 90 = -z horizon. */
+function sunPos(zenithDeg) {
+  const z = THREE.MathUtils.degToRad(zenithDeg);
+  return new THREE.Vector3(0, Math.cos(z) * SUN_R, -Math.sin(z) * SUN_R);
+}
+
+// ============================================================== STARS
+// Above the air there is no scattering, so the "space" beats want stars. They
+// also stop frame 0 -- the thumbnail -- from being an empty black rectangle.
+const STAR_N = 700;
+const starMat = new THREE.PointsMaterial({
+  size: 5.2, sizeAttenuation: false, color: C(0xdfe8ff), transparent: true,
+  opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false });
+{
+  const pos = new Float32Array(STAR_N * 3);
+  for (let i = 0; i < STAR_N; i++) {
+    // upper hemisphere only, on a shell inside the dome
+    const u = rnd() * 2 - 1, ph = rnd() * Math.PI * 2, r = 1900;
+    const s = Math.sqrt(1 - u * u);
+    pos[i * 3] = Math.cos(ph) * s * r;
+    pos[i * 3 + 1] = Math.abs(u) * r * 0.9 + 30;
+    pos[i * 3 + 2] = Math.sin(ph) * s * r;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const stars = new THREE.Points(g, starMat);
+  stars.frustumCulled = false;
+  scene.add(stars);
+}
+
+// ============================================================== GROUND
+const terrain = new THREE.Group(); scene.add(terrain);
+{
+  const cv = document.createElement('canvas'); cv.width = cv.height = 512;
+  const g = cv.getContext('2d');
+  const grd = g.createRadialGradient(256, 256, 0, 256, 256, 256);
+  grd.addColorStop(0, '#131a26'); grd.addColorStop(1, '#05070c');
+  g.fillStyle = grd; g.fillRect(0, 0, 512, 512);
+  const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace;
+  const ground = new THREE.Mesh(new THREE.CircleGeometry(2400, 64),
+    new THREE.MeshBasicMaterial({ map: tex }));
+  ground.rotation.x = -Math.PI / 2; ground.position.y = -0.5;
+  terrain.add(ground);
+}
+// Ridge silhouette: a compositional anchor, and the dark pixels that keep the
+// 1st-percentile luma honest once the sky fills the frame.
+{
+  const shape = new THREE.Shape();
+  const N = 220, SPANX = 5200;
+  shape.moveTo(-SPANX / 2, -300);
+  for (let i = 0; i <= N; i++) {
+    const t = i / N, x = -SPANX / 2 + t * SPANX;
+    const h = 16 + 11 * Math.sin(t * 11.0 + 0.7) + 7 * Math.sin(t * 27.0 + 2.1)
+                 + 4 * Math.sin(t * 53.0 + 4.4);
+    shape.lineTo(x, h);
+  }
+  shape.lineTo(SPANX / 2, -300); shape.closePath();
+  const ridge = new THREE.Mesh(new THREE.ShapeGeometry(shape),
+    new THREE.MeshBasicMaterial({ color: C(0x05070e), side: THREE.DoubleSide, toneMapped: false }));
+  ridge.position.set(0, 0, -900);
+  terrain.add(ridge);
+}
+
+// ============================================================== SPECTRUM FAN
+// Additive bands from a common apex. Collapsed they sum to white -- which is
+// the point, white light IS the sum -- and spread, they are a spectrum.
+const STRIP = DATA.spectrum_strip;                       // [[nm, "#rrggbb"], ...]
+const fanGroup = new THREE.Group();
+fanGroup.position.set(0, 96, 0);
+scene.add(fanGroup);
+// The incoming white beam, above the apex -- so the shot reads beam-in,
+// spectrum-out rather than as an unexplained rainbow.
+const fanBeam = new THREE.Mesh(new THREE.PlaneGeometry(2.6, 120),
+  new THREE.MeshBasicMaterial({ color: C(0xfff4e2), transparent: true, opacity: 0,
+    blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
+    side: THREE.DoubleSide }));
+fanBeam.position.y = 60;
+fanGroup.add(fanBeam);
+const FAN_LEN = 54, FAN_HALF = THREE.MathUtils.degToRad(23);
+const fanBands = [];
+for (let i = 0; i < STRIP.length; i++) {
+  const [nm, hex] = STRIP[i];
+  const geo = new THREE.PlaneGeometry(1.35, FAN_LEN);
+  geo.translate(0, -FAN_LEN / 2, 0);                     // pivot at the apex
+  const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+    color: C(hex), transparent: true, opacity: 0, depthWrite: false,
+    blending: THREE.AdditiveBlending, toneMapped: false, side: THREE.DoubleSide }));
+  fanGroup.add(m);
+  fanBands.push({ mesh: m, ang: lerp(-FAN_HALF, FAN_HALF, i / (STRIP.length - 1)), nm });
+}
+
+// ============================================================== WAVES + LOBES
+// The lambda^-4 beat. Two wave trains at the TRUE wavelength ratio 700/400 =
+// 1.75, each ending on a molecule that radiates a Rayleigh dipole lobe whose
+// RADIUS IS THE SCATTERED INTENSITY -- the standard polar radiation-pattern
+// convention -- so the blue lobe is 9.38x the red one, exactly the number the
+// caption puts on screen.
+const RATIO = NUM.ratio_pure_400_700;          // 9.3789
+const LAM_B = 1.70, LAM_R = LAM_B * (700 / 400);
+
+/** Sine along x over [x0, x1]. Explicit range so a train can END on a scatterer. */
+class SineCurve extends THREE.Curve {
+  constructor(x0, x1, amp, lam) { super(); this.x0 = x0; this.x1 = x1; this.amp = amp; this.lam = lam; }
+  getPoint(t, target = new THREE.Vector3()) {
+    const x = lerp(this.x0, this.x1, t);
+    return target.set(x, this.amp * Math.sin(2 * Math.PI * x / this.lam), 0);
+  }
+}
+function makeWave(lam, amp, colHex, x0, x1, rad = 0.05) {
+  const segs = Math.round((x1 - x0) / lam * 24);
+  const geo = new THREE.TubeGeometry(new SineCurve(x0, x1, amp, lam), segs, rad, 7, false);
+  const mat = new THREE.MeshBasicMaterial({ color: C(colHex), transparent: true,
+    opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false });
+  return { mesh: new THREE.Mesh(geo, mat), lam };
+}
+const lawGroup = new THREE.Group();
+lawGroup.position.set(0, 24, 0);
+scene.add(lawGroup);
+
+// Both trains arrive from the left and TERMINATE on their scatterer at x=0, so
+// the shot reads wave-in -> molecule -> radiation pattern rather than as two
+// unrelated squiggles. Geometry stops one wavelength short of 0 because the
+// travel animation shifts it right by up to lam.
+const LANE = 1.15;
+const waveB = makeWave(LAM_B, 0.40, CL.waveBlue, -22, -LAM_B, 0.075);
+const waveR = makeWave(LAM_R, 0.40, CL.waveRed, -22, -LAM_R, 0.075);
+waveB.mesh.position.set(0, LANE, 0);      // blue upper: its lobe needs the room
+waveR.mesh.position.set(0, -LANE, 0);
+lawGroup.add(waveB.mesh, waveR.mesh);
+
+/**
+ * Rayleigh dipole lobe: r(theta) = 1 + cos^2(theta) about the incident axis
+ * (+x here), revolved in phi. The peanut shape -- equal forward and backward
+ * lobes, minimum broadside -- is the actual phase function, not a stylisation.
+ */
+function rayleighLobe(scale) {
+  const NT = 64, NP = 48;
+  const pos = [], idx = [];
+  for (let i = 0; i <= NT; i++) {
+    const th = (i / NT) * Math.PI, r = (1 + Math.cos(th) ** 2) * scale;
+    for (let j = 0; j <= NP; j++) {
+      const ph = (j / NP) * Math.PI * 2;
+      pos.push(r * Math.cos(th), r * Math.sin(th) * Math.cos(ph), r * Math.sin(th) * Math.sin(ph));
+    }
+  }
+  for (let i = 0; i < NT; i++) for (let j = 0; j < NP; j++) {
+    const a = i * (NP + 1) + j, b = a + NP + 1;
+    idx.push(a, b, a + 1, b, b + 1, a + 1);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx); g.computeVertexNormals();
+  return g;
+}
+function makeLobe(scale, colHex) {
+  const geo = rayleighLobe(scale);
+  const grp = new THREE.Group();
+  const skin = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+    color: C(colHex), transparent: true, opacity: 0, side: THREE.DoubleSide,
+    blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }));
+  const wire = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+    color: C(colHex), transparent: true, opacity: 0, wireframe: true,
+    blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }));
+  grp.add(skin, wire);
+  return { grp, skin, wire };
+}
+// r(theta=0) = 2*scale, so the blue lobe spans +-1.9 units against a half-frame
+// width of ~2.4 at the shooting distance. The red lobe is the SAME shape at
+// 1/9.3789 the radius -- that ratio is the entire point of the beat.
+const LOBE_B = makeLobe(0.65, CL.waveBlue);
+const LOBE_R = makeLobe(0.65 / RATIO, CL.waveRed);
+LOBE_B.grp.position.set(0, LANE, 0);
+LOBE_R.grp.position.set(0, -LANE, 0);
+lawGroup.add(LOBE_B.grp, LOBE_R.grp);
+
+/** N2 as two bonded spheres. Dark and rim-lit -- a pale ball blows out in close-up. */
+function makeN2(r = 0.30, colHex = 0x7f9cc4) {
+  const g = new THREE.Group();
+  const mat = new THREE.MeshStandardMaterial({ color: C(colHex), roughness: 0.42,
+    metalness: 0.15, emissive: C(0x101d33), emissiveIntensity: 0.6, transparent: true });
+  const a = new THREE.Mesh(new THREE.SphereGeometry(r, 20, 16), mat);
+  const b = new THREE.Mesh(new THREE.SphereGeometry(r, 20, 16), mat);
+  a.position.x = -r * 0.60; b.position.x = r * 0.60;
+  const bond = new THREE.Mesh(new THREE.CylinderGeometry(r * 0.34, r * 0.34, r * 1.5, 12), mat);
+  bond.rotation.z = Math.PI / 2;
+  g.add(a, b, bond);
+  return g;
+}
+const molB = makeN2(0.11); molB.position.set(0, LANE, 0); lawGroup.add(molB);
+const molR = makeN2(0.11); molR.position.set(0, -LANE, 0); lawGroup.add(molR);
+
+// ============================================================== SCALE BEAT
+const scaleGroup = new THREE.Group();
+scaleGroup.position.set(0, 24, 0);
+scene.add(scaleGroup);
+const heroMol = makeN2(0.30); scaleGroup.add(heroMol);
+// A wave whose on-screen wavelength really were ~1400x the molecule's diameter
+// would run three orders of magnitude off-frame, so the ratio HERE is
+// compressed for legibility. The caption carries the true number.
+const scaleWave = makeWave(7.0, 0.9, vivid(atNm(470)), -60, 60, 0.028);
+scaleWave.mesh.position.set(0, 0, -0.6);
+scaleGroup.add(scaleWave.mesh);
+
+const FIELD_N = 900;
+const fieldMesh = new THREE.InstancedMesh(
+  new THREE.SphereGeometry(0.16, 6, 5),
+  new THREE.MeshBasicMaterial({ color: C(0x9fc4ff), transparent: true, opacity: 0.5,
+    blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }), FIELD_N);
+const fieldData = Array.from({ length: FIELD_N }, () => ({
+  p: new THREE.Vector3((rnd() - .5) * 160, rnd() * 66, (rnd() - .5) * 160),
+  ph: rnd() * 6.283, sp: .4 + rnd() * 1.2, sc: .5 + rnd() * 1.9,
+}));
+fieldMesh.frustumCulled = false;
+scene.add(fieldMesh);
+
+// ============================================================== PHOTON PATHS
+// Monte Carlo trajectories baked by tools/physics.py: real Rayleigh mean free
+// path per wavelength, real (1+cos^2 theta) phase function. The unit slab is
+// scaled UNIFORMLY into world space so every scattering angle survives.
+const MC_SCALE = 40;
+const mcGroup = new THREE.Group(); scene.add(mcGroup);
+
+/**
+ * One merged tube geometry per photon population, carrying per-vertex arc
+ * length (aS) and a per-photon phase offset (aSeed), so a single uniform drives
+ * a comet-trail reveal across all of them at once.
+ */
+// Seeds must agree between a photon's tube and its scatter flashes, so they come
+// from a golden-ratio low-discrepancy sequence on the path INDEX rather than
+// from the shared PRNG (whose call order differs between the two builders).
+const seedOf = (i) => (i * 0.6180339887498949) % 1;
+const MC_LOOP = 118;          // world units of arc a head travels before looping
+
+const PHOTON_VS = `
+  attribute float aS; attribute float aSeed;
+  uniform float uT, uTrail, uLoop, uSize;
+  varying float vA; varying float vHead;
+  void main(){
+    float head = mod(uT + aSeed*uLoop, uLoop);
+    float d = head - aS;
+    vA    = (d >= 0.0) ? exp(-d/uTrail) : 0.0;
+    vHead = (d >= 0.0) ? exp(-d/3.0)    : 0.0;
+    vec4 mv = modelViewMatrix*vec4(position,1.);
+    gl_Position = projectionMatrix*mv;
+    gl_PointSize = uSize;
+  }`;
+
+function photonMaterial(colHex, extra = {}) {
+  return new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    uniforms: {
+      uT: { value: 0 }, uTrail: { value: 7.0 }, uLoop: { value: MC_LOOP },
+      uCol: { value: C(colHex) }, uHeadCol: { value: C(0xffffff) },
+      uAmp: { value: 0 }, uSize: { value: 1 }, ...extra,
+    },
+    vertexShader: PHOTON_VS,
+    fragmentShader: `
+      uniform vec3 uCol, uHeadCol; uniform float uAmp;
+      varying float vA; varying float vHead;
+      void main(){
+        vec3 c = mix(uCol, uHeadCol, vHead*0.30);
+        gl_FragColor = vec4(c, vA*uAmp);
+      }`,
+  });
+}
+
+/** Merged tube geometry for a photon population, with arc length per vertex. */
+function buildPhotons(paths, colHex, radius) {
+  const geos = [];
+  for (const p of paths) {
+    const pts = p.pts.map(v => new THREE.Vector3(v[0] * MC_SCALE, v[1] * MC_SCALE, v[2] * MC_SCALE));
+    // dedupe: a zero-length segment makes the Frenet frame produce NaNs
+    const clean = [pts[0]];
+    for (let i = 1; i < pts.length; i++)
+      if (pts[i].distanceTo(clean[clean.length - 1]) > 1e-3) clean.push(pts[i]);
+    if (clean.length < 2) continue;
+    let L = 0; for (let i = 1; i < clean.length; i++) L += clean[i].distanceTo(clean[i - 1]);
+    // tension 0 keeps the scattering vertices SHARP -- the kink IS the event
+    const curve = new THREE.CatmullRomCurve3(clean, false, 'catmullrom', 0.0);
+    const g = new THREE.TubeGeometry(curve, Math.max(28, clean.length * 24), radius, 6, false);
+    const n = g.attributes.position.count, uv = g.attributes.uv;
+    const aS = new Float32Array(n), aSeed = new Float32Array(n);
+    const seed = seedOf(p.__i);
+    for (let i = 0; i < n; i++) { aS[i] = uv.getX(i) * L; aSeed[i] = seed; }
+    g.setAttribute('aS', new THREE.BufferAttribute(aS, 1));
+    g.setAttribute('aSeed', new THREE.BufferAttribute(aSeed, 1));
+    g.deleteAttribute('normal'); g.deleteAttribute('uv');
+    geos.push(g);
+  }
+  if (!geos.length) return null;
+  const mesh = new THREE.Mesh(BGU.mergeGeometries(geos, false), photonMaterial(colHex));
+  mesh.frustumCulled = false;
+  return mesh;
+}
+
+/** A glow point at every scattering vertex, flashing as its own head passes. */
+function buildFlashes(paths, colHex, size) {
+  const pos = [], sArr = [], seedArr = [];
+  for (const p of paths) {
+    const pts = p.pts.map(v => new THREE.Vector3(v[0] * MC_SCALE, v[1] * MC_SCALE, v[2] * MC_SCALE));
+    const seed = seedOf(p.__i);
+    let acc = 0;
+    for (let i = 1; i < pts.length; i++) {
+      acc += pts[i].distanceTo(pts[i - 1]);
+      if (i < pts.length - 1) {          // interior vertex == a scattering event
+        pos.push(pts[i].x, pts[i].y, pts[i].z); sArr.push(acc); seedArr.push(seed);
+      }
+    }
+  }
+  if (!pos.length) return null;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('aS', new THREE.Float32BufferAttribute(sArr, 1));
+  g.setAttribute('aSeed', new THREE.Float32BufferAttribute(seedArr, 1));
+  const mat = photonMaterial(colHex, { uSize: { value: size } });
+  mat.uniforms.uTrail.value = 3.4;       // a flash, not a trail
+  const pts = new THREE.Points(g, mat);
+  pts.frustumCulled = false;
+  return pts;
+}
+
+// Split each population by whether it ever scattered. Straight-through photons
+// are drawn DIM: they are 78% of the blue and 95% of the red, and at equal
+// brightness they bury the very events the beat is about. The real fractions go
+// on screen in the caption, so the emphasis is not a claim.
+const tag = (arr) => arr.map((p, i) => (p.__i = i, p));
+const splitBy = (arr, want) => arr.filter(p => (p.n > 0) === want);
+const MCB = tag(DATA.montecarlo.blue), MCR = tag(DATA.montecarlo.red);
+
+const phBlueStraight = buildPhotons(splitBy(MCB, false), CL.waveBlue, 0.13);
+const phBlueScat     = buildPhotons(splitBy(MCB, true),  CL.waveBlue, 0.26);
+const phRedStraight  = buildPhotons(splitBy(MCR, false), CL.waveRed,  0.13);
+const phRedScat      = buildPhotons(splitBy(MCR, true),  CL.waveRed,  0.26);
+const phBlueFlash    = buildFlashes(splitBy(MCB, true),  0xa8ccff, 34);
+const phRedFlash     = buildFlashes(splitBy(MCR, true),  0xffd8c8, 30);
+const PH_ALL = [phBlueStraight, phBlueScat, phRedStraight, phRedScat,
+                phBlueFlash, phRedFlash].filter(Boolean);
+PH_ALL.forEach(m => mcGroup.add(m));
+
+// ============================================================== CAPTIONS
+const capScene = new THREE.Scene();
+const capCam = new THREE.OrthographicCamera(-W / 2, W / 2, H / 2, -H / 2, -500, 500);
+const FONT = '"Helvetica Neue", Helvetica, Arial, sans-serif';
+
+function makeCaption(text, opts = {}) {
+  const { size = 78, weight = 700, tracking = 0.02, color = '#efefef',
+          y = 0, maxWidth = SAFE.x1 - SAFE.x0 } = opts;
+  const probe = document.createElement('canvas').getContext('2d');
+  const measure = (px) => {
+    probe.font = `${weight} ${px}px ${FONT}`;
+    probe.letterSpacing = `${(tracking * px).toFixed(2)}px`;
+    return probe.measureText(text).width;
+  };
+  let fit = size;
+  if (measure(fit) > maxWidth) {           // auto-fit; a hand-picked size overflows
+    let lo = 10, hi = size;
+    while (hi - lo > 0.5) { const m = (lo + hi) / 2; if (measure(m) > maxWidth) hi = m; else lo = m; }
+    fit = Math.floor(lo);
+  }
+  probe.font = `${weight} ${fit}px ${FONT}`;
+  probe.letterSpacing = `${(tracking * fit).toFixed(2)}px`;
+  const total = probe.measureText(text).width;
+
+  const group = new THREE.Group();
+  group.position.set(LANE_CX - W / 2, y, 0);
+  capScene.add(group);
+
+  const chars = [];
+  let cursor = -total / 2;
+  const PAD = Math.ceil(fit * 0.42);
+  for (const ch of text) {
+    const adv = probe.measureText(ch).width;
+    if (ch !== ' ') {
+      const cw = Math.ceil(adv) + PAD * 2, chh = Math.ceil(fit * 1.7) + PAD;
+      const cv = document.createElement('canvas'); cv.width = cw; cv.height = chh;
+      const g = cv.getContext('2d');
+      g.font = `${weight} ${fit}px ${FONT}`;
+      g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = color;
+      g.fillText(ch, cw / 2, chh / 2);
+      const tex = new THREE.CanvasTexture(cv);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.minFilter = tex.magFilter = THREE.LinearFilter; tex.generateMipmaps = false;
+      renderer.initTexture(tex);            // else a mid-piece debut renders blank
+      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(cw, chh),
+        // normal alpha, not additive: additive glyph edges compound against the
+        // glow behind them and legibility goes. Bloom supplies the halo.
+        new THREE.MeshBasicMaterial({ map: tex, transparent: true,
+          depthTest: false, depthWrite: false, toneMapped: false }));
+      mesh.position.x = cursor + adv / 2;
+      group.add(mesh);
+      chars.push({ mesh });
+    }
+    cursor += adv;
+  }
+  return {
+    group, chars, size: fit, width: total,
+    play(f, a, b, c, d) {
+      const n = chars.length || 1;
+      // Cap TOTAL stagger: a fixed per-char delay makes a long line take
+      // seconds to land and opens its exit before its entrance finishes.
+      const SI = Math.min(1.0, 11 / n), SO = Math.min(0.5, 6 / n);
+      let vis = false, maxO = 0;
+      for (let i = 0; i < n; i++) {
+        const m = chars[i].mesh;
+        const pi = clamp((f - a - i * SI) / Math.max(1, b - a), 0, 1);
+        const po = clamp((f - c - i * SO) / Math.max(1, d - c), 0, 1);
+        const ei = E.outQuint(pi), eo = E.inCubic(po);
+        const o = ei * (1 - eo);
+        m.material.opacity = o;
+        m.position.y = (1 - ei) * 46 - eo * 30;
+        m.scale.setScalar((0.82 + 0.18 * ei) * (1 - 0.10 * eo));
+        m.rotation.x = (1 - ei) * -0.95 + eo * 0.5;
+        m.visible = o > 0.003;
+        if (m.visible) vis = true;
+        if (o > maxO) maxO = o;
+      }
+      group.visible = vis;
+      return maxO;               // drives the scrim behind this text band
+    },
+  };
+}
+
+/** A canvas-drawn data panel in the ortho overlay: charts, swatches, readouts. */
+function makePanel(w, h, y, draw, opts = {}) {
+  const S = 2;                                  // supersample, then linear-filter down
+  const cv = document.createElement('canvas'); cv.width = w * S; cv.height = h * S;
+  const g = cv.getContext('2d');
+  g.scale(S, S);
+  draw(g, w, h);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter = tex.magFilter = THREE.LinearFilter; tex.generateMipmaps = false;
+  renderer.initTexture(tex);
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0,
+      depthTest: false, depthWrite: false, toneMapped: false }));
+  mesh.position.set(LANE_CX - W / 2 + (opts.dx || 0), y, 0);
+  capScene.add(mesh);
+  return { mesh, play(f, a, b, c, d) {
+    const ein = E.outQuint(span(f, a, b));
+    const o = ein * (1 - E.inCubic(span(f, c, d)));
+    mesh.material.opacity = o;
+    mesh.position.y = y + (1 - ein) * 26;
+    mesh.scale.setScalar(0.97 + 0.03 * ein);
+    mesh.visible = o > 0.004;
+    return o;
+  } };
+}
+
+const px = (n, w = 400) => `${w} ${n}px ${FONT}`;
+
+/**
+ * Soft dark scrim behind a text band. Without this, white type over the lit
+ * sky dome is unreadable for most of the piece -- the single biggest
+ * legibility fix in the whole file. renderOrder -1 keeps it under everything
+ * in capScene regardless of construction order.
+ */
+function makeScrim(yTop, yBot, strength = 0.62) {
+  const h = yTop - yBot, n = 256;
+  const cv = document.createElement('canvas'); cv.width = 4; cv.height = n;
+  const g = cv.getContext('2d');
+  const grd = g.createLinearGradient(0, 0, 0, n);
+  // feathered at both ends so there is no visible edge against the sky
+  grd.addColorStop(0.00, 'rgba(2,4,10,0)');
+  grd.addColorStop(0.22, `rgba(2,4,10,${strength})`);
+  grd.addColorStop(0.74, `rgba(2,4,10,${strength})`);
+  grd.addColorStop(1.00, 'rgba(2,4,10,0)');
+  g.fillStyle = grd; g.fillRect(0, 0, 4, n);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter = tex.magFilter = THREE.LinearFilter; tex.generateMipmaps = false;
+  renderer.initTexture(tex);
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(W * 1.2, h),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0,
+      depthTest: false, depthWrite: false, toneMapped: false }));
+  mesh.position.set(0, (yTop + yBot) / 2, 0);
+  mesh.renderOrder = -1;
+  capScene.add(mesh);
+  return { mesh, set(o) { mesh.material.opacity = o; mesh.visible = o > 0.004; } };
+}
+const scrimTop = makeScrim(820, 330, 0.70);     // headline + subline band
+const scrimBot = makeScrim(-180, -720, 0.66);   // data-panel band
+
+// ---- panel: the spectrum bar, coloured by the CIE integration in physics.py
+const spectrumPanel = makePanel(820, 200, -430, (g, w) => {
+  const x0 = 30, x1 = w - 30, ytop = 46, hbar = 78;
+  for (let i = 0; i < STRIP.length; i++) {
+    const t = i / (STRIP.length - 1);
+    g.fillStyle = STRIP[i][1];
+    g.fillRect(x0 + t * (x1 - x0) - 1, ytop, (x1 - x0) / STRIP.length + 2.4, hbar);
+  }
+  g.strokeStyle = 'rgba(255,255,255,0.30)'; g.lineWidth = 1.5;
+  g.strokeRect(x0, ytop, x1 - x0, hbar);
+  g.fillStyle = '#cfd8e6'; g.font = px(25, 600); g.textBaseline = 'top';
+  g.textAlign = 'left';   g.fillText('380 nm', x0, ytop + hbar + 14);
+  g.textAlign = 'right';  g.fillText('720 nm', x1, ytop + hbar + 14);
+  g.textAlign = 'center'; g.fillStyle = '#8c9ab0'; g.font = px(21, 500);
+  g.fillText('VISIBLE SPECTRUM', (x0 + x1) / 2, ytop + hbar + 16);
+  const tp = (NUM.wien_peak_nm - 380) / (720 - 380);
+  const xp = x0 + tp * (x1 - x0);
+  g.strokeStyle = '#ffffff'; g.lineWidth = 2.5;
+  g.beginPath(); g.moveTo(xp, ytop - 12); g.lineTo(xp, ytop + hbar + 6); g.stroke();
+  g.fillStyle = '#ffffff'; g.font = px(23, 700); g.textAlign = 'center'; g.textBaseline = 'bottom';
+  g.fillText(`PEAK ${NUM.wien_peak_nm.toFixed(0)} nm`, xp, ytop - 16);
+});
+
+// ---- panel: the 1/lambda^4 curve, plotted straight from data/physics.json
+const curvePanel = makePanel(760, 430, -420, (g, w, h) => {
+  const CV = DATA.lambda4_curve;             // [[nm, (550/nm)^4], ...]
+  const x0 = 96, x1 = w - 34, y0 = h - 78, y1 = 46;
+  const lmin = CV[0][0], lmax = CV[CV.length - 1][0];
+  const vmax = Math.max(...CV.map(p => p[1]));
+  const X = l => x0 + (l - lmin) / (lmax - lmin) * (x1 - x0);
+  const Y = v => y0 - (v / vmax) * (y0 - y1);
+  g.strokeStyle = 'rgba(255,255,255,0.28)'; g.lineWidth = 1.6;
+  g.beginPath(); g.moveTo(x0, y1 - 8); g.lineTo(x0, y0); g.lineTo(x1, y0); g.stroke();
+  // spectrum ribbon on the x axis, so the curve is read against real colour
+  for (let i = 0; i < STRIP.length; i++) {
+    const nm = STRIP[i][0]; if (nm < lmin || nm > lmax) continue;
+    g.fillStyle = STRIP[i][1];
+    g.fillRect(X(nm) - 1, y0 + 7, (x1 - x0) / ((lmax - lmin) / 2) + 2.6, 15);
+  }
+  g.beginPath(); g.moveTo(X(CV[0][0]), y0);
+  CV.forEach(p => g.lineTo(X(p[0]), Y(p[1])));
+  g.lineTo(X(CV[CV.length - 1][0]), y0); g.closePath();
+  const grd = g.createLinearGradient(x0, 0, x1, 0);
+  grd.addColorStop(0, 'rgba(120,140,255,0.45)'); grd.addColorStop(1, 'rgba(255,90,60,0.12)');
+  g.fillStyle = grd; g.fill();
+  g.strokeStyle = '#eaf0ff'; g.lineWidth = 3.4;
+  g.beginPath(); CV.forEach((p, i) => i ? g.lineTo(X(p[0]), Y(p[1])) : g.moveTo(X(p[0]), Y(p[1]))); g.stroke();
+  const mark = (nm, col, label) => {
+    const v = (550 / nm) ** 4;
+    g.strokeStyle = 'rgba(255,255,255,0.32)'; g.lineWidth = 1.4;
+    g.beginPath(); g.moveTo(X(nm), Y(v)); g.lineTo(X(nm), y0); g.stroke();
+    g.fillStyle = col; g.beginPath(); g.arc(X(nm), Y(v), 8, 0, 6.283); g.fill();
+    g.fillStyle = '#dbe4f2'; g.font = px(23, 700); g.textAlign = 'center'; g.textBaseline = 'bottom';
+    g.fillText(label, X(nm), Y(v) - 15);
+  };
+  mark(400, CL.waveBlue, '400 nm');
+  mark(700, CL.waveRed, '700 nm');
+  g.save(); g.translate(30, (y0 + y1) / 2); g.rotate(-Math.PI / 2);
+  g.fillStyle = '#9fb0c6'; g.font = px(24, 600); g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText('SCATTERING STRENGTH', 0, 0); g.restore();
+  g.fillStyle = '#ffffff'; g.font = px(42, 700); g.textAlign = 'right'; g.textBaseline = 'top';
+  g.fillText('1 / λ⁴', x1 - 6, y1 - 2);
+});
+
+// ---- lobe labels. Panel-local (0,0) is top-left; the panel spans ortho
+//      x -450..+450 and y +400..-800, and the lobes sit on ortho x = -60
+//      (the lane), blue near y +64 and red near y -527.
+const lobeLabels = makePanel(900, 1200, -200, (g) => {
+  const P = (ox, oy) => [ox + 450, 400 - oy];
+  const tag = (ox, oy, nm, col, note, align, tickTo) => {
+    const [x, y] = P(ox, oy);
+    if (tickTo != null) {
+      const [tx, ty] = P(tickTo, oy);
+      g.strokeStyle = 'rgba(255,255,255,0.45)'; g.lineWidth = 1.6;
+      g.beginPath(); g.moveTo(tx, ty);
+      g.lineTo(x + (align === 'right' ? 12 : -12), y); g.stroke();
+    }
+    g.textAlign = align; g.textBaseline = 'middle';
+    g.fillStyle = col; g.font = px(38, 800);
+    g.fillText(nm, x, y - 18);
+    g.fillStyle = '#c3cfe0'; g.font = px(25, 600);
+    g.fillText(note, x, y + 20);
+  };
+  // blue label sits ABOVE its lobe (which spans ortho y -103..+231) and is
+  // right-aligned inside the panel, or the note runs off the texture edge
+  tag(410, 300, '400 nm', CL.waveBlue, '9.4× THE SCATTER', 'right', null);
+  tag(70, -524, '700 nm', CL.waveRed, '1×', 'left', 10);
+});
+
+// ---- panel: what Rayleigh scattering sends your way, against what your eye
+//      actually registers of it. Both curves come straight from physics.py.
+const violetPanel = makePanel(860, 470, -390, (g, w, h) => {
+  const VC = DATA.violet_curves;
+  const x0 = 40, x1 = w - 34, y0 = h - 92, y1 = 62;
+  const lmin = VC.lam[0], lmax = VC.lam[VC.lam.length - 1];
+  const X = l => x0 + (l - lmin) / (lmax - lmin) * (x1 - x0);
+  const Y = v => y0 - v * (y0 - y1);
+  for (let i = 0; i < STRIP.length; i++) {
+    const nm = STRIP[i][0]; if (nm < lmin || nm > lmax) continue;
+    g.fillStyle = STRIP[i][1];
+    g.fillRect(X(nm) - 1, y0 + 8, (x1 - x0) / ((lmax - lmin) / 2) + 2.6, 16);
+  }
+  const plot = (key, stroke, fillA, dash) => {
+    g.beginPath(); g.moveTo(X(lmin), y0);
+    VC.lam.forEach((l, i) => g.lineTo(X(l), Y(VC[key][i])));
+    g.lineTo(X(lmax), y0); g.closePath();
+    g.fillStyle = fillA; g.fill();
+    g.setLineDash(dash); g.strokeStyle = stroke; g.lineWidth = 3.2;
+    g.beginPath(); VC.lam.forEach((l, i) => i ? g.lineTo(X(l), Y(VC[key][i]))
+                                              : g.moveTo(X(l), Y(VC[key][i])));
+    g.stroke(); g.setLineDash([]);
+  };
+  plot('scattered', '#9d8bff', 'rgba(120,110,255,0.20)', [9, 7]);
+  plot('seen', '#eaf2ff', 'rgba(150,190,255,0.26)', []);
+  g.textBaseline = 'top'; g.textAlign = 'left';
+  g.fillStyle = '#9d8bff'; g.font = px(30, 800);
+  g.fillText('WHAT SCATTERS', x0 + 10, y1 - 44);
+  g.fillStyle = '#eaf2ff'; g.font = px(30, 800);
+  g.fillText('WHAT YOU SEE', X(555), y1 - 44);
+  g.fillStyle = '#a4b2c6'; g.font = px(24, 600);
+  g.textAlign = 'left';  g.fillText('380 nm', x0, y0 + 32);
+  g.textAlign = 'right'; g.fillText('700 nm', x1, y0 + 32);
+  g.textAlign = 'center'; g.fillStyle = '#7c8ba1'; g.font = px(21, 500);
+  g.fillText('scattered energy × the CIE 1931 luminous response',
+             (x0 + x1) / 2, y0 + 60);
+});
+
+// ---- panel: the derived sky colour and where it came from
+const swatchPanel = makePanel(830, 300, -400, (g, w, h) => {
+  const bw = 250, bh = 186, bx = 26, by = 48;
+  g.fillStyle = CL.sky; g.fillRect(bx, by, bw, bh);
+  g.strokeStyle = 'rgba(255,255,255,0.40)'; g.lineWidth = 2; g.strokeRect(bx, by, bw, bh);
+  const tx = bx + bw + 40;
+  g.textAlign = 'left'; g.textBaseline = 'top';
+  g.fillStyle = '#e8eef8'; g.font = px(34, 700);
+  g.fillText('SUNLIGHT × 1/λ⁴,', tx, by + 2);
+  g.fillText('THROUGH YOUR EYE:', tx, by + 46);
+  g.font = px(62, 800); g.fillStyle = CL.sky;
+  g.fillText(CL.sky.toUpperCase(), tx, by + 104);
+  g.font = px(22, 500); g.fillStyle = '#8d9cb2';
+  g.fillText('SPECTRAL INTEGRAL → CIE 1931 → sRGB', tx, by + 180);
+  g.fillStyle = '#8d9cb2'; g.font = px(21, 600); g.textAlign = 'center';
+  g.fillText('SINGLE SCATTER', bx + bw / 2, by + bh + 14);
+});
+
+// ---- panel: what survives the horizon path
+const sunsetPanel = makePanel(800, 300, -430, (g, w) => {
+  const x0 = 34, x1 = w - 34;
+  const AM = NUM.airmass_horizon;
+  const Tb = Math.exp(-NUM.tau_zenith_440 * AM), Tr = Math.exp(-NUM.tau_zenith_660 * AM);
+  // log-scaled bars: linear, blue (1e-4) would be a sub-pixel sliver next to red
+  const lg = v => clamp((Math.log10(v) + 5) / 5, 0.02, 1);
+  const row = (yy, label, frac, col, tag) => {
+    g.fillStyle = '#c8d3e2'; g.font = px(25, 700); g.textAlign = 'left'; g.textBaseline = 'middle';
+    g.fillText(label, x0, yy);
+    const bx = x0 + 195, bw = x1 - bx - 140;
+    g.fillStyle = 'rgba(255,255,255,0.09)'; g.fillRect(bx, yy - 17, bw, 34);
+    g.fillStyle = col; g.fillRect(bx, yy - 17, Math.max(3, bw * frac), 34);
+    g.fillStyle = '#e8eef8'; g.font = px(24, 700); g.textAlign = 'right';
+    g.fillText(tag, x1, yy);
+  };
+  g.fillStyle = '#9fb0c6'; g.font = px(23, 600); g.textAlign = 'left'; g.textBaseline = 'top';
+  g.fillText(`SURVIVING THE HORIZON PATH — AIRMASS ${AM.toFixed(1)}`, x0, 24);
+  row(122, 'RED  660 nm', lg(Tr), CL.waveRed, `${(Tr * 100).toFixed(1)}%`);
+  row(198, 'BLUE 440 nm', lg(Tb), CL.waveBlue, `${(Tb * 100).toFixed(3)}%`);
+  g.fillStyle = '#7c8ba1'; g.font = px(19, 500); g.textAlign = 'left'; g.textBaseline = 'top';
+  g.fillText('bars log-scaled', x0, 250);
+  g.textAlign = 'right'; g.fillStyle = '#e8eef8'; g.font = px(27, 800);
+  g.fillText(`RED GETS THROUGH ${Math.round(NUM.horizon_transmit_ratio / 10) * 10}× MORE`, x1, 246);
+});
+
+// ---- headlines / sublines. Numbers are interpolated from the baked data so a
+//      caption can never drift from what the solver computed.
+const R47 = NUM.ratio_pure_400_700.toFixed(1);                // 9.4
+const SIZE_X = Math.round(NUM.wave_vs_molecule / 100) * 100;   // 1400
+const AM_X = NUM.airmass_horizon.toFixed(0);                   // 38
+const EYE = NUM.eye_sens_400_pct.toFixed(2);                   // 0.04
+// fraction of a straight-up beam scattered at least once, = 1 - exp(-tau)
+const B_PCT = (NUM.zenith_scatter_frac_440 * 100).toFixed(0);   // 22
+const R_PCT = (NUM.zenith_scatter_frac_660 * 100).toFixed(1);   // 4.5
+const HEAD = { y: 585, size: 86, weight: 800, tracking: 0.005 };
+const SUB = { y: 468, size: 46, weight: 600, tracking: 0.045, color: '#9fd0ff' };
+
+const CAP = {
+  h1: makeCaption('WHY IS THE SKY BLUE?', { ...HEAD }),
+  s1: makeCaption('IT IS NOT REFLECTED OCEAN', { ...SUB }),
+
+  h2: makeCaption('SUNLIGHT ISN’T WHITE', { ...HEAD }),
+  s2: makeCaption('IT IS EVERY WAVELENGTH AT ONCE', { ...SUB }),
+  h3: makeCaption('A 5772 K FIRE', { ...HEAD }),
+  s3: makeCaption(`RADIATING HARDEST AT ${NUM.wien_peak_nm.toFixed(0)} nm`, { ...SUB }),
+
+  h4: makeCaption('NOW ADD AIR', { ...HEAD }),
+  s4: makeCaption(`N₂ AND O₂ — ${SIZE_X}× SMALLER THAN THE WAVE`, { ...SUB }),
+  s5: makeCaption('EACH ONE RERADIATES LIKE A TINY ANTENNA', { ...SUB }),
+
+  h5: makeCaption('SCATTERING ∝ 1 / λ⁴', { ...HEAD }),
+  s6: makeCaption('HALVE THE WAVELENGTH, 16× THE SCATTER', { ...SUB }),
+  h6: makeCaption(`BLUE SCATTERS ${R47}× HARDER`, { ...HEAD }),
+  s7: makeCaption('400 nm AGAINST 700 nm', { ...SUB }),
+
+  h7: makeCaption('RED FLIES STRAIGHT THROUGH', { ...HEAD }),
+  s8: makeCaption(`ONLY ${R_PCT}% OF IT SCATTERS`, { ...SUB }),
+  h8: makeCaption('BLUE GETS TURNED ASIDE', { ...HEAD }),
+  s9: makeCaption(`${B_PCT}% — ARRIVING FROM EVERY DIRECTION`, { ...SUB }),
+
+  h9: makeCaption('BUT VIOLET SCATTERS MORE', { ...HEAD }),
+  s10: makeCaption(`YOUR EYE SEES ${EYE}% OF PEAK AT 400 nm`, { ...SUB }),
+  h10: makeCaption('SO THE MIX READS BLUE', { ...HEAD }),
+
+  h11: makeCaption('NOW DROP THE SUN', { ...HEAD }),
+  s11: makeCaption(`LIGHT CROSSES ${AM_X}× MORE AIR`, { ...SUB }),
+  h12: makeCaption('THE BLUE IS ALL GONE', { ...HEAD }),
+  s12: makeCaption('SCATTERED AWAY BEFORE IT REACHES YOU', { ...SUB }),
+
+  t1: makeCaption('1 / λ⁴', { y: 600, size: 190, weight: 800, tracking: 0.03 }),
+  t2: makeCaption('THAT IS THE WHOLE SKY', { y: 424, size: 50, weight: 600,
+                                             tracking: 0.09, color: '#9fd0ff' }),
+};
+
+// Full-frame flash, a few frames only -- a long wash reads as a cheap cut.
+const flashPlane = new THREE.Mesh(new THREE.PlaneGeometry(4, 4),
+  new THREE.MeshBasicMaterial({ color: C(0xd8e6ff), transparent: true, opacity: 0,
+    depthTest: false, toneMapped: false }));
+flashPlane.renderOrder = 999; flashPlane.scale.set(W, H, 1);
+capScene.add(flashPlane);
+
+// ============================================================== POST CHAIN
+const rtOpts = { type: THREE.HalfFloatType, colorSpace: THREE.LinearSRGBColorSpace };
+const sceneTarget = new THREE.WebGLRenderTarget(W, H, { ...rtOpts, samples: 4, depthBuffer: true });
+const accumTarget = new THREE.WebGLRenderTarget(W, H, { ...rtOpts, depthBuffer: false });
+
+const accScene = new THREE.Scene();
+const accCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const accMat = new THREE.ShaderMaterial({
+  uniforms: { tSrc: { value: null }, uW: { value: 1 / SUBSAMPLES } },
+  vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.,1.); }`,
+  // 1/N in-shader, not via material opacity: transparent objects make
+  // opacity-as-weight unreliable.
+  fragmentShader: `uniform sampler2D tSrc; uniform float uW; varying vec2 vUv;
+    void main(){ gl_FragColor = vec4(texture2D(tSrc,vUv).rgb*uW, 1.0); }`,
+  depthTest: false, depthWrite: false,
+  blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor,
+});
+accScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), accMat));
+
+const LookShader = {
+  uniforms: { tDiffuse: { value: null }, uRes: { value: new THREE.Vector2(W, H) },
+              uVig: { value: 0.66 }, uGrain: { value: 0.55 } },
+  vertexShader: `varying vec2 vUv;
+    void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
+  fragmentShader: `
+    uniform sampler2D tDiffuse; uniform vec2 uRes; uniform float uVig, uGrain;
+    varying vec2 vUv;
+    // These constants are sRGB CODE UNITS but this pass runs before OutputPass,
+    // i.e. in LINEAR space. Adding them raw is a ~13x error near black.
+    float srgb2lin(float c){ return (c/255.0)/12.92; }
+    float hash(vec2 p){ p=fract(p*vec2(233.34,851.73)); p+=dot(p,p+23.45); return fract(p.x*p.y); }
+    float vnoise(vec2 p){
+      vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+      return mix(mix(hash(i),hash(i+vec2(1,0)),f.x), mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),f.x), f.y);
+    }
+    void main(){
+      vec2 c = vUv-0.5;
+      // radial chromatic aberration: 2.79 px R-B at the corner, zero at centre
+      vec3 col;
+      col.r = texture2D(tDiffuse, 0.5 + c*1.001369).r;
+      col.g = texture2D(tDiffuse, vUv).g;
+      col.b = texture2D(tDiffuse, 0.5 + c*0.998589).b;
+
+      float r = length(c*vec2(1.0, 0.62));
+      col *= clamp(1.0 - uVig*(r*r*2.15 - 0.06), 0.0, 1.0);
+
+      col += vec3(srgb2lin(3.2), srgb2lin(2.6), srgb2lin(4.4));   // black is not 0
+
+      // static grain (46.55 px). Static reads as film; animated reads as noise.
+      float n = vnoise(vUv*uRes/46.55) - 0.5;
+      col += vec3(srgb2lin(0.189), srgb2lin(0.24), srgb2lin(0.290))*n*2.0*uGrain*24.0;
+
+      gl_FragColor = vec4(max(col,0.0), 1.0);
+    }`,
+};
+
+const composer = new EffectComposer(renderer);
+composer.setSize(W, H);
+const texPass = new TexturePass(accumTarget.texture);
+composer.addPass(texPass);
+// Threshold HIGH on purpose -- near zero, every dim pixel enters the mip chain
+// and the frame hazes to milky grey. Threshold and strength are TUNED.
+const BLOOM_BASE = 0.40;
+const bloom = new UnrealBloomPass(new THREE.Vector2(W, H), BLOOM_BASE, 0.34, 0.72);
+{ // far glow reads violet: blue carries the widest lobes, green ~73% of blue
+  const tints = [[1,.98,1],[.97,.90,1],[.92,.82,1],[.88,.76,1],[.86,.74,1]]
+    .map(([r, g, b]) => new THREE.Vector3(r, g, b));
+  if (bloom.bloomTintColors) bloom.bloomTintColors = tints;
+  if (bloom.compositeMaterial?.uniforms?.bloomTintColors)
+    bloom.compositeMaterial.uniforms.bloomTintColors.value = tints;
+}
+composer.addPass(bloom);
+composer.addPass(new ShaderPass(LookShader));
+composer.addPass(new OutputPass());
+
+// Halton (2,3) on a disc: aperture offset (DoF) and sub-pixel offset (AA) from
+// one fixed table. Not a PRNG -- the render must reproduce.
+const halton = (i, b) => { let f = 1, r = 0, n = i + 1;
+  while (n > 0) { f /= b; r += f * (n % b); n = Math.floor(n / b); } return r; };
+const SAMPLES = Array.from({ length: SUBSAMPLES }, (_, i) => {
+  const u = halton(i, 2), v = halton(i, 3), rr = Math.sqrt(u), th = v * Math.PI * 2;
+  return { dx: Math.cos(th) * rr, dy: Math.sin(th) * rr,
+           jx: halton(i, 5) - .5, jy: halton(i, 7) - .5 };
+});
+
+// ============================================================== CAMERA
+// [frame, x,y,z, tx,ty,tz, aperture, fov]. All locked-off: the piece has no one
+// travelling subject, so keys are world coordinates. The focal plane sits on the
+// TARGET, so every target here is something that should be sharp.
+const CAMKEYS = [
+  // hook -- looking up at the sun through airless, star-lit sky
+  [0,      0,  46,  118,    0, 176,  -34,   0.16, 34],
+  [125,    0,  54,  104,    0, 172,  -30,   0.20, 32],
+  // spectrum -- the fan is 54 units long, so stand well back and hold it whole
+  [154,    0,  86,  150,    0,  86,    0,   0.12, 33],
+  [330,    0,  74,  158,    0,  74,    0,   0.20, 31],
+  // scale -- dive to a single molecule (r=0.30, so ~2/3 of frame width at d=9)
+  [374,    0,  24.4, 15,    0,  24,    0,   0.05, 30],
+  [500,    0,  24.2,  9,    0,  24,    0,   0.07, 30],
+  // law -- axis sits 0.6 ABOVE the blue lane so the lobe clears the caption band
+  [556,    0,  24.9, 13,    0,  24.9,  0,   0.08, 32],
+  [760,   -0.8, 24.9, 12.4, 0,  24.9,  0,   0.10, 32],
+  // skyfill -- clear the beam standing at x=z=0 before it is lit, then settle
+  [790,    0,  26,   66,    0,  27,    0,   0.14, 34],
+  [836,    0,  27,  120,    0,  27,    0,   0.20, 34],
+  [1000,   0,  24,  138,    0,  30,    0,   0.26, 34],
+  // violet -- drift up into the blue
+  [1080,   0,  20,  130,    0,  34,    0,   0.24, 33],
+  [1160,   0,  14,  116,    0,  40,    0,   0.22, 33],
+  // sunset -- drop to the ground and face the setting sun
+  [1238,   0,   9,   60,    0,  20, -200,   0.16, 32],
+  [1360,   0,   8,   44,    0,  24, -300,   0.12, 30],
+  // title
+  [1439,   0,   8,   50,    0,  26, -320,   0.10, 31],
+];
+const _pA = new THREE.Vector3(), _tA = new THREE.Vector3();
+const _pB = new THREE.Vector3(), _tB = new THREE.Vector3();
+function camAt(frame) {
+  let i = 0;
+  while (i < CAMKEYS.length - 2 && frame > CAMKEYS[i + 1][0]) i++;
+  const A = CAMKEYS[i], B = CAMKEYS[i + 1];
+  const t = E.inOutCubic(span(frame, A[0], B[0]));
+  _pA.set(A[1], A[2], A[3]); _tA.set(A[4], A[5], A[6]);
+  _pB.set(B[1], B[2], B[3]); _tB.set(B[4], B[5], B[6]);
+  return { pos: _pA.clone().lerp(_pB, t), tgt: _tA.clone().lerp(_tB, t),
+           ap: lerp(A[7], B[7], t), fov: lerp(A[8], B[8], t) };
+}
+
+// ============================================================== POSE
+const UP = new THREE.Vector3(0, 1, 0);
+const _cF = new THREE.Vector3(), _cR = new THREE.Vector3(), _cU = new THREE.Vector3();
+const _dummy = new THREE.Object3D();
+const _sunCol = new THREE.Color();
+
+/** Write an opacity onto every material under a group. */
+function fade(root, o) {
+  root.traverse(n => { if (n.material) n.material.opacity = o; });
+}
+
+function pose(frame, sample) {
+  const F = Math.floor(frame + 1e-6);
+
+  // ---- camera + accumulation depth of field. Offsetting the eye across the
+  // aperture and re-aiming at the same target keeps that plane sharp.
+  const ck = camAt(frame);
+  camera.fov = ck.fov;
+  _cF.subVectors(ck.tgt, ck.pos).normalize();
+  _cR.crossVectors(_cF, UP).normalize();
+  _cU.crossVectors(_cR, _cF).normalize();
+  camera.position.copy(ck.pos)
+    .addScaledVector(_cR, sample.dx * ck.ap)
+    .addScaledVector(_cU, sample.dy * ck.ap);
+  camera.lookAt(ck.tgt);
+  camera.setViewOffset(W, H, sample.jx + LANE_SHIFT, sample.jy, W, H);
+  camera.updateProjectionMatrix();
+
+  // ---- sun: high for most of the piece, setting during the sunset beat
+  const sunsetT = ease(frame, 1158, 1232, E.inOutCubic);
+  const sp = sunPos(lerp(26, 86.0, sunsetT));
+  sunGroup.position.copy(sp);
+  _sunCol.copy(C(CL.sunHigh)).lerp(C(CL.sunLow), sunsetT);
+  sunBody.material.color.copy(_sunCol);
+  sunGlow.material.color.copy(_sunCol);
+  sunGlow.scale.setScalar(lerp(190, 300, sunsetT));
+  const sunVis = clamp(pulse(frame, 0, 1, 336, 376) + pulse(frame, 1168, 1236, 1460, 1470), 0, 1);
+  sunBody.material.opacity = sunVis;
+  sunGlow.material.opacity = sunVis * lerp(0.85, 0.60, sunsetT);
+  sunGroup.visible = sunVis > 0.01;
+
+  starMat.opacity = (1 - ease(frame, 250, 430, E.inOutCubic)) * 0.9;
+
+  // A ground/sky horizon line cutting across a molecular close-up is a lie
+  // about where the camera is, and it reads as a hard seam. Drop the terrain
+  // for the scale and law beats, bring it back when we pull out.
+  terrain.visible = frame < 330 || frame > 778;
+
+  // ---- dome: airless black, then the derived sky, then the sunset tint
+  domeMat.uniforms.uFill.value = ease(frame, 300, 430, E.inOutCubic) * 0.30
+    + ease(frame, 830, 1010, E.inOutCubic) * 0.70;
+  domeMat.uniforms.uSunset.value = sunsetT;
+  domeMat.uniforms.uSunDir.value.copy(sp).normalize();
+  const closeUp = pulse(frame, 300, 380, 740, 830, E.outSoft);
+  domeMat.uniforms.uGain.value = lerp(1.0, 0.88, sunsetT) * (1 - 0.26 * closeUp);
+
+  // ---- spectrum fan: collapsed (additively white) -> dispersed
+  const fanOn = pulse(frame, 130, 170, 300, 338, E.outSoft);
+  const spread = ease(frame, 178, 272, E.inOutCubic);
+  fanGroup.visible = fanOn > 0.01;
+  if (fanGroup.visible) {
+    fanGroup.rotation.z = Math.sin(frame * 0.006) * 0.035;   // authored, not accumulated
+    fanBeam.material.opacity = fanOn * 0.5;
+    for (const b of fanBands) {
+      b.mesh.rotation.z = b.ang * spread;
+      // collapsed, 171 additive bands would sum to a blown white bar; taper the
+      // per-band weight so the SUM lands near 1 rather than near 171
+      b.mesh.material.opacity = fanOn * lerp(0.022, 0.55, spread);
+    }
+  }
+
+  // ---- scale beat: hero molecule with a wave sweeping past
+  const scaleOn = pulse(frame, 338, 384, 486, 512, E.outSoft);
+  scaleGroup.visible = scaleOn > 0.01;
+  if (scaleGroup.visible) {
+    heroMol.rotation.set(frame * 0.004, frame * 0.011, 0.2);
+    fade(heroMol, scaleOn);
+    scaleWave.mesh.material.opacity = scaleOn * 0.95;
+    // translating a sine by a whole wavelength is invisible, so mod keeps the
+    // train travelling forever without the geometry running out
+    scaleWave.mesh.position.x = (frame * 0.30) % scaleWave.lam;
+  }
+
+  // ---- law beat: two wave trains at the true 700/400 wavelength ratio
+  const lawOn = pulse(frame, 508, 554, 790, 826, E.outSoft);
+  lawGroup.visible = lawOn > 0.01;
+  if (lawGroup.visible) {
+    waveB.mesh.material.opacity = lawOn * 0.95;
+    waveR.mesh.material.opacity = lawOn * 0.95;
+    // same phase VELOCITY for both -- in vacuum every wavelength travels at c,
+    // so the blue train cycles past a fixed point exactly 1.75x more often
+    const travel = frame * 0.26;
+    waveB.mesh.position.x = travel % waveB.lam;
+    waveR.mesh.position.x = travel % waveR.lam;
+    const lobeOn = pulse(frame, 626, 678, 788, 822, E.outSoft);
+    const bre = 1 + 0.035 * Math.sin(frame * 0.09);
+    LOBE_B.grp.scale.setScalar(lobeOn * bre);
+    LOBE_R.grp.scale.setScalar(lobeOn * bre);
+    LOBE_B.skin.material.opacity = lobeOn * 0.055;
+    LOBE_B.wire.material.opacity = lobeOn * 0.16;
+    LOBE_R.skin.material.opacity = lobeOn * 0.075;
+    LOBE_R.wire.material.opacity = lobeOn * 0.32;   // tiny: needs the extra edge
+    fade(molB, lawOn); fade(molR, lawOn);
+    molB.rotation.y = frame * 0.02; molR.rotation.y = -frame * 0.02;
+  }
+
+  // ---- photon rain: the Monte Carlo, revealed as comet trails
+  const mcOn = pulse(frame, 782, 844, 1120, 1162, E.outSoft);
+  mcGroup.visible = mcOn > 0.01;
+  if (mcGroup.visible) {
+    const t = (frame - 700) * 0.55;
+    PH_ALL.forEach(m => { m.material.uniforms.uT.value = t; });
+    // red enters first, so "straight through" is established before "bounced"
+    const blueIn = E.outSoft(span(frame, 858, 920));
+    // the straight-through tubes are coincident, so they SUM into the beam --
+    // each one has to be dim or the column blows out
+    phRedStraight.material.uniforms.uAmp.value  = mcOn * 0.16;
+    phRedScat.material.uniforms.uAmp.value      = mcOn * 0.90;
+    phBlueStraight.material.uniforms.uAmp.value = mcOn * 0.16 * blueIn;
+    phBlueScat.material.uniforms.uAmp.value     = mcOn * 1.00 * blueIn;
+    if (phRedFlash)  phRedFlash.material.uniforms.uAmp.value  = mcOn * 0.85;
+    if (phBlueFlash) phBlueFlash.material.uniforms.uAmp.value = mcOn * 1.0 * blueIn;
+  }
+
+  // ---- molecule field: the air itself, wherever we are inside it
+  const fieldOn = pulse(frame, 330, 424, 1300, 1362, E.outSoft);
+  fieldMesh.visible = fieldOn > 0.01;
+  if (fieldMesh.visible) {
+    fieldMesh.material.opacity = fieldOn * 0.20;
+    for (let i = 0; i < FIELD_N; i++) {
+      const d = fieldData[i];
+      _dummy.position.set(
+        d.p.x + Math.sin(frame * 0.006 * d.sp + d.ph) * 1.9,
+        d.p.y + Math.sin(frame * 0.009 * d.sp + d.ph * 2) * 1.3,
+        d.p.z + Math.cos(frame * 0.005 * d.sp + d.ph) * 1.9);
+      _dummy.rotation.set(0, 0, 0);
+      _dummy.scale.setScalar(d.sc);
+      _dummy.updateMatrix();
+      fieldMesh.setMatrixAt(i, _dummy.matrix);
+    }
+    fieldMesh.instanceMatrix.needsUpdate = true;
+  }
+
+  // ---- captions. play(frame, inStart, inEnd, outStart, outEnd) -> peak alpha,
+  // which drives the scrim behind each band so type never sits on bare sky.
+  let top = 0, bot = 0;
+  const T = v => { if (v > top) top = v; };
+  const B = v => { if (v > bot) bot = v; };
+
+  T(CAP.h1.play(frame, 2, 30, 96, 116));
+  T(CAP.s1.play(frame, 44, 68, 96, 116));
+
+  T(CAP.h2.play(frame, 142, 168, 238, 256));
+  T(CAP.s2.play(frame, 174, 200, 238, 256));
+  T(CAP.h3.play(frame, 264, 290, 316, 330));
+  T(CAP.s3.play(frame, 272, 298, 316, 330));
+  B(spectrumPanel.play(frame, 188, 216, 308, 328));
+
+  T(CAP.h4.play(frame, 348, 374, 426, 444));
+  T(CAP.s4.play(frame, 380, 406, 426, 444));
+  T(CAP.s5.play(frame, 452, 478, 492, 508));
+
+  T(CAP.h5.play(frame, 518, 546, 598, 616));
+  T(CAP.s6.play(frame, 552, 578, 598, 616));
+  T(CAP.h6.play(frame, 656, 684, 738, 756));
+  T(CAP.s7.play(frame, 690, 714, 738, 756));
+  B(curvePanel.play(frame, 556, 586, 612, 636));
+  lobeLabels.play(frame, 648, 676, 740, 758);   // its own band; not scrimmed
+
+  T(CAP.h7.play(frame, 788, 816, 868, 886));
+  T(CAP.s8.play(frame, 822, 848, 868, 886));
+  T(CAP.h8.play(frame, 918, 946, 988, 1004));
+  T(CAP.s9.play(frame, 952, 978, 988, 1004));
+
+  T(CAP.h9.play(frame, 1014, 1042, 1086, 1102));
+  T(CAP.s10.play(frame, 1046, 1072, 1086, 1102));
+  B(violetPanel.play(frame, 1020, 1050, 1082, 1102));
+  T(CAP.h10.play(frame, 1108, 1134, 1150, 1164));
+  B(swatchPanel.play(frame, 1112, 1142, 1150, 1164));
+
+  T(CAP.h11.play(frame, 1178, 1206, 1246, 1262));
+  T(CAP.s11.play(frame, 1212, 1236, 1246, 1262));
+  T(CAP.h12.play(frame, 1270, 1296, 1346, 1360));
+  T(CAP.s12.play(frame, 1302, 1326, 1346, 1360));
+  B(sunsetPanel.play(frame, 1274, 1302, 1342, 1360));
+
+  T(CAP.t1.play(frame, 1374, 1400, 1600, 1620));
+  T(CAP.t2.play(frame, 1402, 1426, 1600, 1620));
+
+  scrimTop.set(top * 0.95);
+  scrimBot.set(bot * 0.95);
+
+  // No full-frame flash anywhere in this piece. A flat wash over 1080x1920
+  // milks the image for as long as it lasts and reads as a cheap cut; the beat
+  // changes here already carry a camera move and a caption change.
+  flashPlane.material.opacity = 0;
+  flashPlane.visible = false;
+}
+
+// ============================================================== RENDER
+function renderAtTime(frame) {
+  const beat = beatAt(frame);
+  // render() honours autoClear, so leaving it on wipes the accumulator before
+  // each additive blend and the frame comes out at 1/N brightness.
+  renderer.autoClear = false;
+  renderer.setRenderTarget(accumTarget);
+  renderer.setClearColor(0x000000, 1);
+  renderer.clear(true, true, true);
+
+  for (let s = 0; s < SUBSAMPLES; s++) {
+    pose(frame + (s / SUBSAMPLES) * SHUTTER, SAMPLES[s]);
+    renderer.setRenderTarget(sceneTarget);
+    renderer.clear(true, true, true);
+    renderer.render(scene, camera);
+    renderer.render(capScene, capCam);      // no clear: overlay on the same target
+    accMat.uniforms.tSrc.value = sceneTarget.texture;
+    renderer.setRenderTarget(accumTarget);
+    renderer.render(accScene, accCam);
+  }
+
+  renderer.setRenderTarget(null);
+  renderer.autoClear = true;
+  // Blur accumulates BEFORE the post chain: the smear happens at the shutter,
+  // the glow after -- and it is N times cheaper.
+  bloom.strength = BLOOM_BASE * (beat.bloom ?? 1);
+  texPass.map = accumTarget.texture;
+  composer.render();
+}
+
+window.__piece = {
+  frames: FRAMES, fps: FPS,
+  seek: (f) => renderAtTime(f),
+  /** The same frame must render identically twice, seeking away in between. */
+  async determinismCheck(f = Math.floor(FRAMES * 0.6)) {
+    const grab = () => { renderAtTime(f); return renderer.domElement.toDataURL('image/png'); };
+    const a = grab(); renderAtTime(0); const b = grab();
+    return a === b;
+  },
+};
+
+if (new URLSearchParams(location.search).has('render')) {
+  document.body.classList.add('render');
+  renderAtTime(0);
+} else {
+  const t0 = performance.now();
+  const loop = () => { renderAtTime(((performance.now() - t0) / 1000) * FPS % FRAMES);
+                       requestAnimationFrame(loop); };
+  loop();
+}
+window.__ready = true;
+</script>
+</body>
+</html>
