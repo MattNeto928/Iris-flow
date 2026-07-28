@@ -331,10 +331,17 @@ def run_logged(cmd, cwd=None, env=None, tag='') -> tuple:
 # this wrapper. The flags go AFTER "$@" because Chrome keeps the LAST value of a
 # repeated switch, so ours must land after the --use-angle=metal render.mjs
 # appends.
+# Flags the wrapper appends after puppeteer's own argv. Chrome keeps the LAST
+# occurrence of a repeated switch, which is what makes this work -- and is
+# exactly why the GL flags are NOT in here.
+#
+# They used to be. On the GPU image that silently won: MOTION_GL_FLAGS asked for
+# --use-angle=vulkan, the wrapper appended --use-angle=swiftshader after it, and
+# the render came up on "SwiftShader Device (Subzero)" on a machine with a Tesla
+# T4 sitting idle. Everything "worked", 107x slower. render.mjs now owns the GL
+# backend (and honours MOTION_GL_FLAGS); the wrapper only supplies the two flags
+# that are about running as root in a container and are true on every image.
 LINUX_CHROME_FLAGS = (
-    '--use-gl=angle',
-    '--use-angle=swiftshader',
-    '--enable-unsafe-swiftshader',
     '--no-sandbox',
     '--disable-dev-shm-usage',
 )

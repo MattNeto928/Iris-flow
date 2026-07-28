@@ -44,6 +44,22 @@ export class IrisFlowStack extends cdk.Stack {
         },
       ],
       removalPolicy: cdk.RemovalPolicy.RETAIN,
+      lifecycleRules: [
+        {
+          // iris-motion copies every finished MP4 here under motion/ because
+          // Metricool has to fetch it over an unauthenticated GET. MEASURED at
+          // ~87 MB per video (not the ~15 MB first assumed); at 5/day that is
+          // ~13 GB/month accruing forever, since nothing else ever deletes it.
+          // 60 days is well past any Metricool re-read — it re-reads the media
+          // when the post publishes, at most ~90 minutes after upload.
+          // Scoped to the motion/ prefix ONLY: the STEM pipeline's own objects
+          // live at other prefixes and are deliberately untouched.
+          id: 'expire-motion-mp4s',
+          enabled: true,
+          prefix: 'motion/',
+          expiration: cdk.Duration.days(60),
+        },
+      ],
     });
 
     // =====================
@@ -577,59 +593,72 @@ export class IrisFlowStack extends cdk.Stack {
     storyStateMachine.grantStartExecution(storyOrchestratorFn);
 
     // =============================================
-    // EventBridge: STEM orchestrator trigger — 5× daily.
+    // EventBridge: STEM orchestrator trigger — PAUSED.
     //
-    // Each invocation generates ONE video and picks a random posting time in the
-    // next 30-90 min, so posts spread organically across the day.
+    // All three rules below are DISABLED. The STEM pipeline itself stays fully
+    // deployed (state machine, orchestrator, Batch job defs, queue), it is only
+    // no longer triggered: iris-motion has taken over these five daily slots and
+    // drains the SAME iris-flow-topic-queue, so leaving these enabled would put
+    // two pipelines in a race for every topic and double the daily post volume.
     //
-    // Per-network caps: YouTube 2 posts/day, TikTok 3 posts/day (its For-You
-    // distribution collapsed under the 5×/day identical-crosspost cadence —
-    // fewer, spread-out posts while it recovers). The schedule is split into
-    // three rules that hit the SAME orchestrator Lambda with different constant
-    // `include_youtube` / `include_tiktok` flags, threaded onto the execution
-    // input → postprocess → Metricool, which drops a network when its flag is
-    // false. IG/Facebook receive all 5 videos/day.
+    // TO RESUME: set enabled back to true on the rules you want (they are
+    // independent) and `cdk deploy` this stack — and disable the matching
+    // iris-motion-daily-* rule in motion/cdk/lib/iris-motion-stack.ts first,
+    // since the two schedules are hour-for-hour identical.
+    //
+    // The hours and flags are preserved exactly as they were, and are mirrored
+    // by iris-motion's rules: YouTube 2 posts/day, TikTok 3 posts/day (its
+    // For-You distribution collapsed under the 5×/day identical-crosspost
+    // cadence), IG/Facebook all 5. The `include_youtube` / `include_tiktok`
+    // constants thread onto the execution input → postprocess → Metricool,
+    // which drops a network when its flag is false.
     // =============================================
 
-    // 2× daily with YouTube + TikTok — prime US engagement windows.
-    // 18:00 UTC = 1pm EST, 00:00 UTC = 7pm EST.
+    // PAUSED — 2× daily with YouTube + TikTok. 18:00 UTC = 1pm EST, 00:00 = 7pm.
     const scheduleRuleYouTube = new events.Rule(this, 'DailyScheduleYouTube', {
       ruleName: 'iris-flow-daily-youtube',
-      description: 'STEM orchestrator 2× daily WITH YouTube + TikTok (1pm, 7pm EST)',
-      enabled: true,
+      description:
+        'PAUSED — STEM orchestrator 2× daily WITH YouTube + TikTok (1pm, 7pm EST); ' +
+        'superseded by iris-motion-daily-youtube. Set enabled=true here and disable ' +
+        'that rule to resume.',
+      enabled: false,
       schedule: events.Schedule.cron({
         minute: '0',
-        hour: '18,0', // 2× daily, UTC
+        hour: '18,0', // 2× daily, UTC (only fires when enabled)
       }),
     });
     scheduleRuleYouTube.addTarget(new targets.LambdaFunction(orchestratorFn, {
       event: events.RuleTargetInput.fromObject({ include_youtube: true, include_tiktok: true }),
     }));
 
-    // 1× daily with TikTok (no YouTube) — midday slot.
-    // 15:00 UTC = 10am EST.
+    // PAUSED — 1× daily with TikTok (no YouTube). 15:00 UTC = 10am EST.
     const scheduleRuleTikTok = new events.Rule(this, 'DailyScheduleTikTok', {
       ruleName: 'iris-flow-daily-tiktok',
-      description: 'STEM orchestrator 1× daily WITH TikTok, no YouTube (10am EST)',
-      enabled: true,
+      description:
+        'PAUSED — STEM orchestrator 1× daily WITH TikTok, no YouTube (10am EST); ' +
+        'superseded by iris-motion-daily-tiktok. Set enabled=true here and disable ' +
+        'that rule to resume.',
+      enabled: false,
       schedule: events.Schedule.cron({
         minute: '0',
-        hour: '15', // 1× daily, UTC
+        hour: '15', // 1× daily, UTC (only fires when enabled)
       }),
     });
     scheduleRuleTikTok.addTarget(new targets.LambdaFunction(orchestratorFn, {
       event: events.RuleTargetInput.fromObject({ include_youtube: false, include_tiktok: true }),
     }));
 
-    // 2× daily IG/Facebook only — early morning + late afternoon.
-    // 11:00 UTC = 6am, 21:00 = 4pm EST.
+    // PAUSED — 2× daily IG/Facebook only. 11:00 UTC = 6am, 21:00 = 4pm EST.
     const scheduleRuleIgFb = new events.Rule(this, 'DailyScheduleNoYouTube', {
       ruleName: 'iris-flow-daily-no-youtube',
-      description: 'STEM orchestrator 2× daily IG/Facebook only (6am, 4pm EST)',
-      enabled: true,
+      description:
+        'PAUSED — STEM orchestrator 2× daily IG/Facebook only (6am, 4pm EST); ' +
+        'superseded by iris-motion-daily-no-youtube. Set enabled=true here and disable ' +
+        'that rule to resume.',
+      enabled: false,
       schedule: events.Schedule.cron({
         minute: '0',
-        hour: '11,21', // 2× daily, UTC
+        hour: '11,21', // 2× daily, UTC (only fires when enabled)
       }),
     });
     scheduleRuleIgFb.addTarget(new targets.LambdaFunction(orchestratorFn, {

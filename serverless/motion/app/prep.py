@@ -46,11 +46,33 @@ FPS = 30                 # Iris-flow normalises segments to 1080x1920@30
 #     2 shards is the whole G-family on-demand quota (8 vCPU / 4 per instance)
 #     and halves the render without paying for a third boot.
 SUBSAMPLES = 24
-SHARDS = 2
+# ONE shard. VERIFIED through common.render_env() on a T4: 0.185 s/frame at
+# ss24, so all 1440 frames are 4.4 min on a single instance. A second shard
+# would save 2.2 min of render and cost a whole extra ~4 min instance boot plus
+# its idle tail -- instance-minutes, not frames, are what Batch bills on EC2.
+SHARDS = 1
 MAX_AUTHOR_ATTEMPTS = 3
 # Hard ceiling. If authoring somehow spends more than this, stop and take the
 # seed -- a video that costs more than the budget is worse than the fallback.
 AUTHOR_COST_CEILING_USD = float(os.environ.get("AUTHOR_COST_CEILING_USD", "1.50"))
+
+# Whether a total authoring failure may fall back to the bundled seed piece.
+#
+# TRUE by default, because that is what a manual run wants: the seed is a
+# known-good gate-passing piece and it is how the infrastructure is exercised
+# end to end without depending on a model.
+#
+# SCHEDULED runs set it false (see app/lambdas/orchestrator.py). Those runs post
+# to the accounts unconditionally, and the seed is ONE fixed aurora piece -- so
+# a fallback there would publish the same video again, under whatever topic came
+# off the queue, and the only signal would be authored_by=seed buried in
+# plan.json. Failing the run instead skips the slot and sends the failure email.
+#
+# Parsed as a negative list so a BLANK value means the default rather than
+# false: a job definition that forgets to set it, or a local `docker run`, must
+# behave like the manual case, not silently become fatal.
+SEED_FALLBACK = os.environ.get("SEED_FALLBACK", "").strip().lower() \
+    not in ("0", "false", "no", "off")
 
 CLAUDE_MODEL = "claude-opus-5"
 GEMINI_MODEL = "gemini-3.1-pro-preview"
@@ -373,7 +395,8 @@ def run():
     # tested independently of the models -- a render/stitch/notify regression and
     # a bad scene look identical from the outside otherwise, and the seed is a
     # known-good 60 s piece that has already passed the gates.
-    if os.environ.get("FORCE_SEED", "").lower() not in ("1", "true", "yes"):
+    force_seed = os.environ.get("FORCE_SEED", "").lower() in ("1", "true", "yes")
+    if not force_seed:
         if os.environ.get("ANTHROPIC_API_KEY"):
             providers.append(author_claude)
         if os.environ.get("GOOGLE_AI_API_KEY"):
@@ -411,6 +434,18 @@ def run():
             log.warning("author attempt failed: %s", err)
 
     if not spec:
+        # FORCE_SEED is checked first and wins: it is an explicit request for the
+        # seed, not a downgrade, so SEED_FALLBACK has no say over it.
+        if not force_seed and not SEED_FALLBACK:
+            why = err or ("no authoring provider was configured — neither "
+                          "ANTHROPIC_API_KEY nor GOOGLE_AI_API_KEY is set")
+            # Truncated: `err` may be a full page stack trace from probe_render,
+            # and this string is the Batch failure message the state machine
+            # carries into the failure email.
+            raise RuntimeError(
+                f"authoring failed after {len(attempts)} attempt(s) and "
+                f"SEED_FALLBACK is off, so this run will not publish the seed "
+                f"piece. Last authoring error:\n{why[:2000]}")
         # Never leave the pipeline with nothing to render. The seed is a real,
         # gate-passing 60 s piece; the run is still honest because authored_by
         # records that the model path did not produce it.

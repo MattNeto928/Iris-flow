@@ -1,12 +1,13 @@
 """
 Batch Worker Entrypoint for iris-motion - Routes by JOB_TYPE env var.
 
-JOB_TYPE values: prep, render, stitch
+JOB_TYPE values: prep, render, stitch, postprocess
 
-One container image, three job definitions (see CONTRACT.md):
-  prep    2 vCPU / 4096 MiB   topic -> narration + scene -> probe render -> S3
-  render  4 vCPU / 8192 MiB   frames [FRAME_FROM, FRAME_TO] -> S3
-  stitch  2 vCPU / 8192 MiB   frames -> gates -> encode + mux -> S3
+One container image, four job definitions (see CONTRACT.md):
+  prep         2 vCPU / 4096 MiB   topic -> narration + scene -> probe render -> S3
+  render       4 vCPU / 8192 MiB   frames [FRAME_FROM, FRAME_TO] -> S3
+  stitch       2 vCPU / 8192 MiB   frames -> gates -> encode + mux -> S3
+  postprocess  1 vCPU / 2048 MiB   public copy -> caption -> Metricool -> plan.json
 
 Every job exits non-zero on a real failure so Step Functions catches it.
 """
@@ -43,10 +44,19 @@ def _stitch():
     return stitch_run()
 
 
+# Returns a COROUTINE, not a result: MetricoolClient is async, so postprocess.run
+# is too. main() below awaits whatever comes back, which is why this needs no
+# special case.
+def _postprocess():
+    from postprocess import run as postprocess_run
+    return postprocess_run()
+
+
 JOB_DISPATCH = {
     "prep": _prep,
     "render": _render,
     "stitch": _stitch,
+    "postprocess": _postprocess,
 }
 
 
@@ -66,8 +76,9 @@ def main():
 
     try:
         result = handler()
-        # render and stitch are synchronous. prep is not ours: if its run() turns
-        # out to be async, await it here rather than exiting 0 on a coroutine
+        # render and stitch are synchronous; postprocess is a coroutine (the
+        # Metricool client is async) and prep is not ours, so if its run() turns
+        # out to be async too, await it here rather than exiting 0 on a coroutine
         # that never ran.
         if inspect.isawaitable(result):
             asyncio.run(result)

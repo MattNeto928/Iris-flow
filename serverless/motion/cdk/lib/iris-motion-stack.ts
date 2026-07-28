@@ -8,6 +8,9 @@ import * as batch from 'aws-cdk-lib/aws-batch';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as lambda_ from 'aws-cdk-lib/aws-lambda';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as sqs from 'aws-cdk-lib/aws-sqs';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as sfn from 'aws-cdk-lib/aws-stepfunctions';
 import * as tasks from 'aws-cdk-lib/aws-stepfunctions-tasks';
 import { Construct } from 'constructs';
@@ -21,15 +24,35 @@ import { Construct } from 'constructs';
  * range is SHARDED across parallel Batch jobs — that fan-out is the whole reason
  * this stack exists rather than a single container.
  *
- * Nothing here is shared with IrisFlowStack except two read-only things:
- * the `iris-flow/api-keys` secret and SES. New bucket, new ECR repo, new VPC,
- * new compute environment, new job queue.
+ * Shared with IrisFlowStack, all of it read-only except the last: the
+ * `iris-flow/api-keys` secret, SES, the VPC, the `iris-flow-topic-queue` SQS
+ * queue (motion now drains the same topic backlog the STEM pipeline did), and
+ * the PUBLIC `iris-flow-videos-<account>` bucket, which motion writes the
+ * finished MP4 into because Metricool has to fetch it over plain HTTPS.
+ * Everything else is its own: bucket, ECR repo, compute environments, queues.
  *
- * Manually triggered only — there is deliberately NO EventBridge schedule.
+ * Scheduled 5x daily by the three EventBridge rules at the bottom of this file,
+ * which fire `iris-motion-orchestrator` — the same cadence and the same
+ * per-network caps the STEM pipeline used before it was paused.
+ *
+ * EXECUTION INPUT. Every field below is read by a JsonPath in the state
+ * machine, and a JsonPath to a missing field FAILS the state rather than
+ * defaulting — so all eight are mandatory on every execution, hand-started or
+ * not. The orchestrator always sets them.
  *
  *   aws stepfunctions start-execution \
  *     --state-machine-arn <StateMachineArn output> \
- *     --input '{"video_id":"aurora01","topic":"why auroras glow","target_duration":48}'
+ *     --input '{"video_id":"aurora01","topic":"why auroras glow",
+ *               "target_duration":48,
+ *               "force_seed":true,"seed_fallback":true,
+ *               "schedule_time":"2026-07-28T18:40:00+00:00",
+ *               "include_youtube":false,"include_tiktok":false}'
+ *
+ * The two seed flags are what separate a manual run from a scheduled one.
+ * Scheduled runs pin BOTH false: authoring is Claude-only and a slot that
+ * cannot be authored is skipped, not filled with the same aurora piece for the
+ * fifth time. Manual runs leave the fallback on, or force the seed outright, to
+ * exercise the infrastructure without spending on a model call.
  */
 export class IrisMotionStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -76,6 +99,24 @@ export class IrisMotionStack extends cdk.Stack {
         },
       ],
     });
+
+    // =====================
+    // Public delivery bucket — IMPORTED from IrisFlowStack, never redeclared
+    // =====================
+    // MotionBucket above is BLOCK_ALL private, which is right for frames and
+    // plan.json but useless for posting: Metricool fetches the video over an
+    // unauthenticated GET, and a presigned URL is not an option — it expires,
+    // and Metricool re-reads the media when the post actually publishes, up to
+    // 90 minutes after the pipeline finished. So postprocess copies
+    // out/video.mp4 into IrisFlowStack's public bucket and posts THAT url,
+    // exactly as the STEM pipeline does.
+    //
+    // fromBucketName, not a new s3.Bucket: this bucket belongs to IrisFlowStack
+    // (publicReadAccess + CORS + RETAIN, all set there). Declaring it here would
+    // be a second CloudFormation resource fighting for the same name.
+    const publicVideoBucket = s3.Bucket.fromBucketName(
+      this, 'PublicVideoBucket', `iris-flow-videos-${this.account}`,
+    );
 
     // =====================
     // ECR repository — IMPORTED, not created
@@ -132,6 +173,14 @@ export class IrisMotionStack extends cdk.Stack {
     // grantReadWrite includes s3:PutObjectTagging, which the render shards need
     // to apply the frames lifecycle tag.
     motionBucket.grantReadWrite(batchJobRole);
+    // Write-only on the public bucket, and only for postprocess's copy of the
+    // finished MP4. Deliberately NOT grantReadWrite: the STEM pipeline's own
+    // manifests and segments live in there and nothing in iris-motion has any
+    // business reading or overwriting them. grantPut also carries s3:Abort*,
+    // which a multipart PUT of a ~15 MB video needs to clean up after itself.
+    publicVideoBucket.grantPut(batchJobRole);
+    // Already present before postprocess existed; postprocess relies on it for
+    // the METRICOOL_* keys injected below.
     apiSecrets.grantRead(batchJobRole);
 
     const batchExecRole = new iam.Role(this, 'BatchExecRole', {
@@ -198,12 +247,20 @@ export class IrisMotionStack extends cdk.Stack {
       GOOGLE_AI_API_KEY: batch.Secret.fromSecretsManager(apiSecrets, 'GOOGLE_AI_API_KEY'),
     };
 
+    // extraEnv / extraSecrets exist for postprocess: it is the only job that
+    // talks to Metricool, and there is no reason for a render shard's task
+    // definition to carry publishing credentials it will never read.
     const createJobDef = (
       logicalId: string,
       jobType: string,
       vcpu: number,
       memoryMiB: number,
       timeoutMinutes: number,
+      extraEnv: { [key: string]: string } = {},
+      extraSecrets: { [key: string]: batch.Secret } = {},
+      // AT-MOST-ONCE. Any job whose side effect is visible OUTSIDE this account
+      // must pass true. See the postprocess call site.
+      atMostOnce: boolean = false,
     ): batch.EcsJobDefinition => {
       const jobDefName = `iris-motion-${jobType}`;
       const container = new batch.EcsFargateContainerDefinition(this, `${logicalId}Container`, {
@@ -215,8 +272,9 @@ export class IrisMotionStack extends cdk.Stack {
         environment: {
           ...batchEnvVars,
           JOB_TYPE: jobType,
+          ...extraEnv,
         },
-        secrets: batchSecrets,
+        secrets: { ...batchSecrets, ...extraSecrets },
         logging: ecs.LogDrivers.awsLogs({
           streamPrefix: jobDefName,
           logRetention: logs.RetentionDays.ONE_WEEK,
@@ -231,8 +289,11 @@ export class IrisMotionStack extends cdk.Stack {
         jobDefinitionName: jobDefName,
         container,
         timeout: cdk.Duration.minutes(timeoutMinutes),
-        retryAttempts: 3,
-        retryStrategies: [
+        // A retry is safe for prep/render/stitch: they are idempotent, they
+        // write to S3 keys derived from the frame number, and re-running one
+        // costs compute. It is NOT safe for anything that posts.
+        retryAttempts: atMostOnce ? 1 : 3,
+        retryStrategies: atMostOnce ? [] : [
           // Spot reclaim is retried HERE, inside Batch, not in Step Functions:
           // a reclaimed attempt is not a task failure the state machine ever
           // sees, and re-running one shard is far cheaper than re-running the
@@ -280,6 +341,44 @@ export class IrisMotionStack extends cdk.Stack {
     // 2 vCPU but still 8 GiB: stitch is ffmpeg-bound, not CPU-bound, and the
     // memory is for decoding the frame sequence, not for parallelism.
     const stitchJobDef = createJobDef('StitchJobDef', 'stitch', 2, 8192, 20);
+    // postprocess: caption + copy the MP4 to the public bucket + schedule to
+    // Metricool. It is HTTP-bound, not CPU-bound — 1 vCPU / 2 GiB, the same
+    // shape IrisFlowStack gives its own postprocess job. It runs on the FARGATE
+    // queue, never the GPU one: a g4dn.xlarge spun up to make four API calls
+    // would cost more than the render it follows.
+    // 15 min: Metricool's scheduler endpoint is called once per brand and has
+    // been seen to take ~30 s under load, and the S3 copy is a few seconds.
+    // atMostOnce=true on the LAST argument. This is the one job in the stack
+    // whose side effect leaves the account: it books a post on real Instagram /
+    // TikTok / YouTube / Facebook accounts. Batch's evaluateOnExit can only ADD
+    // retries, so with the shared strategy a Fargate Spot reclaim ten seconds
+    // after schedule_post() returns would run the whole job again and book the
+    // post TWICE, with no idempotency key to stop it. A reclaimed post must
+    // fail the run and email, never repeat.
+    const postprocessJobDef = createJobDef(
+      'PostprocessJobDef', 'postprocess', 1, 2048, 15,
+      {
+        // The PUBLIC bucket, NOT MOTION_BUCKET — this is the one Metricool
+        // fetches from. app/postprocess.py defaults it to the same name, but
+        // set it here anyway: the default is a literal account id in Python
+        // source, and this is the only place that number should come from.
+        PUBLIC_BUCKET_NAME: publicVideoBucket.bucketName,
+        // Carried over verbatim from IrisFlowStack's batchEnvVars so a motion
+        // post lands exactly the way the STEM posts it replaces did. The
+        // TikTok one is not cosmetic: Metricool rejects autoAddMusic outright
+        // on video posts (HTTP 400), and every motion piece is a video.
+        METRICOOL_DEFAULT_AUDIO_NAME: 'Scientific-Nipsey',
+        METRICOOL_TIKTOK_AUTO_ADD_MUSIC: 'false',
+        METRICOOL_SHOW_REEL_ON_FEED: 'true',
+        METRICOOL_INSTAGRAM_MANUAL_FOR_AUDIO: 'false',
+      },
+      {
+        METRICOOL_API_KEY: batch.Secret.fromSecretsManager(apiSecrets, 'METRICOOL_API_KEY'),
+        METRICOOL_USER_ID: batch.Secret.fromSecretsManager(apiSecrets, 'METRICOOL_USER_ID'),
+        METRICOOL_BLOG_ID: batch.Secret.fromSecretsManager(apiSecrets, 'METRICOOL_BLOG_ID'),
+      },
+      true,      // atMostOnce: never retry a job that posts
+    );
 
     // =====================
     // GPU render path — EC2-backed Batch, NOT Fargate
@@ -428,12 +527,22 @@ export class IrisMotionStack extends cdk.Stack {
           // Batch environment values must be strings; target_duration arrives
           // as a JSON number.
           TARGET_DURATION: sfn.JsonPath.stringAt('States.Format(\'{}\', $.target_duration)'),
-            // Selects the bundled seed piece over the model authoring path, so
-            // the infrastructure can be exercised without spending on a model
-            // call and without a bad scene masquerading as a pipeline bug.
-            // Always present on the execution input (the CLI examples pass it),
-            // because a JsonPath to a missing field fails the state, not the field.
-            FORCE_SEED: sfn.JsonPath.stringAt("States.Format('{}', $.force_seed)"),
+          // Selects the bundled seed piece over the model authoring path, so
+          // the infrastructure can be exercised without spending on a model
+          // call and without a bad scene masquerading as a pipeline bug.
+          // Always present on the execution input (the CLI examples pass it),
+          // because a JsonPath to a missing field fails the state, not the field.
+          FORCE_SEED: sfn.JsonPath.stringAt("States.Format('{}', $.force_seed)"),
+          // Whether the seed is allowed as a FALLBACK when authoring fails,
+          // which is a different question from FORCE_SEED asking for it.
+          // Scheduled runs set it false: they publish unconditionally, and the
+          // seed is one fixed aurora piece, so a fallback there posts that same
+          // video again under whatever topic came off the queue. Better to fail
+          // the run, skip the slot, and send the failure email.
+          // app/prep.py defaults it TRUE on a blank value, so this override is
+          // the ONLY thing that makes a scheduled run authored-only — dropping
+          // it does not break a deploy, it quietly starts republishing the seed.
+          SEED_FALLBACK: sfn.JsonPath.stringAt("States.Format('{}', $.seed_fallback)"),
         },
       },
       resultPath: '$.prepResult',
@@ -494,6 +603,38 @@ export class IrisMotionStack extends cdk.Stack {
     });
     stitchJob.addRetry(batchRetry);
 
+    // Publishing. Runs AFTER stitch and BEFORE notify, unconditionally: there is
+    // no Choice on $.stitchResult and none on the gates. stitch already treats a
+    // gate failure as informational (it writes out/gates.txt and encodes
+    // anyway), and notify reports the result by email — so a soft gate FAIL is
+    // something you read about, not something that silently drops the slot.
+    //
+    // SCHEDULE_TIME / INCLUDE_YOUTUBE / INCLUDE_TIKTOK come off the execution
+    // input, set by the orchestrator from the constant on the triggering
+    // EventBridge rule; they are what cap YouTube at 2 posts/day and TikTok at
+    // 3. Batch environment values must be strings, hence States.Format on the
+    // two booleans — the same pattern IrisFlowStack's PostprocessJob uses.
+    const postprocessJob = new tasks.BatchSubmitJob(this, 'PostprocessJob', {
+      jobDefinitionArn: postprocessJobDef.jobDefinitionArn,
+      jobName: sfn.JsonPath.format('motion-postprocess-{}', sfn.JsonPath.stringAt('$.video_id')),
+      jobQueueArn: jobQueue.jobQueueArn,
+      containerOverrides: {
+        environment: {
+          VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
+          SCHEDULE_TIME: sfn.JsonPath.stringAt('$.schedule_time'),
+          INCLUDE_YOUTUBE: sfn.JsonPath.stringAt("States.Format('{}', $.include_youtube)"),
+          INCLUDE_TIKTOK: sfn.JsonPath.stringAt("States.Format('{}', $.include_tiktok)"),
+          // DRY_RUN=true does everything except the Metricool call: copies the MP4
+          // public, writes the caption, logs what it WOULD book. Without this on the
+          // execution input there is no way to rehearse posting — the first cron
+          // fire after a deploy would be the first live post.
+          DRY_RUN: sfn.JsonPath.stringAt("States.Format('{}', $.dry_run)"),
+        },
+      },
+      resultPath: '$.postprocessResult',
+    });
+    postprocessJob.addRetry(batchRetry);
+
     const notifySuccess = new tasks.LambdaInvoke(this, 'NotifySuccess', {
       lambdaFunction: notifyFn,
       payloadResponseOnly: true,
@@ -529,11 +670,15 @@ export class IrisMotionStack extends cdk.Stack {
     planShards.addCatch(notifyFailure, toNotifyOnFailure);
     renderMap.addCatch(notifyFailure, toNotifyOnFailure);
     stitchJob.addCatch(notifyFailure, toNotifyOnFailure);
+    // Posting is the one stage whose failure leaves a finished, unpublished
+    // video sitting in S3, so it especially needs to reach the email.
+    postprocessJob.addCatch(notifyFailure, toNotifyOnFailure);
 
     const definition = prepJob
       .next(planShards)
       .next(renderMap)
       .next(stitchJob)
+      .next(postprocessJob)
       .next(notifySuccess);
 
     const stateMachine = new sfn.StateMachine(this, 'MotionStateMachine', {
@@ -550,7 +695,125 @@ export class IrisMotionStack extends cdk.Stack {
       },
     });
 
-    // No EventBridge rule by design — iris-motion is triggered by hand.
+    // =====================
+    // Orchestrator Lambda — one execution per scheduled slot
+    // =====================
+    // Drains the SAME queue the STEM pipeline drained. Imported by name rather
+    // than redeclared: `iris-flow-topic-queue` is IrisFlowStack's resource, and
+    // the point of importing it is that the topic backlog already sitting in it
+    // carries over to motion instead of being stranded. Nothing contends for a
+    // message — the three STEM rules that used to drive the other consumer are
+    // disabled in iris-flow-stack.ts as part of this changeover.
+    //
+    // Region and account are concrete (bin/app.ts pins them), so this parses to
+    // a real ARN and `queueUrl` resolves to the real URL rather than a stack of
+    // CloudFormation intrinsics.
+    const topicQueue = sqs.Queue.fromQueueArn(
+      this, 'TopicQueue',
+      `arn:aws:sqs:${this.region}:${this.account}:iris-flow-topic-queue`,
+    );
+
+    const orchestratorFn = new lambda_.Function(this, 'OrchestratorFn', {
+      functionName: 'iris-motion-orchestrator',
+      runtime: lambda_.Runtime.PYTHON_3_12,
+      handler: 'orchestrator.handler',
+      code: lambda_.Code.fromAsset('../app/lambdas'),
+      // 2 minutes is all it needs — one SQS receive, one StartExecution — but
+      // StartExecution is the throttled call in this account and a retry inside
+      // the handler is cheaper than a lost slot.
+      timeout: cdk.Duration.minutes(2),
+      memorySize: 256,
+      environment: {
+        // Flip to 'true' to rehearse: every scheduled run then renders and
+        // publishes the MP4 but books nothing on Metricool. Change it with
+        // `aws lambda update-function-configuration` -- no redeploy needed.
+        MOTION_DRY_RUN: 'false',
+        TOPIC_QUEUE_URL: topicQueue.queueUrl,
+        STATE_MACHINE_ARN: stateMachine.stateMachineArn,
+        // AWS_REGION is set by the Lambda runtime.
+      },
+    });
+    // receive + delete: the orchestrator takes one topic per slot and removes
+    // it, so a topic is never rendered twice.
+    topicQueue.grantConsumeMessages(orchestratorFn);
+    stateMachine.grantStartExecution(orchestratorFn);
+
+    // =====================
+    // EventBridge — 5x daily, the cadence taken over from the STEM pipeline
+    // =====================
+    // Three rules, one Lambda, differing only in the constant network flags
+    // they pass. Hours and flags are reproduced EXACTLY from IrisFlowStack's
+    // DailySchedule* rules (now disabled), because this is a handover, not a
+    // new schedule: the posting rhythm the accounts are used to should not
+    // change on the day the content pipeline behind it does.
+    //
+    // Per-network caps come out of the split: YouTube 2 posts/day, TikTok
+    // 3 posts/day (its For-You distribution collapsed under a 5x/day identical
+    // crosspost cadence). IG/Facebook get all 5. The flags ride the execution
+    // input into postprocess, which hands them to Metricool.
+
+    // 2x daily with YouTube + TikTok — prime US engagement windows.
+    // 18:00 UTC = 1pm EST, 00:00 UTC = 7pm EST.
+    const motionScheduleYouTube = new events.Rule(this, 'MotionDailyScheduleYouTube', {
+      ruleName: 'iris-motion-daily-youtube',
+      description: 'Motion orchestrator 2× daily WITH YouTube + TikTok (1pm, 7pm EST)',
+      // SHIPPED DISABLED, deliberately. The three iris-flow-daily-* rules are
+      // still ENABLED in the live account and these use byte-identical crons,
+      // so if IrisMotionStack deploys first every slot fires TWICE — ten posts
+      // a day to real accounts. Enable only after IrisFlowStack is deployed and
+      // `aws events describe-rule` shows the STEM rules DISABLED:
+      //   aws events enable-rule --name iris-motion-daily-youtube
+      enabled: false,
+      schedule: events.Schedule.cron({
+        minute: '0',
+        hour: '18,0', // 2× daily, UTC
+      }),
+    });
+    motionScheduleYouTube.addTarget(new targets.LambdaFunction(orchestratorFn, {
+      event: events.RuleTargetInput.fromObject({ include_youtube: true, include_tiktok: true }),
+    }));
+
+    // 1× daily with TikTok (no YouTube) — midday slot.
+    // 15:00 UTC = 10am EST.
+    const motionScheduleTikTok = new events.Rule(this, 'MotionDailyScheduleTikTok', {
+      ruleName: 'iris-motion-daily-tiktok',
+      description: 'Motion orchestrator 1× daily WITH TikTok, no YouTube (10am EST)',
+      // SHIPPED DISABLED, deliberately. The three iris-flow-daily-* rules are
+      // still ENABLED in the live account and these use byte-identical crons,
+      // so if IrisMotionStack deploys first every slot fires TWICE — ten posts
+      // a day to real accounts. Enable only after IrisFlowStack is deployed and
+      // `aws events describe-rule` shows the STEM rules DISABLED:
+      //   aws events enable-rule --name iris-motion-daily-youtube
+      enabled: false,
+      schedule: events.Schedule.cron({
+        minute: '0',
+        hour: '15', // 1× daily, UTC
+      }),
+    });
+    motionScheduleTikTok.addTarget(new targets.LambdaFunction(orchestratorFn, {
+      event: events.RuleTargetInput.fromObject({ include_youtube: false, include_tiktok: true }),
+    }));
+
+    // 2× daily IG/Facebook only — early morning + late afternoon.
+    // 11:00 UTC = 6am, 21:00 = 4pm EST.
+    const motionScheduleIgFb = new events.Rule(this, 'MotionDailyScheduleNoYouTube', {
+      ruleName: 'iris-motion-daily-no-youtube',
+      description: 'Motion orchestrator 2× daily IG/Facebook only (6am, 4pm EST)',
+      // SHIPPED DISABLED, deliberately. The three iris-flow-daily-* rules are
+      // still ENABLED in the live account and these use byte-identical crons,
+      // so if IrisMotionStack deploys first every slot fires TWICE — ten posts
+      // a day to real accounts. Enable only after IrisFlowStack is deployed and
+      // `aws events describe-rule` shows the STEM rules DISABLED:
+      //   aws events enable-rule --name iris-motion-daily-youtube
+      enabled: false,
+      schedule: events.Schedule.cron({
+        minute: '0',
+        hour: '11,21', // 2× daily, UTC
+      }),
+    });
+    motionScheduleIgFb.addTarget(new targets.LambdaFunction(orchestratorFn, {
+      event: events.RuleTargetInput.fromObject({ include_youtube: false, include_tiktok: false }),
+    }));
 
     // =====================
     // Outputs
@@ -578,6 +841,11 @@ export class IrisMotionStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'JobQueueArn', {
       value: jobQueue.jobQueueArn,
       description: 'Batch job queue ARN',
+    });
+
+    new cdk.CfnOutput(this, 'OrchestratorFnArn', {
+      value: orchestratorFn.functionArn,
+      description: 'iris-motion-orchestrator Lambda ARN (invoke to fire a slot by hand)',
     });
   }
 }

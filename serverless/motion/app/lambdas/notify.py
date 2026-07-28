@@ -267,6 +267,36 @@ def _error_lines(error):
     return lines
 
 
+def _post_lines(plan):
+    """
+    What happened on the social side.
+
+    Without this the email reports a green render and says nothing about whether
+    a post was booked — and booking the post is the entire point of a scheduled
+    run. A run that rendered perfectly and silently published nothing looked
+    identical to a complete success.
+    """
+    post = plan.get('post') or {}
+    if not post:
+        return None
+    out = [f"  status         {post.get('status', 'unknown')}"
+           + ('   [DRY RUN — nothing booked]' if post.get('dry_run') else '')]
+    if post.get('public_url'):
+        out.append(f"  public url     {post['public_url']}")
+    nets = [n for n, on in (('youtube', post.get('include_youtube')),
+                            ('tiktok', post.get('include_tiktok'))) if on]
+    out.append(f"  networks       {', '.join(nets) if nets else 'ig/facebook only'}")
+    if post.get('schedule_time'):
+        out.append(f"  scheduled for  {post['schedule_time']}")
+    if post.get('title'):
+        out.append(f"  title          {post['title'][:70]}")
+    for r in ((post.get('metricool') or {}).get('results') or []):
+        ok = 'ok' if r.get('success') else 'FAILED'
+        out.append(f"  brand {r.get('blog_id')}   {ok} "
+                   f"{r.get('post_id') or r.get('error', '')}")
+    return out
+
+
 def _section(title, lines):
     return [title] + (lines if lines else ['  n/a']) + ['']
 
@@ -346,6 +376,7 @@ def _notify(event):
     lines += _section('FFPROBE', _probe_lines(probe, plan))
     lines += _section('GATES (check.py)',
                       ['  ' + ln for ln in gates.splitlines()] if gates else None)
+    lines += _section('POST', _post_lines(plan))
     lines += _section('COST', _cost_lines(plan))
 
     timings = _timing_lines(plan)
