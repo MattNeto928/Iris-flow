@@ -113,6 +113,38 @@ common way these fail:
 - Each `find` must match EXACTLY ONCE in the whole document. If a short string
   appears twice, extend it until it is unique.
 
+BUILD THE THING. This is the single biggest quality lever and the one most
+often missed. The subject of the video must exist as REAL 3D GEOMETRY that the
+camera moves around — not as a background gradient with captions on top.
+- A piece about Earth's shadow builds the shadow CONE as geometry and flies
+  along it. It does not draw a pink-to-blue vertical gradient and label it.
+  That exact mistake produced 35 seconds of wallpaper on a real run.
+- A piece about an ice crystal builds the hexagonal prism, with facets, and
+  refracts a ray through it.
+- A piece about a spider builds a jointed spider. A piece about a bee builds a
+  bee from scaled spheres, a parametric wing and a translucent quad.
+Assemble subjects from primitives — spheres, cylinders, lathes, tubes, extrudes,
+BufferGeometry you generate — the way the template's hero is assembled. A scene
+whose only geometry is a backdrop plane is a failed scene, however pretty the
+gradient is.
+
+EVERY BEAT NEEDS SOMETHING ON SCREEN, ALL THE WAY TO THE LAST FRAME.
+- The final beat is the most commonly dead one: the narration ends, the captions
+  have exited, and the last 10-15 seconds are an empty backdrop. Measured on a
+  real run: 13 seconds of nothing. Give the closing beat a title card, a held
+  hero shot, or a slow push — something.
+- Check every beat in your BEATS table against your pose() and captions: if a
+  beat drives no object and shows no caption, it is dead air. Delete the beat or
+  fill it.
+- A caption alone is not content. If the only thing changing on screen is text,
+  the beat is a slide, not a shot.
+
+CONTRAST. Aim for a dark scene with bright subjects. The gates measure the 1st
+percentile of luma and expect low single digits; a full-frame pastel wash reads
+as flat and washed out, and bloom has nothing to bite on. If the subject is
+genuinely bright (a sky, a flame), keep something dark in frame for it to read
+against.
+
 Hard rules, each learned from a real failure:
 - `new THREE.Color(r,g,b)` treats floats as ALREADY LINEAR. Use the template's
   `C(0xRRGGBB)` helper for every authored colour.
@@ -313,6 +345,164 @@ def inject_timing(piece, fps, frames, beats):
     return piece
 
 
+REPAIR_SYSTEM = """You are reviewing a contact sheet from a 3D explainer video
+you just authored, plus the numeric gates. Frames run left to right, top to
+bottom, evenly spaced across the whole piece.
+
+Judge it the way a viewer would, then return edits that fix what you find. Look
+for these first, in this order — they are the failures that actually happen:
+
+1. DEAD FRAMES. Tiles that are empty, or a backdrop with nothing on it. The tail
+   is the usual offender. Any tile with no subject and no caption is dead air.
+2. NO SUBJECT. If the piece is a background gradient with text over it, that is
+   the failure mode to fix — build the thing the video is about as real
+   geometry and stage the camera on it.
+3. WASHED OUT. A flat pastel frame with no dark anywhere. The gates report the
+   1st percentile of luma; low single digits is the target.
+4. BLOWN OUT. Large white areas, or a clipped-pixel figure above ~2%.
+5. UNREADABLE TYPE. Captions overlapping the subject, or too small to read at
+   thumbnail size — which is how this will actually be watched.
+6. MONOTONY. Six tiles that look identical mean six seconds where nothing
+   happened.
+
+Return ONLY a JSON object, no prose, no fence:
+{"assessment": "one or two sentences on what is actually wrong",
+ "edits": [{"find": "...", "replace": "..."}]}
+
+The edits apply to the CURRENT piece.html, which is given to you below — not to
+the original template. Same rules as before: each `find` must appear EXACTLY
+ONCE, edits must not overlap, and anything you delete must not still be
+referenced by pose().
+
+If the sheet genuinely looks good, return {"assessment": "...", "edits": []}.
+Do not invent work. A cosmetic tweak that risks a ReferenceError is worse than
+leaving it alone."""
+
+
+def _contact_sheet(frames_dir, dest, cols=6, rows=4):
+    """
+    Tile the preflight frames into one PNG for the model to look at.
+
+    Scaled so the long edge lands near 1500 px: past that the image costs more
+    tokens without the model seeing more, and these tiles only need to answer
+    "is anything on screen" and "does it read", not "is the bokeh right".
+    """
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-pattern_type", "glob",
+         "-i", str(Path(frames_dir) / "*.png"),
+         "-vf", f"scale=240:-1,tile={cols}x{rows}:padding=4:color=0x202020",
+         "-frames:v", "1", str(dest)],
+        check=True)
+    return dest
+
+
+def preflight_repair(piece_path, wd, plan_frames, fps, attempt_cost):
+    """
+    Render a strided preflight, gate it, LOOK at it, and let the model fix it.
+
+    This is the loop a human runs with the motion-video skill -- render a
+    handful of frames, put them in a contact sheet, look, batch the fixes -- and
+    it is the step whose absence produced the two bad pieces so far. Both were
+    mechanically perfect: valid MP4, right length, right codec, and 13 seconds
+    of empty frame that no numeric gate can see.
+
+    Cheap on purpose: ~24 frames at ss2 is about a minute on Fargate, against
+    ~$0.30 for the repair call and a full render that would otherwise be spent
+    on a scene nobody would watch.
+
+    Returns (repaired: bool, cost_usd: float). Never raises -- a failed repair
+    leaves the original piece in place, because the original at least renders.
+    """
+    import anthropic
+    import base64
+
+    # .resolve(): render.mjs resolves a RELATIVE --out against its own ROOT, not
+    # against cwd, so a relative workdir silently writes the frames somewhere
+    # else and the glob below finds nothing. Same trap that made probe_render
+    # always report failure.
+    frames = (Path(wd) / "preflight").resolve()
+    sheet = (Path(wd) / "preflight_sheet.png").resolve()
+    stride = max(1, plan_frames // 24)
+    r = subprocess.run(
+        ["node", str(APP / "render.mjs"), "--page", page_url_path(piece_path),
+         "--out", str(frames), "--stride", str(stride), "--ss", "2"],
+        cwd=wd, capture_output=True, text=True, timeout=1800, env=render_env())
+    n = len(list(frames.glob("*.png")))
+    if r.returncode != 0 or n < 8:
+        log.warning("preflight render produced %d frames — skipping repair", n)
+        return False, 0.0
+
+    g = subprocess.run(
+        [sys.executable, str(APP / "check.py"), "--frames", str(frames),
+         "--fps", str(fps)],
+        capture_output=True, text=True)
+    gates = (g.stdout + g.stderr).strip()
+    log.info("preflight gates:\n%s", gates)
+
+    try:
+        _contact_sheet(frames, sheet)
+        png = base64.standard_b64encode(sheet.read_bytes()).decode()
+    except Exception as e:                                  # noqa: BLE001
+        log.warning("could not build contact sheet: %s", e)
+        return False, 0.0
+
+    piece = piece_path.read_text()
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    try:
+        with client.messages.stream(
+            # 24000, not 16000: MEASURED, a real repair emitted 16,679 output
+            # tokens (13 edits carrying whole replacement blocks) and 16000 cut
+            # the JSON mid-string, which surfaces as an unparseable response
+            # rather than as "too small".
+            model=CLAUDE_MODEL, max_tokens=24000,
+            thinking={"type": "disabled"},
+            system=REPAIR_SYSTEM,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64",
+                                             "media_type": "image/png",
+                                             "data": png}},
+                {"type": "text", "text":
+                    f"{n} frames, evenly spaced across the whole piece.\n\n"
+                    f"GATES:\n{gates}\n\nCURRENT piece.html:\n{piece}"},
+            ]}],
+        ) as stream:
+            resp = stream.get_final_message()
+        text = "".join(b.text for b in resp.content if b.type == "text")
+        usage = (resp.usage.model_dump() if hasattr(resp.usage, "model_dump")
+                 else dict(resp.usage))
+        cost = _price(usage, False)
+        spec = _extract_json(text)
+    except Exception as e:                                  # noqa: BLE001
+        log.warning("repair call failed: %s", e)
+        return False, 0.0
+
+    log.info("repair assessment: %s", spec.get("assessment", "")[:400])
+    edits = spec.get("edits") or []
+    if not edits:
+        log.info("model reports nothing to fix")
+        return False, cost
+
+    # Apply to a COPY. If the repaired piece does not render, the original is
+    # still on disk and still works -- a repair must never be able to make
+    # things worse than not repairing.
+    backup = piece_path.read_text()
+    try:
+        piece_path.write_text(apply_edits(backup, edits))
+    except Exception as e:                                  # noqa: BLE001
+        log.warning("repair edits did not apply (%s) — keeping original", e)
+        piece_path.write_text(backup)
+        return False, cost
+
+    ok, out = probe_render(piece_path, wd)
+    if not ok:
+        log.warning("repaired piece failed its probe render — reverting:\n%s",
+                    out[:800])
+        piece_path.write_text(backup)
+        return False, cost
+    log.info("repair applied: %d edits, $%.3f", len(edits), cost)
+    return True, cost
+
+
 def probe_render(piece_path, wd, ss=2):
     """
     Render three frames to prove the scene actually runs.
@@ -458,6 +648,23 @@ def run():
         (Path(wd) / "data" / "aurora.json").write_text(_read("data/aurora.json"))
         spec = json.loads(_read("seed_narration.json"))
         source = "seed"
+
+    # ONE repair pass. Look at what was actually rendered, not just whether it
+    # ran. Skipped for the seed (it is a known-good piece and there is nothing
+    # to fix) and when authoring never produced anything.
+    if source in ("claude", "gemini") and os.environ.get("SKIP_REPAIR", "").lower() \
+            not in ("1", "true", "yes"):
+        try:
+            _probe_frames = int(re.search(r"const FRAMES = (\d+);",
+                                          (Path(wd) / "piece.html").read_text()).group(1))
+            repaired, rcost = preflight_repair(
+                Path(wd) / "piece.html", wd, _probe_frames, FPS, cost)
+            cost += rcost
+            log.info("repair pass: %s (running author cost $%.3f)",
+                     "applied" if repaired else "no change", cost)
+        except Exception as e:                              # noqa: BLE001
+            # A repair that crashes must not lose a scene that already renders.
+            log.warning("repair pass errored, keeping original: %s", e)
 
     piece_src = (Path(wd) / "piece.html").read_text()
 
