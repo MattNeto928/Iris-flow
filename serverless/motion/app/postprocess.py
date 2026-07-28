@@ -56,7 +56,12 @@ CLAUDE_MODEL = 'claude-opus-5'
 PRICE = {'in': 5.0 / 1e6, 'out': 25.0 / 1e6}
 # A title + caption + tiktok_title is ~250 tokens of JSON. This budget is only
 # credible because thinking is off below -- see _caption_claude.
-CAPTION_MAX_TOKENS = 2000
+# 2000 TRUNCATED a real response mid-JSON. The parse then failed, the prose
+# fallback treated the whole broken blob AS the caption, and a post went to
+# Metricool reading '{"title": "Why ice floats...'. It was deleted 13 minutes
+# before publication. The output carries title + tiktok_title + a ~600-char
+# caption, so 2000 was never the slack it looked like.
+CAPTION_MAX_TOKENS = 4000
 
 # Same caps the STEM pipeline applies. schedule_post will itself cut a YouTube
 # title over 100 to 97 + "...", so cutting at 97 here means the title that gets
@@ -251,7 +256,7 @@ def _caption_claude(topic: str, narration: str) -> tuple:
     Opus 5 rejects budget_tokens, so switching thinking off is the only cap
     available, and a caption needs none of it.
 
-    That is also what makes CAPTION_MAX_TOKENS=2000 safe: with thinking off the
+    That is also what makes CAPTION_MAX_TOKENS safe: with thinking off the
     whole budget is output, and the output is ~250 tokens of JSON.
     """
     import anthropic
@@ -290,6 +295,25 @@ def _caption_claude(topic: str, narration: str) -> tuple:
         # Same recovery as the STEM pipeline's generate_caption: the model wrote
         # a usable caption in prose, so use it rather than throwing the call away.
         cleaned = _clean(raw)
+        # NEVER emit JSON as the caption. This fallback exists for a model that
+        # answered in PROSE, not one that answered in BROKEN JSON -- and missing
+        # that distinction is what put a raw '{"title": ...' blob in front of an
+        # audience. If it still looks like JSON, salvage the fields by regex and
+        # fail loudly rather than posting the blob.
+        if cleaned.lstrip().startswith('{'):
+            def _grab(k):
+                m = re.search(rf'"{k}"\s*:\s*"((?:[^"\\]|\\.)*)"', cleaned)
+                return _clean(m.group(1)) if m else ''
+            title, caption = _grab('title'), _grab('caption')
+            tiktok_title = _grab('tiktok_title') or title
+            if not (title and caption):
+                raise RuntimeError(
+                    'caption response was truncated JSON and could not be '
+                    f'salvaged (title={title!r} caption={caption[:60]!r})')
+            logger.warning('caption JSON was malformed; salvaged by regex')
+            # Fall through to the single shared return below -- an early return
+            # here returned a 3-tuple of strings against this function's
+            # (dict, cost) contract, and blew up at the call site instead.
         caption = cleaned
         title = cleaned.split('.')[0].strip()[:80]
         tiktok_title = title
