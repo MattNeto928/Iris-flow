@@ -288,12 +288,46 @@ def _post_lines(plan):
     out.append(f"  networks       {', '.join(nets) if nets else 'ig/facebook only'}")
     if post.get('schedule_time'):
         out.append(f"  scheduled for  {post['schedule_time']}")
-    if post.get('title'):
-        out.append(f"  title          {post['title'][:70]}")
-    for r in ((post.get('metricool') or {}).get('results') or []):
-        ok = 'ok' if r.get('success') else 'FAILED'
-        out.append(f"  brand {r.get('blog_id')}   {ok} "
-                   f"{r.get('post_id') or r.get('error', '')}")
+
+    # Every booked post, one block per format. `metricool` is keyed by format
+    # now (reel / story / carousel / image), not a flat results list.
+    for kind, res in (post.get('metricool') or {}).items():
+        if not isinstance(res, dict):
+            continue
+        out.append(f"  --- {kind} ---")
+        if res.get('scheduled_time'):
+            out.append(f"    at           {res['scheduled_time']} ET")
+        for r in (res.get('results') or []):
+            ok = 'ok' if r.get('success') else 'FAILED'
+            out.append(f"    brand {r.get('blog_id')}  {ok}  "
+                       f"{r.get('post_id') or r.get('error', '')}   "
+                       f"{','.join(r.get('networks') or [])}")
+        if not res.get('results'):
+            out.append(f"    not booked   {res.get('error', 'no networks')}")
+
+    # THE COPY ITSELF. This is here because a truncated JSON blob once reached
+    # four live accounts as a caption and the email at the time reported only
+    # "status scheduled" — everything looked green. The email now shows what the
+    # audience will actually read, so a broken caption is visible in the inbox
+    # rather than in the feed.
+    c = post.get('copy') or {}
+    if c:
+        out.append("  --- copy ---")
+        out.append(f"    yt title     {(c.get('youtube') or {}).get('title', '')[:80]}")
+        out.append(f"    yt tags      {', '.join((c.get('youtube') or {}).get('tags') or [])[:110]}")
+        out.append(f"    ig caption   {(c.get('instagram') or {}).get('caption', '')[:150]}")
+        out.append(f"    first comment {(post.get('first_comment') or '')[:110]}")
+        out.append(f"    tiktok       {(c.get('tiktok') or {}).get('title', '')[:80]}")
+        out.append(f"    fb caption   {(c.get('facebook') or {}).get('caption', '')[:110]}")
+        out.append(f"    alt text     {(c.get('alt_text') or '')[:110]}")
+    a = post.get('assets') or {}
+    out.append(f"  assets         {len(a.get('slides') or [])} slides, "
+               f"image={'y' if a.get('image') else 'n'}, "
+               f"story={'y' if a.get('story') else 'n'}, "
+               f"cover={post.get('cover_ms')}ms")
+    if post.get('audio'):
+        out.append(f"  ig audio       {post['audio'].get('title')} "
+                   f"— {post['audio'].get('artist')}")
     return out
 
 

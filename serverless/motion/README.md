@@ -14,7 +14,11 @@ schedule.**
 aws stepfunctions start-execution \
   --state-machine-arn arn:aws:states:us-east-1:482625028438:stateMachine:iris-motion-pipeline \
   --name run-$(date +%s) \
-  --input '{"video_id":"demo01","topic":"why the sky is blue","target_duration":60,"force_seed":false}'
+  --input '{"video_id":"demo01","topic":"why the sky is blue","target_duration":60,
+            "force_seed":false,"seed_fallback":true,
+            "schedule_time":"2026-07-29T15:00:00+00:00",
+            "include_youtube":false,"include_tiktok":false,
+            "post_carousel":false,"post_story":false,"post_image":false}'
 ```
 
 ## Shape
@@ -141,6 +145,23 @@ CONTRACT.md   the build contract these were written against
 | emails | 3 delivered via SES |
 | measured compute | 51.95 vCPU-hr total → **$0.77 on Spot** for everything above |
 | **per video** | **~$0.27 compute + $0.85 authoring ≈ $1.17** |
+
+### Cost after the multi-format change
+
+The companion formats are close to free because they consume a video that
+already exists — the expensive terms (one Opus 5 authoring call, one T4 render)
+are unchanged and are paid once per scene, not once per post.
+
+| item | per run | note |
+|---|---|---|
+| authoring + render + stitch | ~$1.17 | unchanged |
+| per-platform copy call | ~$0.05 | measured: 1440 output tokens on Opus 5 |
+| carousel + story + still assets | ~$0.01 | ffmpeg + Pillow inside postprocess |
+| **per scene, now 1-4 posts** | **~$1.23** | vs ~$1.17 for a single post |
+| weekly compilation | ~$0.45 | one Claude call, ~90 s of TTS, one encode |
+
+At 5 scenes/day that is about **$6.20/day**, against $5.85 before, for roughly
+9 posts a day instead of 5. The per-POST cost drops from ~$1.17 to ~$0.69.
 
 Known deviations from CONTRACT.md, deliberate:
 

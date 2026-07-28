@@ -52,11 +52,19 @@ def _postprocess():
     return postprocess_run()
 
 
+# Also a coroutine, and also on its own weekly schedule rather than in the
+# per-video state machine: it consumes pieces that are already finished.
+def _compile():
+    from compile_video import run as compile_run
+    return compile_run()
+
+
 JOB_DISPATCH = {
     "prep": _prep,
     "render": _render,
     "stitch": _stitch,
     "postprocess": _postprocess,
+    "compile": _compile,
 }
 
 

@@ -1,8 +1,7 @@
 """
-JOB_TYPE=postprocess -- ship the finished video: public copy, caption, Metricool.
+JOB_TYPE=postprocess -- ship the finished piece: public copies, copy, Metricool.
 
 Runs after stitch and is the only job in this pipeline that publishes anything.
-Three steps, in this order because each depends on the one before:
 
   1. out/video.mp4 is copied from the private motion bucket into the public
      iris-flow-videos-<account>. Metricool fetches the media itself, over plain
@@ -11,113 +10,67 @@ Three steps, in this order because each depends on the one before:
      SERVER-SIDE: download + re-upload of a ~40 MB file through a 2 vCPU task is
      wall clock and egress spent on a byte-identical result S3 will produce for
      free.
-  2. ONE Opus 5 call turns the topic and the narration into
-     {title, caption, tiktok_title}.
-  3. The post is scheduled, unconditionally.
+  2. ONE Opus 5 call (app/postcopy.py) writes copy for EVERY network and every
+     companion format.
+  3. Companion assets are cut from the finished video (app/slides.py): a
+     carousel deck, a still, a 15s story.
+  4. Up to four posts are scheduled -- the reel always, plus whichever
+     companions this slot is flagged for.
 
-UNCONDITIONALLY is the word that matters. The check.py gates are read here and
-recorded into plan.json so they reach the notify email, and they do NOT gate:
-stitch already encodes a gate-failing render on purpose ("a gate result is
+UNCONDITIONALLY is still the word that matters. The check.py gates are read here
+and recorded into plan.json so they reach the notify email, and they do NOT
+gate: stitch already encodes a gate-failing render on purpose ("a gate result is
 information"), and this job takes the same line all the way through to publish.
+
+COMPANIONS ARE BUILT ON EVERY RUN, and only POSTED when the slot says so. They
+cost ffmpeg seconds against a video that already exists, and building them
+always means the assets are in S3 for any piece, so a good deck can be posted by
+hand later without re-running the pipeline.
 
 env:  VIDEO_ID, MOTION_BUCKET            (as every other job)
       PUBLIC_BUCKET_NAME                 optional, defaults to the deployed bucket
       SCHEDULE_TIME                      ISO-8601 UTC; absent => no post
       INCLUDE_YOUTUBE, INCLUDE_TIKTOK    per-network caps, default true
+      POST_CAROUSEL, POST_STORY, POST_IMAGE   per-format caps, default FALSE
       DRY_RUN                            'true' => log the payload, post nothing
       ANTHROPIC_API_KEY
       METRICOOL_API_KEY / METRICOOL_USER_ID / METRICOOL_BLOG_ID
 """
 
-import json
 import os
-import re
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import common
+import postcopy
+import slides as slidegen
 from common import logger
 
-# The public bucket IrisFlowStack owns (`iris-flow-videos-${account}`, with
-# publicReadAccess). Defaulted rather than required so a manual run needs no
-# extra env in the one account this pipeline is deployed to; the env var is there
-# for the stack to be explicit and for a test bucket.
 PUBLIC_BUCKET = (os.environ.get('PUBLIC_BUCKET_NAME')
                  or os.environ.get('PUBLIC_BUCKET')
                  or 'iris-flow-videos-482625028438')
-# Its own prefix inside a bucket the STEM pipeline also writes to
-# (`videos/<Y>/<m>/<d>/<id>.mp4`). Nothing collides and either pipeline's objects
-# can be listed on their own.
 PUBLIC_PREFIX = 'motion/'
 
-CLAUDE_MODEL = 'claude-opus-5'
-# Opus 5 list price, same table as prep.py. No caching here: the prompt is ~700
-# tokens and changes every run, so there is nothing worth a cache write.
-PRICE = {'in': 5.0 / 1e6, 'out': 25.0 / 1e6}
-# A title + caption + tiktok_title is ~250 tokens of JSON. This budget is only
-# credible because thinking is off below -- see _caption_claude.
-# 2000 TRUNCATED a real response mid-JSON. The parse then failed, the prose
-# fallback treated the whole broken blob AS the caption, and a post went to
-# Metricool reading '{"title": "Why ice floats...'. It was deleted 13 minutes
-# before publication. The output carries title + tiktok_title + a ~600-char
-# caption, so 2000 was never the slack it looked like.
-CAPTION_MAX_TOKENS = 4000
-
-# Same caps the STEM pipeline applies. schedule_post will itself cut a YouTube
-# title over 100 to 97 + "...", so cutting at 97 here means the title that gets
-# logged is the title that posts, rather than a longer one silently ellipsised
-# two layers down.
 YOUTUBE_TITLE_MAX = 97
 TIKTOK_TITLE_MAX = 80
 
-CAPTION_PROMPT = """You are writing the title and caption for a TikTok / Instagram Reel / YouTube Short.
-
-TOPIC:
-{topic}
-
-NARRATION (the complete spoken script of the video, verbatim):
-{narration}
-
-The narration is the source of truth for what this video actually says. Do not
-promise the viewer anything it does not deliver, and do not describe visuals you
-cannot see.
-
-Write the way a smart human creator writes, not the way an AI writes.
-
-HARD RULES (violating any one of these makes the post unusable):
-- NO em dashes ( — ) anywhere. Use commas or periods.
-- NO en dashes ( – ). Use a regular hyphen ( - ) only when joining words like "well-known".
-- NO "dive into", "fascinating", "let's explore", "uncover", "unpack", "delve", "journey", "buckle up", "mind-blowing", "wild".
-- NO "did you know" / "ever wondered" openers.
-- NO meta references to the video itself ("in this video", "today we look at").
-- NO mention of "Iris Flow", "AI", or any tool/brand name.
-- NO ellipses.
-- NO emojis anywhere in the title or caption text. Hashtags only.
-
-TITLE (used as the YouTube title):
-- Under 80 characters.
-- Concrete, specific noun phrase. Name the phenomenon, person, or number.
-- No clickbait fluff like "you wont believe" or "shocking".
-- Examples of the right tone: "Why bees make hexagons", "Bayes rule, decoded in 60 seconds", "Lorenz attractor: order from a butterfly".
-
-TIKTOK_TITLE (used only on TikTok, where a flat noun phrase dies in the feed):
-- Under 80 characters.
-- State the counterintuitive claim directly, as a challenge or a tension. A question is
-  allowed here. One emoji is allowed here (at the end, never mid-sentence), no more.
-- Still banned: "you won't believe", "shocking", "mind-blowing", "what if I told you",
-  and everything in the hard rules above.
-- Examples of the right tone: "Building more roads makes traffic worse", "A magnet falls
-  slower through copper. No magic", "Your intuition about this coin flip is wrong".
-
-CAPTION:
-- 1-2 short sentences, under 220 chars total before hashtags.
-- Open with a concrete claim or surprising fact drawn from the narration. Mention a number, a name, or a specific phenomenon. Be SPECIFIC.
-- The second sentence (if any) is the "but here's the twist" line, the part that makes a viewer want to watch.
-- Tone: a sharp graduate student texting a friend who is curious about science. Confident, no filler.
-- Then a blank line, then 4-6 hashtags. Hashtags should be specific to the topic (not just generic #science #stem). Include a couple broad ones at the end.
-
-OUTPUT FORMAT (must parse as JSON, no markdown fences, no commentary):
-{{"title": "...", "tiktok_title": "...", "caption": "...\\n\\n#tag1 #tag2 #tag3 #tag4"}}"""
+# When each companion publishes, in Eastern wall-clock hours.
+#
+# The reel slots publish at roughly 8, 10, 12, 14 and 16 ET, so the companions
+# take the ODD hours between them: 9 ET and 11 ET are the two best hours of the
+# week for Instagram on this account (index 90 and 98 of 100) AND they are gaps
+# in the reel schedule, so a carousel never lands on top of a reel.
+#
+# The story is the exception and goes out 90 MINUTES after its reel, on purpose:
+# a story is a pointer to the reel, and a pointer is worth nothing once the
+# thing it points at has scrolled away.
+COMPANION_PLAN = {
+    'story': {'offset_minutes': 90},
+    'carousel': {'next_day_hour_et': 11},
+    'image': {'next_day_hour_et': 9},
+}
+_ET = ZoneInfo('America/New_York')
 
 _TRUTHY = ('1', 'true', 'yes', 'on')
 
@@ -126,18 +79,10 @@ _TRUTHY = ('1', 'true', 'yes', 'on')
 # env
 # ============================================================
 def _flag(name: str, default: str = 'true') -> bool:
-    """INCLUDE_YOUTUBE / INCLUDE_TIKTOK, parsed exactly as src/worker.py does."""
     return os.environ.get(name, default).strip().lower() in _TRUTHY
 
 
 def _motion_bucket() -> str:
-    """
-    The private bucket, by name.
-
-    common resolves it into a module constant at import; re-check it here so an
-    unset env fails with that sentence instead of as `Bucket=None` inside
-    copy_object.
-    """
     if not common.BUCKET:
         raise RuntimeError('MOTION_BUCKET / MOTION_BUCKET_NAME not set')
     return common.BUCKET
@@ -147,19 +92,11 @@ def _motion_bucket() -> str:
 # gates -- recorded, never enforced
 # ============================================================
 def _gates_text(vid: str, wd):
-    """check.py's output, or None if stitch never got as far as uploading it."""
     path = common.download_file(vid, 'out/gates.txt', wd / 'gates.txt', optional=True)
     return path.read_text() if path else None
 
 
 def _gates_passed(plan: dict, text):
-    """
-    The gate verdict, or None if there isn't one. Recorded, never enforced.
-
-    stitch writes it into plan["output"]["gates_passed"] and uploads the file;
-    the text scan is the fallback for a run that died between the two, and is
-    the same rule the notify Lambda applies.
-    """
     passed = (plan.get('output') or {}).get('gates_passed')
     if passed is None and text:
         passed = not ('FAIL:' in text or 'gates FAILED' in text)
@@ -167,22 +104,21 @@ def _gates_passed(plan: dict, text):
 
 
 # ============================================================
-# public copy
+# public copies
 # ============================================================
-def _publish(vid: str) -> tuple:
-    """
-    Server-side copy of out/video.mp4 into the public bucket. Returns (url, bytes).
+def _public_url(key: str) -> str:
+    # Same URL shape the STEM pipeline hands Metricool today. Path style over
+    # the bucket's regional endpoint would also resolve, but this is the form
+    # already known to work with their fetcher.
+    return f'https://{PUBLIC_BUCKET}.s3.amazonaws.com/{key}'
 
-    No ACL is set: IrisFlowStack gives that bucket a policy granting s3:GetObject
-    on every key, so the object is readable the moment it lands, and a per-object
-    ACL would simply fail if the bucket ever moves to BucketOwnerEnforced.
-    """
+
+def _publish_video(vid: str) -> tuple:
+    """Server-side copy of out/video.mp4 into the public bucket -> (url, bytes)."""
     src_bucket = _motion_bucket()
     src_key = common.key(vid, 'out/video.mp4')
     dst_key = f'{PUBLIC_PREFIX}{vid}.mp4'
 
-    # head first: a missing source here means stitch did not finish, and saying
-    # so beats a bare NoSuchKey out of copy_object.
     try:
         head = common.s3.head_object(Bucket=src_bucket, Key=src_key)
     except Exception as e:  # noqa: BLE001 - re-raised immediately with context
@@ -194,135 +130,85 @@ def _publish(vid: str) -> tuple:
         raise RuntimeError(f's3://{src_bucket}/{src_key} is zero bytes')
 
     # MetadataDirective=REPLACE so the Content-Type is asserted here rather than
-    # inherited. A plain COPY carries whatever header the private object happens
-    # to have, which makes what Metricool sees over HTTPS depend on how stitch
-    # uploaded the file; this pins it at the one point that matters.
+    # inherited from however stitch happened to upload the file.
     common.s3.copy_object(
-        Bucket=PUBLIC_BUCKET,
-        Key=dst_key,
+        Bucket=PUBLIC_BUCKET, Key=dst_key,
         CopySource={'Bucket': src_bucket, 'Key': src_key},
-        MetadataDirective='REPLACE',
-        ContentType='video/mp4',
-    )
+        MetadataDirective='REPLACE', ContentType='video/mp4')
 
-    # Same URL shape the STEM pipeline hands Metricool today (src/worker.py
-    # job_concatenate). Path style over the bucket's regional endpoint would also
-    # resolve, but this is the form already known to work with their fetcher.
-    url = f'https://{PUBLIC_BUCKET}.s3.amazonaws.com/{dst_key}'
+    url = _public_url(dst_key)
     logger.info(f'[{vid}] published {size / 1e6:.1f} MB -> {url}')
     return url, size
 
 
+def _publish_asset(local, vid: str, name: str) -> str:
+    """Upload one companion asset straight into the public bucket."""
+    key = f'{PUBLIC_PREFIX}{vid}/{name}'
+    common.s3.upload_file(
+        str(local), PUBLIC_BUCKET, key,
+        ExtraArgs={'ContentType': common._content_type(name)})
+    return _public_url(key)
+
+
 # ============================================================
-# caption
+# scheduling times
 # ============================================================
-def _clean(text: str) -> str:
-    """Belt-and-braces: strip the punctuation the prompt bans, in case it slips."""
-    return (text.replace('—', ', ')
-                .replace('–', ', ')
-                .replace('...', '.')
-                .replace('…', '.'))
-
-
-def _extract_json(text: str) -> dict:
-    text = text.strip()
-    if text.startswith('```'):
-        text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.S)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        i, j = text.find('{'), text.rfind('}')
-        if i < 0 or j <= i:
-            raise
-        return json.loads(text[i:j + 1])
-
-
-def _narration_text(plan: dict) -> str:
-    segs = plan.get('narration') or []
-    lines = [str(s.get('text', '')).strip()
-             for s in segs if isinstance(s, dict) and s.get('text')]
-    return '\n'.join(ln for ln in lines if ln)
-
-
-def _caption_claude(topic: str, narration: str) -> tuple:
+def _companion_time(base: datetime, spec: dict) -> datetime:
     """
-    One Opus 5 call -> ({title, caption, tiktok_title}, usd).
+    When a companion publishes, from the reel's own schedule_time.
 
-    thinking is DISABLED, deliberately, against the SDK default. MEASURED on this
-    account on prep.py's authoring call: with thinking adaptive -- which is what
-    omitting the parameter gives on Opus 5 -- the model spent the ENTIRE 32,000
-    token budget inside one thinking block and returned stop_reason=max_tokens
-    with zero text. Twice. Billed, and downstream it looks like malformed JSON.
-    Opus 5 rejects budget_tokens, so switching thinking off is the only cap
-    available, and a caption needs none of it.
-
-    That is also what makes CAPTION_MAX_TOKENS safe: with thinking off the
-    whole budget is output, and the output is ~250 tokens of JSON.
+    next_day_hour_et is resolved in EASTERN wall clock and converted back to
+    UTC, not computed as "+21 hours". Those differ by an hour across a DST
+    boundary, and the whole point of the chosen hours is that they sit in the
+    gaps between reel slots -- an hour of drift puts a carousel on top of a reel.
     """
-    import anthropic
-    client = anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
-    msg = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=CAPTION_MAX_TOKENS,
-        thinking={'type': 'disabled'},
-        messages=[{'role': 'user',
-                   'content': CAPTION_PROMPT.format(topic=topic,
-                                                    narration=narration)}],
-    )
+    if 'offset_minutes' in spec:
+        return base + timedelta(minutes=spec['offset_minutes'])
+    et = base.astimezone(_ET) + timedelta(days=1)
+    et = et.replace(hour=spec['next_day_hour_et'], minute=0,
+                    second=0, microsecond=0)
+    return et.astimezone(timezone.utc)
 
-    raw = ''.join(b.text for b in msg.content
-                  if getattr(b, 'type', None) == 'text').strip()
-    usage = msg.usage.model_dump() if hasattr(msg.usage, 'model_dump') else dict(msg.usage)
-    cost = (usage.get('input_tokens', 0) * PRICE['in']
-            + usage.get('output_tokens', 0) * PRICE['out'])
-    logger.info('caption: stop=%s out=%s text=%d chars $%.4f',
-                msg.stop_reason, usage.get('output_tokens'), len(raw), cost)
 
-    if not raw:
-        # Fail loudly rather than posting an empty caption. The publish is
-        # already done, so the video is recoverable by hand from the URL in
-        # plan.json; a post with no words is not.
-        raise RuntimeError(
-            f'caption call returned no text (stop_reason={msg.stop_reason}, '
-            f'output_tokens={usage.get("output_tokens")})')
+# Words that carry no topic. Instagram's hashtag suggestion endpoint keys off a
+# single word, so handing it the FIRST word of the topic asks it about "Why" —
+# which is what the first version of this did, for a piece titled "Why ice
+# floats". The suggestions came back generic and the whole call was wasted.
+_STOP = {'why', 'how', 'what', 'when', 'the', 'a', 'an', 'and', 'or', 'of',
+         'in', 'on', 'is', 'are', 'does', 'do', 'this', 'that', 'to', 'for',
+         'from', 'with', 'its', 'it', 'you', 'your', 'can', 'not'}
 
-    try:
-        data = _extract_json(raw)
-        title = _clean(str(data.get('title', '')).strip())
-        caption = _clean(str(data.get('caption', '')).strip())
-        tiktok_title = _clean(str(data.get('tiktok_title', '')).strip()) or title
-    except Exception:  # noqa: BLE001 - any parse failure takes the same recovery
-        # Same recovery as the STEM pipeline's generate_caption: the model wrote
-        # a usable caption in prose, so use it rather than throwing the call away.
-        cleaned = _clean(raw)
-        # NEVER emit JSON as the caption. This fallback exists for a model that
-        # answered in PROSE, not one that answered in BROKEN JSON -- and missing
-        # that distinction is what put a raw '{"title": ...' blob in front of an
-        # audience. If it still looks like JSON, salvage the fields by regex and
-        # fail loudly rather than posting the blob.
-        if cleaned.lstrip().startswith('{'):
-            def _grab(k):
-                m = re.search(rf'"{k}"\s*:\s*"((?:[^"\\]|\\.)*)"', cleaned)
-                return _clean(m.group(1)) if m else ''
-            title, caption = _grab('title'), _grab('caption')
-            tiktok_title = _grab('tiktok_title') or title
-            if not (title and caption):
-                raise RuntimeError(
-                    'caption response was truncated JSON and could not be '
-                    f'salvaged (title={title!r} caption={caption[:60]!r})')
-            logger.warning('caption JSON was malformed; salvaged by regex')
-            # Fall through to the single shared return below -- an early return
-            # here returned a 3-tuple of strings against this function's
-            # (dict, cost) contract, and blew up at the call site instead.
-        caption = cleaned
-        title = cleaned.split('.')[0].strip()[:80]
-        tiktok_title = title
-        logger.warning('caption response was not JSON; derived title heuristically')
 
-    if not caption or not title:
-        raise RuntimeError(f'caption call produced an unusable result: '
-                           f'title={title!r} caption={caption[:80]!r}')
-    return {'title': title, 'caption': caption, 'tiktok_title': tiktok_title}, cost
+def _hashtag_seed(topic: str, fallback: str) -> str:
+    """
+    The one word to ask Instagram about: the longest non-stopword available.
+
+    Longest is a crude proxy for most specific, and it is the right crude proxy
+    here — "hydrogen" and "hexagonal" beat "ice" for finding the tags a niche
+    audience actually follows, and a bad seed costs only a generic list.
+    """
+    for source in (topic, fallback):
+        words = [w.strip('.,:;!?()"\'').lower() for w in (source or '').split()]
+        words = [w for w in words if w.isalpha() and len(w) >= 4 and w not in _STOP]
+        if words:
+            return max(words, key=len)
+    return ''
+
+
+def _clamp(when: datetime) -> datetime:
+    """
+    Never hand Metricool a publicationDate in the past.
+
+    schedule_time is chosen by the orchestrator BEFORE the pipeline runs
+    (now + 30..90 min), but the run itself can outlast that. A past date either
+    errors or publishes instantly, which defeats spreading posts across the day.
+    """
+    floor = datetime.now(timezone.utc) + timedelta(minutes=5)
+    if when < floor:
+        logger.warning('schedule time %s is in the past (pipeline outran its '
+                       'window) - clamping to %s', when.isoformat(), floor.isoformat())
+        return floor
+    return when
 
 
 # ============================================================
@@ -342,123 +228,219 @@ async def run():
                 f'(recorded only -- this job posts either way)')
 
     # --- 2. public copy -----------------------------------------------------
-    public_url, public_bytes = _publish(vid)
+    public_url, public_bytes = _publish_video(vid)
 
-    # --- 3. caption ---------------------------------------------------------
-    narration = _narration_text(plan)
+    # --- 3. copy ------------------------------------------------------------
+    segs = plan.get('narration') or []
+    narration = '\n'.join(str(s.get('text', '')).strip()
+                          for s in segs if isinstance(s, dict) and s.get('text'))
     if not narration:
-        # Every path through prep writes narration, including the seed. An empty
-        # one means a hand-edited or truncated plan; the topic alone still gives
-        # the model something to work from, so say so and continue.
         logger.warning(f'[{vid}] plan.json has no narration text -- '
-                       f'captioning from the topic alone')
-    cap, caption_usd = _caption_claude(topic, narration)
-    caption = cap['caption']
-    youtube_title = cap['title'][:YOUTUBE_TITLE_MAX]
-    tiktok_title = (cap.get('tiktok_title') or cap['title'])[:TIKTOK_TITLE_MAX]
-    logger.info(f"[{vid}] title='{youtube_title}'  tiktok_title='{tiktok_title}'  "
-                f"caption_first40='{caption[:40]}'")
+                       f'writing copy from the topic alone')
+    duration = sum(float(s.get('duration') or 0) for s in segs if isinstance(s, dict))
+    bundle, copy_usd = postcopy.generate(topic, narration, duration)
 
-    # --- 4. schedule --------------------------------------------------------
+    youtube_title = bundle['youtube']['title'][:YOUTUBE_TITLE_MAX]
+    bundle['youtube']['title'] = youtube_title
+    bundle['tiktok']['title'] = bundle['tiktok']['title'][:TIKTOK_TITLE_MAX]
+
+    # --- 4. companion assets ------------------------------------------------
+    # Built for every run whether or not this slot posts them: they are cheap
+    # against a video that already exists, and an asset in S3 can be posted by
+    # hand later, while an asset never built cannot.
+    video_local = common.download_file(vid, 'out/video.mp4', wd / 'video.mp4')
+    piece_html = ''
+    piece_path = common.download_file(vid, 'piece.html', wd / 'piece_ro.html',
+                                      optional=True)
+    if piece_path:
+        piece_html = piece_path.read_text(errors='replace')
+    fps = float(plan.get('fps') or 30)
+
+    assets = {}
+    try:
+        deck = slidegen.build_slides(video_local, wd, bundle['slides'],
+                                     piece_html=piece_html, fps=fps)
+        assets['slides'] = [_publish_asset(p, vid, p.name) for p in deck]
+    except Exception as e:  # noqa: BLE001 - one format failing is not the run failing
+        logger.warning('[%s] carousel assets failed: %s', vid, e)
+        assets['slides'] = []
+    try:
+        still = slidegen.build_image(video_local, wd, bundle['slides'],
+                                     piece_html=piece_html, fps=fps)
+        assets['image'] = _publish_asset(still, vid, 'image.jpg') if still else None
+    except Exception as e:  # noqa: BLE001
+        logger.warning('[%s] still image failed: %s', vid, e)
+        assets['image'] = None
+    try:
+        story = slidegen.build_story(video_local, wd)
+        assets['story'] = _publish_asset(story, vid, 'story.mp4')
+    except Exception as e:  # noqa: BLE001
+        logger.warning('[%s] story asset failed: %s', vid, e)
+        assets['story'] = None
+    try:
+        cover_ms = slidegen.best_cover_ms(video_local, wd, piece_html, fps)
+    except Exception as e:  # noqa: BLE001 - Metricool defaults to frame 0
+        logger.warning('[%s] cover frame selection failed: %s', vid, e)
+        cover_ms = None
+
+    logger.info('[%s] assets: %d slides, image=%s, story=%s, cover=%sms',
+                vid, len(assets['slides']), bool(assets['image']),
+                bool(assets['story']), cover_ms)
+
+    # --- 5. schedule --------------------------------------------------------
     schedule_time_str = os.environ.get('SCHEDULE_TIME')
     dry_run = os.environ.get('DRY_RUN', 'false').lower() == 'true'
-    # Set per-execution by the orchestrator (via the triggering EventBridge rule)
-    # to hold YouTube and TikTok to their daily caps. When false, Metricool drops
-    # that network from every blog. Both default to true.
     include_youtube = _flag('INCLUDE_YOUTUBE')
     include_tiktok = _flag('INCLUDE_TIKTOK')
+    # Default FALSE, unlike the network flags: a hand-run execution should post
+    # the reel and nothing else rather than surprise the accounts with three
+    # extra posts it never asked for.
+    post_carousel = _flag('POST_CAROUSEL', 'false')
+    post_story = _flag('POST_STORY', 'false')
+    post_image = _flag('POST_IMAGE', 'false')
 
-    schedule_result = None
+    from metricool_client import MetricoolClient
+    mc = MetricoolClient()
+
+    # Instagram's own suggestions, merged behind the model's tags: the model's
+    # are topical, Instagram's are the ones it recognises, and a caption wants
+    # both. Never replaces, only tops up to 12.
+    tags = list(bundle['instagram']['hashtags'])
+    for extra in await mc.suggest_hashtags(_hashtag_seed(topic, youtube_title), limit=8):
+        if len(tags) >= 12:
+            break
+        if extra.lower() not in {t.lower() for t in tags}:
+            tags.append(extra)
+    bundle['instagram']['hashtags'] = tags
+    first_comment = ' '.join(tags)
+
+    audio = None
+    if mc.instagram_audio and bundle.get('audio_query'):
+        audio = await mc.find_instagram_audio(bundle['audio_query'],
+                                              min_ms=int(duration * 1000))
+
+    posts = {}
     if dry_run:
         status = 'dry_run'
         logger.info(
-            f'[{vid}] DRY_RUN -- would schedule to Metricool:\n'
-            f'  video_url       {public_url}\n'
-            f'  schedule_time   {schedule_time_str}\n'
-            f'  include_youtube {include_youtube}\n'
-            f'  include_tiktok  {include_tiktok}\n'
-            f'  youtube_title   {youtube_title}\n'
-            f'  tiktok_title    {tiktok_title}\n'
-            f'  caption         {caption}'
+            f'[{vid}] DRY_RUN -- would schedule:\n'
+            f'  reel        {public_url}\n'
+            f'  at          {schedule_time_str} (yt={include_youtube} tt={include_tiktok})\n'
+            f'  yt_title    {youtube_title}\n'
+            f'  yt_tags     {bundle["youtube"]["tags"]}\n'
+            f'  yt_category {bundle["youtube"]["category"]}\n'
+            f'  ig_caption  {bundle["instagram"]["caption"]}\n'
+            f'  first_comm  {first_comment}\n'
+            f'  tiktok      {bundle["tiktok"]["title"]} | {bundle["tiktok"]["caption"][:80]}\n'
+            f'  fb_caption  {bundle["facebook"]["caption"][:120]}\n'
+            f'  alt_text    {bundle["alt_text"]}\n'
+            f'  cover_ms    {cover_ms}\n'
+            f'  audio       {audio.get("title") if audio else None}\n'
+            f'  carousel    {post_carousel} ({len(assets["slides"])} slides)\n'
+            f'  story       {post_story} ({assets["story"]})\n'
+            f'  image       {post_image} ({assets["image"]})'
         )
     elif not schedule_time_str:
-        # Non-fatal: this is what a manual smoke test looks like. Logged at
-        # WARNING because on a scheduled run it means the slot silently produced
-        # no post, which is otherwise invisible.
         status = 'no_schedule_time'
         logger.warning(f'[{vid}] SCHEDULE_TIME is not set -- nothing was posted')
     else:
         try:
-            schedule_time = datetime.fromisoformat(schedule_time_str)
-            # CLAMP. schedule_time is chosen by the orchestrator BEFORE the pipeline
-            # runs (now + 30..90 min), but the run itself can outlast that: measured
-            # end-to-end has already exceeded 30 minutes once, and the deployed
-            # timeouts permit far more. Handing Metricool a publicationDate in the
-            # past either errors or publishes instantly, which defeats the whole
-            # point of spreading posts across the day.
-            _floor = datetime.now(timezone.utc) + timedelta(minutes=5)
-            if schedule_time < _floor:
-                logger.warning(
-                    "schedule_time %s is in the past (pipeline outran its window) "
-                    "- clamping to %s", schedule_time.isoformat(), _floor.isoformat())
-                schedule_time = _floor
+            base = datetime.fromisoformat(schedule_time_str)
+            if base.tzinfo is None:
+                base = base.replace(tzinfo=timezone.utc)
         except ValueError as e:
             raise RuntimeError(
                 f'SCHEDULE_TIME={schedule_time_str!r} is not ISO-8601: {e}') from e
 
-        # Imported from THIS app dir, never from serverless/src: the two
-        # pipelines share the secret and SES and nothing else (CONTRACT.md).
-        from metricool_client import MetricoolClient
+        # The reel. This one is the post; the rest are companions to it.
+        posts['reel'] = await mc.schedule(
+            kind='reel', media=[public_url], copy=bundle,
+            schedule_time=_clamp(base),
+            include_youtube=include_youtube, include_tiktok=include_tiktok,
+            alt_text=bundle['alt_text'], first_comment=first_comment,
+            cover_ms=cover_ms, audio=audio)
 
-        logger.info(f'[{vid}] scheduling to Metricool for {schedule_time} '
-                    f'(include_youtube={include_youtube}, '
-                    f'include_tiktok={include_tiktok})...')
-        schedule_result = await MetricoolClient().schedule_post(
-            video_url=public_url,
-            caption=caption,
-            schedule_time=schedule_time,
-            youtube_title=youtube_title,
-            include_youtube=include_youtube,
-            include_tiktok=include_tiktok,
-            tiktok_title=tiktok_title,
-        )
-        for brand in schedule_result.get('results', []):
-            if brand.get('success'):
-                logger.info(f'[{vid}] scheduled brand {brand.get("blog_id")}: '
-                            f'{brand.get("post_id")} '
-                            f'(networks={brand.get("networks")})')
-            else:
-                logger.error(f'[{vid}] brand {brand.get("blog_id")} failed: '
-                             f'{brand.get("error")}')
-        status = 'scheduled' if schedule_result.get('success') else 'failed'
+        # Companions. Each is independently gated by its slot flag AND by
+        # whether its asset actually got built, and a failure in one never
+        # touches another -- schedule() reports rather than raises.
+        if post_story and assets['story']:
+            story_copy = dict(bundle)
+            story_copy['instagram'] = dict(bundle['instagram'],
+                                           caption=bundle.get('story_text') or '')
+            posts['story'] = await mc.schedule(
+                kind='story', media=[assets['story']], copy=story_copy,
+                schedule_time=_clamp(_companion_time(base, COMPANION_PLAN['story'])),
+                include_youtube=False, include_tiktok=False,
+                alt_text=bundle['alt_text'])
 
-    # --- 5. record ----------------------------------------------------------
+        if post_carousel and assets['slides']:
+            posts['carousel'] = await mc.schedule(
+                kind='carousel', media=assets['slides'], copy=bundle,
+                schedule_time=_clamp(_companion_time(base, COMPANION_PLAN['carousel'])),
+                include_youtube=False, include_tiktok=include_tiktok,
+                alt_text=bundle['alt_text'], first_comment=first_comment)
+
+        if post_image and assets['image']:
+            image_copy = dict(bundle)
+            image_copy['instagram'] = dict(bundle['instagram'],
+                                           caption=bundle.get('image_caption') or '')
+            posts['image'] = await mc.schedule(
+                kind='image', media=[assets['image']], copy=image_copy,
+                schedule_time=_clamp(_companion_time(base, COMPANION_PLAN['image'])),
+                include_youtube=False, include_tiktok=False,
+                alt_text=bundle['alt_text'], first_comment=first_comment)
+
+        for kind, res in posts.items():
+            for brand in res.get('results', []):
+                if brand.get('success'):
+                    logger.info(f'[{vid}] {kind} -> blog {brand.get("blog_id")} '
+                                f'post {brand.get("post_id")} '
+                                f'networks={brand.get("networks")}')
+                else:
+                    logger.error(f'[{vid}] {kind} -> blog {brand.get("blog_id")} '
+                                 f'FAILED: {brand.get("error")}')
+
+        # The REEL is what decides the run's verdict. A companion that fails is
+        # logged and reported but does not fail the job: the piece published,
+        # and failing here would send a FAILED email about a post that went out
+        # fine, on top of retry semantics for a job that must never retry.
+        status = 'scheduled' if posts['reel'].get('success') else 'failed'
+
+    # --- 6. record ----------------------------------------------------------
     plan['post'] = {
         'public_bucket': PUBLIC_BUCKET,
         'public_key': f'{PUBLIC_PREFIX}{vid}.mp4',
         'public_url': public_url,
         'bytes': public_bytes,
         'title': youtube_title,
-        'tiktok_title': tiktok_title,
-        'caption': caption,
+        'tiktok_title': bundle['tiktok']['title'],
+        'caption': bundle['instagram']['caption'],
+        'copy': bundle,
+        'assets': assets,
+        'cover_ms': cover_ms,
+        'audio': {'id': audio.get('audioId'), 'title': audio.get('title'),
+                  'artist': audio.get('displayArtist')} if audio else None,
+        'first_comment': first_comment,
         'schedule_time': schedule_time_str,
         'include_youtube': include_youtube,
         'include_tiktok': include_tiktok,
+        'post_carousel': post_carousel,
+        'post_story': post_story,
+        'post_image': post_image,
         'dry_run': dry_run,
-        # Carried so the notify email can show the verdict next to a post that
-        # went out regardless of it.
         'gates_passed': gates_passed,
         'status': status,
-        'metricool': schedule_result,
+        'metricool': posts,
         'recorded_at': datetime.now(timezone.utc).isoformat(),
     }
-    plan.setdefault('cost', {})['caption_usd'] = round(caption_usd, 4)
+    plan.setdefault('cost', {})['caption_usd'] = round(copy_usd, 4)
     plan.setdefault('timings', {})['postprocess_s'] = round(time.time() - t0, 1)
     common.save_plan(vid, plan)
 
-    logger.info(f'[{vid}] postprocess {status} in {time.time() - t0:.1f}s')
+    logger.info(f'[{vid}] postprocess {status} in {time.time() - t0:.1f}s '
+                f'({len(posts)} post(s) scheduled)')
 
-    # Raised AFTER the plan is saved, so the URL, the caption and Metricool's own
+    # Raised AFTER the plan is saved, so the URLs, the copy and Metricool's own
     # error are all on record before the job dies. A scheduled slot that quietly
     # rendered a video and never posted it is the one failure mode nobody
     # notices; this turns it into the FAILED notify email. It cannot cause a
@@ -466,4 +448,4 @@ async def run():
     # ends the job on attempt 1 for anything that is not a known transient.
     if status == 'failed':
         raise RuntimeError(f'Metricool scheduling failed: '
-                           f'{schedule_result.get("error")}')
+                           f'{posts["reel"].get("error")}')

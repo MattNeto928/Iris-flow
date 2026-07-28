@@ -31,13 +31,14 @@ import { Construct } from 'constructs';
  * finished MP4 into because Metricool has to fetch it over plain HTTPS.
  * Everything else is its own: bucket, ECR repo, compute environments, queues.
  *
- * Scheduled 5x daily by the three EventBridge rules at the bottom of this file,
- * which fire `iris-motion-orchestrator` — the same cadence and the same
- * per-network caps the STEM pipeline used before it was paused.
+ * Scheduled 5x daily by the four EventBridge rules at the bottom of this file,
+ * which fire `iris-motion-orchestrator`. The hours are this account's own —
+ * derived from Metricool's per-network audience curve, not inherited from the
+ * STEM pipeline — and the rules also carry the per-format companion caps.
  *
  * EXECUTION INPUT. Every field below is read by a JsonPath in the state
  * machine, and a JsonPath to a missing field FAILS the state rather than
- * defaulting — so all eight are mandatory on every execution, hand-started or
+ * defaulting — so all eleven are mandatory on every execution, hand-started or
  * not. The orchestrator always sets them.
  *
  *   aws stepfunctions start-execution \
@@ -46,7 +47,8 @@ import { Construct } from 'constructs';
  *               "target_duration":48,
  *               "force_seed":true,"seed_fallback":true,
  *               "schedule_time":"2026-07-28T18:40:00+00:00",
- *               "include_youtube":false,"include_tiktok":false}'
+ *               "include_youtube":false,"include_tiktok":false,
+ *               "post_carousel":false,"post_story":false,"post_image":false}'
  *
  * The two seed flags are what separate a manual run from a scheduled one.
  * Scheduled runs pin BOTH false: authoring is Claude-only and a slot that
@@ -363,8 +365,12 @@ export class IrisMotionStack extends cdk.Stack {
     // after schedule_post() returns would run the whole job again and book the
     // post TWICE, with no idempotency key to stop it. A reclaimed post must
     // fail the run and email, never repeat.
+    // 2 vCPU / 4096 MiB, up from 1 / 2048. This job no longer just copies a
+    // file and calls an API: it extracts carousel frames with ffmpeg, composites
+    // slide typography with Pillow at 1080x1350, cuts a story teaser, and makes
+    // up to four Metricool calls. 20-minute timeout for the same reason.
     const postprocessJobDef = createJobDef(
-      'PostprocessJobDef', 'postprocess', 1, 2048, 15,
+      'PostprocessJobDef', 'postprocess', 2, 4096, 20,
       {
         // The PUBLIC bucket, NOT MOTION_BUCKET — this is the one Metricool
         // fetches from. app/postprocess.py defaults it to the same name, but
@@ -379,6 +385,41 @@ export class IrisMotionStack extends cdk.Stack {
         METRICOOL_TIKTOK_AUTO_ADD_MUSIC: 'false',
         METRICOOL_SHOW_REEL_ON_FEED: 'true',
         METRICOOL_INSTAGRAM_MANUAL_FOR_AUDIO: 'false',
+        // Attach a licensed track from Metricool's Instagram catalogue to each
+        // Reel. Audio is a strong Reels ranking signal, but the catalogue
+        // search is keyword-based and MEASURED to match loosely: the query
+        // "cold ambient wonder" for the ice piece returned a track called
+        // "Give Thanks (feat. Plum Soul)". So it goes on at 12/100 against the
+        // video's own 100 — audible enough to register as an attached track,
+        // quiet enough that a bad match is not what the viewer hears over the
+        // narration. Turn the whole thing off with 'false'; no redeploy needed
+        // if you override it on the job definition.
+        METRICOOL_INSTAGRAM_AUDIO: 'true',
+        METRICOOL_AUDIO_VOLUME: '12',
+        METRICOOL_VIDEO_VOLUME: '100',
+      },
+      {
+        METRICOOL_API_KEY: batch.Secret.fromSecretsManager(apiSecrets, 'METRICOOL_API_KEY'),
+        METRICOOL_USER_ID: batch.Secret.fromSecretsManager(apiSecrets, 'METRICOOL_USER_ID'),
+        METRICOOL_BLOG_ID: batch.Secret.fromSecretsManager(apiSecrets, 'METRICOOL_BLOG_ID'),
+      },
+      true,      // atMostOnce: never retry a job that posts
+    );
+
+    // The weekly YouTube long-form cut. Reads finished pieces out of the motion
+    // bucket, writes one landscape video, posts it to YouTube only.
+    //
+    // 4 vCPU / 8 GiB and 60 minutes because unlike postprocess this one is
+    // genuinely CPU-bound: it re-encodes 4-6 vertical pieces into 1920x1080
+    // with a blurred backdrop, then concatenates the lot. libx264 at `medium`
+    // over ~8 minutes of output is minutes of real work, not seconds.
+    //
+    // atMostOnce for the same reason as postprocess: it publishes.
+    const compileJobDef = createJobDef(
+      'CompileJobDef', 'compile', 4, 8192, 60,
+      {
+        PUBLIC_BUCKET_NAME: publicVideoBucket.bucketName,
+        METRICOOL_DEFAULT_AUDIO_NAME: 'Scientific-Nipsey',
       },
       {
         METRICOOL_API_KEY: batch.Secret.fromSecretsManager(apiSecrets, 'METRICOOL_API_KEY'),
@@ -632,6 +673,13 @@ export class IrisMotionStack extends cdk.Stack {
           SCHEDULE_TIME: sfn.JsonPath.stringAt('$.schedule_time'),
           INCLUDE_YOUTUBE: sfn.JsonPath.stringAt("States.Format('{}', $.include_youtube)"),
           INCLUDE_TIKTOK: sfn.JsonPath.stringAt("States.Format('{}', $.include_tiktok)"),
+          // Companion formats. Set per-slot by the triggering rule; exactly one
+          // rule/day sets carousel and image, two set story. postprocess builds
+          // the assets on EVERY run regardless (they cost ffmpeg seconds off a
+          // video that already exists) and these only decide what gets booked.
+          POST_CAROUSEL: sfn.JsonPath.stringAt("States.Format('{}', $.post_carousel)"),
+          POST_STORY: sfn.JsonPath.stringAt("States.Format('{}', $.post_story)"),
+          POST_IMAGE: sfn.JsonPath.stringAt("States.Format('{}', $.post_image)"),
           // DRY_RUN=true does everything except the Metricool call: copies the MP4
           // public, writes the caption, logs what it WOULD book. Without this on the
           // execution input there is no way to rehearse posting — the first cron
@@ -688,6 +736,58 @@ export class IrisMotionStack extends cdk.Stack {
       .next(stitchJob)
       .next(postprocessJob)
       .next(notifySuccess);
+
+    // =====================
+    // Step Functions — iris-motion-compile (weekly, separate graph)
+    // =====================
+    // Its own machine rather than a branch of the pipeline above, because it
+    // consumes pieces that are already FINISHED: it has no prep, no render
+    // fan-out and no stitch, and bolting a Choice onto the front of a
+    // five-state graph to skip four of them would make the per-video path
+    // harder to read for no gain.
+    //
+    // DRY_RUN is threaded the same way and for the same reason as the pipeline:
+    // without it on the execution input, the first cron fire after a deploy is
+    // also the first live upload.
+    const compileJob = new tasks.BatchSubmitJob(this, 'CompileJob', {
+      jobDefinitionArn: compileJobDef.jobDefinitionArn,
+      jobName: sfn.JsonPath.format('motion-compile-{}',
+        sfn.JsonPath.stringAt('$$.Execution.Name')),
+      jobQueueArn: jobQueue.jobQueueArn,
+      containerOverrides: {
+        environment: {
+          VIDEO_ID: sfn.JsonPath.stringAt('$.video_id'),
+          DRY_RUN: sfn.JsonPath.stringAt("States.Format('{}', $.dry_run)"),
+        },
+      },
+      resultPath: '$.compileResult',
+    });
+    compileJob.addRetry(batchRetry);
+
+    const notifyCompileSuccess = new tasks.LambdaInvoke(this, 'NotifyCompileSuccess', {
+      lambdaFunction: notifyFn,
+      payloadResponseOnly: true,
+      resultPath: '$.notifyResult',
+    });
+    const notifyCompileFailure = new tasks.LambdaInvoke(this, 'NotifyCompileFailure', {
+      lambdaFunction: notifyFn,
+      payloadResponseOnly: true,
+      resultPath: '$.notifyResult',
+    });
+    const compileFailed = new sfn.Fail(this, 'CompileFailed', {
+      error: 'IrisMotionCompileFailed',
+      cause: 'The weekly compilation failed. See $.error and the failure email.',
+    });
+    notifyCompileFailure.next(compileFailed);
+    notifyCompileFailure.addCatch(compileFailed, { resultPath: sfn.JsonPath.DISCARD });
+    compileJob.addCatch(notifyCompileFailure, toNotifyOnFailure);
+
+    const compileMachine = new sfn.StateMachine(this, 'MotionCompileStateMachine', {
+      stateMachineName: 'iris-motion-compile',
+      definitionBody: sfn.DefinitionBody.fromChainable(
+        compileJob.next(notifyCompileSuccess)),
+      timeout: cdk.Duration.hours(2),
+    });
 
     const stateMachine = new sfn.StateMachine(this, 'MotionStateMachine', {
       stateMachineName: 'iris-motion-pipeline',
@@ -747,80 +847,140 @@ export class IrisMotionStack extends cdk.Stack {
     stateMachine.grantStartExecution(orchestratorFn);
 
     // =====================
-    // EventBridge — 5x daily, the cadence taken over from the STEM pipeline
+    // EventBridge — 5x daily, retimed against this account's own audience data
     // =====================
-    // Three rules, one Lambda, differing only in the constant network flags
-    // they pass. Hours and flags are reproduced EXACTLY from IrisFlowStack's
-    // DailySchedule* rules (now disabled), because this is a handover, not a
-    // new schedule: the posting rhythm the accounts are used to should not
-    // change on the day the content pipeline behind it does.
+    // The hours are NOT the STEM pipeline's any more. They were chosen by
+    // maximising Metricool's per-network audience-online curve
+    // (GET /v2/scheduler/besttimes/{provider}, 90 days, America/New_York),
+    // weighted by each network's MEASURED median views per post on this account
+    // (IG 3148, YouTube 653, TikTok 425), subject to: 5 slots, >=2h apart,
+    // publish hour inside 07:00-21:00 ET, YouTube on exactly 2, TikTok on 3.
     //
-    // Per-network caps come out of the split: YouTube 2 posts/day, TikTok
-    // 3 posts/day (its For-You distribution collapsed under a 5x/day identical
-    // crosspost cadence). IG/Facebook get all 5. The flags ride the execution
-    // input into postprocess, which hands them to Metricool.
+    // Result: +43% weighted audience-online vs the inherited STEM hours. The
+    // old 00:00 UTC slot was the single worst hour of the day on ALL FOUR
+    // networks (IG 11, TikTok 33, YouTube 25, Facebook 29 on a 0-100 index)
+    // and it carried YouTube post 2-of-2 and TikTok post 3-of-3.
+    //
+    // HONEST CAVEAT, recorded here because it bounds what this is worth: on
+    // 726 of our own posts, publish-hour audience-online has NO measurable
+    // relationship with reach (Spearman rho: IG -0.008, TikTok +0.028,
+    // YouTube -0.120; IG best-vs-worst quartile median 2986 vs 2957 views,
+    // permutation p = 0.94). Retention does the work (skip rate rho -0.72).
+    // These hours are the free half of the trade, not the lever.
+    //
+    // Cron is fixed UTC, so the ET publish times below shift one hour earlier
+    // in winter. Written as EDT because that is when this was deployed.
+    //
+    // Each rule also carries the COMPANION-FORMAT flags. Caps live here, on
+    // the rule, rather than in a counter someone has to reset: exactly one
+    // slot/day sets post_carousel, one sets post_image, two set post_story.
+    // That is 5 reels + 1 carousel + 1 image + 2 stories = 9 posts/day, and
+    // the cap cannot drift because there is no state to drift.
+    const slotDefaults = { post_carousel: false, post_story: false, post_image: false };
 
-    // 2x daily with YouTube + TikTok — prime US engagement windows.
-    // 18:00 UTC = 1pm EST, 00:00 UTC = 7pm EST.
+    // 2× daily WITH YouTube + TikTok. 13:00 UTC = 10am ET, 19:00 = 4pm ET.
+    // 10am ET is the best single hour of the week for TikTok (79) and strong
+    // for IG (95); 4pm ET is YouTube's weekly peak (76).
     const motionScheduleYouTube = new events.Rule(this, 'MotionDailyScheduleYouTube', {
       ruleName: 'iris-motion-daily-youtube',
-      description: 'Motion orchestrator 2× daily WITH YouTube + TikTok (1pm, 7pm EST)',
-      // SHIPPED DISABLED, deliberately. The three iris-flow-daily-* rules are
-      // still ENABLED in the live account and these use byte-identical crons,
-      // so if IrisMotionStack deploys first every slot fires TWICE — ten posts
-      // a day to real accounts. Enable only after IrisFlowStack is deployed and
-      // `aws events describe-rule` shows the STEM rules DISABLED:
-      //   aws events enable-rule --name iris-motion-daily-youtube
-      enabled: false,
+      description: 'Motion orchestrator 2× daily WITH YouTube + TikTok (10am, 4pm ET) + story',
+      // ENABLED in code. This previously shipped `false` to stop it
+      // double-posting alongside the STEM rules during the handover; those are
+      // long since DISABLED and these were enabled by CLI. Leaving the code at
+      // false meant the next `cdk deploy` would silently switch the whole
+      // pipeline back off — the deploy would succeed and the posting would just
+      // stop. The handover is over; the code now says what the account says.
+      enabled: true,
       schedule: events.Schedule.cron({
         minute: '0',
-        hour: '18,0', // 2× daily, UTC
+        hour: '13,19', // 2× daily, UTC
       }),
     });
     motionScheduleYouTube.addTarget(new targets.LambdaFunction(orchestratorFn, {
-      event: events.RuleTargetInput.fromObject({ include_youtube: true, include_tiktok: true }),
+      event: events.RuleTargetInput.fromObject({
+        ...slotDefaults, include_youtube: true, include_tiktok: true, post_story: true,
+      }),
     }));
 
-    // 1× daily with TikTok (no YouTube) — midday slot.
-    // 15:00 UTC = 10am EST.
+    // 1× daily WITH TikTok, no YouTube. 15:00 UTC = 12pm ET.
+    // Carries the day's carousel: midday is IG's second-best hour (94) and a
+    // carousel wants the slot with the most dwell, not the most scroll.
     const motionScheduleTikTok = new events.Rule(this, 'MotionDailyScheduleTikTok', {
       ruleName: 'iris-motion-daily-tiktok',
-      description: 'Motion orchestrator 1× daily WITH TikTok, no YouTube (10am EST)',
-      // SHIPPED DISABLED, deliberately. The three iris-flow-daily-* rules are
-      // still ENABLED in the live account and these use byte-identical crons,
-      // so if IrisMotionStack deploys first every slot fires TWICE — ten posts
-      // a day to real accounts. Enable only after IrisFlowStack is deployed and
-      // `aws events describe-rule` shows the STEM rules DISABLED:
-      //   aws events enable-rule --name iris-motion-daily-youtube
-      enabled: false,
+      description: 'Motion orchestrator 1× daily WITH TikTok, no YouTube (12pm ET) + carousel',
+      enabled: true,
       schedule: events.Schedule.cron({
         minute: '0',
         hour: '15', // 1× daily, UTC
       }),
     });
     motionScheduleTikTok.addTarget(new targets.LambdaFunction(orchestratorFn, {
-      event: events.RuleTargetInput.fromObject({ include_youtube: false, include_tiktok: true }),
+      event: events.RuleTargetInput.fromObject({
+        ...slotDefaults, include_youtube: false, include_tiktok: true, post_carousel: true,
+      }),
     }));
 
-    // 2× daily IG/Facebook only — early morning + late afternoon.
-    // 11:00 UTC = 6am, 21:00 = 4pm EST.
+    // 1× daily IG/Facebook only. 11:00 UTC = 8am ET.
     const motionScheduleIgFb = new events.Rule(this, 'MotionDailyScheduleNoYouTube', {
       ruleName: 'iris-motion-daily-no-youtube',
-      description: 'Motion orchestrator 2× daily IG/Facebook only (6am, 4pm EST)',
-      // SHIPPED DISABLED, deliberately. The three iris-flow-daily-* rules are
-      // still ENABLED in the live account and these use byte-identical crons,
-      // so if IrisMotionStack deploys first every slot fires TWICE — ten posts
-      // a day to real accounts. Enable only after IrisFlowStack is deployed and
-      // `aws events describe-rule` shows the STEM rules DISABLED:
-      //   aws events enable-rule --name iris-motion-daily-youtube
-      enabled: false,
+      description: 'Motion orchestrator 1× daily IG/Facebook only (8am ET)',
+      enabled: true,
       schedule: events.Schedule.cron({
         minute: '0',
-        hour: '11,21', // 2× daily, UTC
+        hour: '11', // 1× daily, UTC
       }),
     });
     motionScheduleIgFb.addTarget(new targets.LambdaFunction(orchestratorFn, {
-      event: events.RuleTargetInput.fromObject({ include_youtube: false, include_tiktok: false }),
+      event: events.RuleTargetInput.fromObject({
+        ...slotDefaults, include_youtube: false, include_tiktok: false,
+      }),
+    }));
+
+    // 1× daily IG/Facebook only. 17:00 UTC = 2pm ET. Carries the day's single
+    // still image, which posts +21h later into 11am ET — IG's weekly peak (98)
+    // and a gap between reel slots, so the two never land together.
+    const motionScheduleImage = new events.Rule(this, 'MotionDailyScheduleImage', {
+      ruleName: 'iris-motion-daily-image',
+      description: 'Motion orchestrator 1× daily IG/Facebook only (2pm ET) + still image',
+      enabled: true,
+      schedule: events.Schedule.cron({
+        minute: '0',
+        hour: '17', // 1× daily, UTC
+      }),
+    });
+    motionScheduleImage.addTarget(new targets.LambdaFunction(orchestratorFn, {
+      event: events.RuleTargetInput.fromObject({
+        ...slotDefaults, include_youtube: false, include_tiktok: false, post_image: true,
+      }),
+    }));
+
+    // Weekly long-form. Targets the compile state machine DIRECTLY — there is
+    // no queue to pop and no topic to choose, so the orchestrator Lambda would
+    // be a hop that does nothing.
+    //
+    // Thursday 17:00 UTC = 1pm ET. With COMPILE_DELAY_MINUTES=120 and a ~40
+    // minute encode, it publishes around 15:40 ET: inside YouTube's strongest
+    // window on this account (index 61-76 from 13:00-17:00 ET) and deliberately
+    // NOT on top of either daily YouTube Short, which publish near 10am and
+    // 4pm ET. Two uploads to the same channel in the same minute compete with
+    // each other and nothing else.
+    //
+    // video_id is EMPTY on purpose: EventBridge cannot mint a unique one, and
+    // app/compile_video.py falls back to `compile<epoch>` on a blank value. The
+    // field still has to be PRESENT because the state machine reads it with a
+    // JsonPath, which fails the state on a missing field rather than defaulting.
+    const motionCompileWeekly = new events.Rule(this, 'MotionCompileWeekly', {
+      ruleName: 'iris-motion-compile-weekly',
+      description: 'Weekly YouTube long-form compilation (Thu 1pm ET)',
+      enabled: true,
+      schedule: events.Schedule.cron({
+        minute: '0',
+        hour: '17',
+        weekDay: 'THU',
+      }),
+    });
+    motionCompileWeekly.addTarget(new targets.SfnStateMachine(compileMachine, {
+      input: events.RuleTargetInput.fromObject({ video_id: '', dry_run: false }),
     }));
 
     // =====================

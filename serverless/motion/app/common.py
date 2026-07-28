@@ -72,6 +72,13 @@ SERVE_ROOT = APP_DIR.parent
 _CONTENT_TYPES = {
     '.mp4': 'video/mp4',
     '.png': 'image/png',
+    # Carousel slides and the still-image post. NOT optional: these objects are
+    # fetched over plain HTTPS by Metricool and handed to Instagram's media
+    # endpoint, and the default below ('application/octet-stream') is not an
+    # image content type — the fetch is what would fail, several minutes later,
+    # in someone else's service.
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
     '.json': 'application/json',
     '.wav': 'audio/wav',
     '.html': 'text/html',

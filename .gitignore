@@ -46,6 +46,13 @@ iris-local/
 # Local prompt-engineering scratch experiment (renders ~170MB of PNG frames)
 prompt_test/
 
+# Batch job scratch. app/common.py puts every job's workdir under
+# SERVE_ROOT/work/<video_id> — it has to live under the static-server root or
+# the browser cannot fetch the piece — which means running any job locally
+# drops downloaded MP4s, candidate frames and rendered slides straight into the
+# tree. Tens of MB per run, all reproducible, none of it source.
+serverless/motion/work/
+
 # motion-video piece workspaces: source is tracked, artifacts are not.
 # Each of these is 1-3 GB of node_modules, virtualenvs and rendered PNG frames.
 *_test/node_modules/

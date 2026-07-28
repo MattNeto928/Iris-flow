@@ -187,6 +187,17 @@ def handler(event, context):
     include_youtube = event.get('include_youtube', True) if isinstance(event, dict) else True
     include_tiktok = event.get('include_tiktok', True) if isinstance(event, dict) else True
 
+    # COMPANION FORMATS. Same mechanism, opposite default: these come off the
+    # rule and default to FALSE, so a hand-invoke posts the reel only and never
+    # surprises the accounts with three extra posts. Exactly one scheduled rule
+    # sets each of carousel/image and two set story — that IS the per-format
+    # daily cap, expressed where it can be read (see IrisMotionStack) rather
+    # than in a counter that has to be reset at midnight.
+    ev = event if isinstance(event, dict) else {}
+    post_carousel = ev.get('post_carousel', False)
+    post_story = ev.get('post_story', False)
+    post_image = ev.get('post_image', False)
+
     execution_input = {
         'video_id': video_id,
         'topic': topic,                      # '' → prep picks its own
@@ -194,6 +205,13 @@ def handler(event, context):
         'schedule_time': schedule_time,      # ISO-8601 UTC, passed to postprocess
         'include_youtube': include_youtube,  # gates the YouTube network in postprocess
         'include_tiktok': include_tiktok,    # gates the TikTok network in postprocess
+        # Companion formats, resolved the same way and for the same reason as
+        # force_seed below: written explicitly on EVERY execution because the
+        # state machine reads them with States.Format('{}', $.post_carousel),
+        # and a JsonPath to a missing field fails the STATE, not just the field.
+        'post_carousel': post_carousel,
+        'post_story': post_story,
+        'post_image': post_image,
         # Both false on every scheduled run — see the module docstring. They are
         # written explicitly rather than omitted because the state machine reads
         # them with States.Format('{}', $.force_seed), and a JsonPath to a
@@ -225,9 +243,10 @@ def handler(event, context):
 
     logger.info(
         'Started %s video_id=%s schedule_time=%s include_youtube=%s '
-        'include_tiktok=%s target_duration=%s authored_only=true',
+        'include_tiktok=%s carousel=%s story=%s image=%s target_duration=%s '
+        'authored_only=true',
         execution_arn, video_id, schedule_time, include_youtube,
-        include_tiktok, TARGET_DURATION,
+        include_tiktok, post_carousel, post_story, post_image, TARGET_DURATION,
     )
     return {
         'execution_arn': execution_arn,
@@ -236,5 +255,8 @@ def handler(event, context):
         'schedule_time': schedule_time,
         'include_youtube': include_youtube,
         'include_tiktok': include_tiktok,
+        'post_carousel': post_carousel,
+        'post_story': post_story,
+        'post_image': post_image,
         'started': True,
     }

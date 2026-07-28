@@ -28,6 +28,15 @@ ENV NVIDIA_VISIBLE_DEVICES=all \
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl gnupg ffmpeg tini \
       python3 python3-pip \
+      # tzdata provides /usr/share/zoneinfo, which is where Python's zoneinfo
+      # looks BEFORE falling back to the pip package of the same name. Ubuntu's
+      # python3 ships neither, and the Debian-based CPU image ships both, so
+      # without this the two images disagree about whether
+      # `ZoneInfo('America/New_York')` works at all. app/postprocess.py and
+      # app/metricool_client.py both resolve that zone at MODULE SCOPE, so the
+      # failure is an ImportError, not a late runtime error. Caught by the
+      # import check at the bottom of this file.
+      tzdata \
       fonts-liberation fonts-dejavu-core \
       # libglvnd is the GL/EGL *dispatch* layer. The vendor implementation comes
       # from the host driver at runtime; without the dispatcher Chrome cannot
@@ -84,7 +93,8 @@ RUN node --check /app/render.mjs && node --check /app/serve.mjs \
  # and fails on the first Batch job instead. This is the check that catches it.
  && MOTION_BUCKET=build-check AWS_DEFAULT_REGION=us-east-1 AWS_REGION=us-east-1 \
     python3 -c "import sys; sys.path.insert(0,'/app'); \
-      import common, tts, narrate, render_shard, stitch, postprocess, prep, worker; \
+      import common, tts, narrate, render_shard, stitch, postprocess, prep, worker, \
+             postcopy, slides, metricool_client, compile_video; \
       print('all worker modules import')" \
  && ffmpeg -version > /dev/null
 

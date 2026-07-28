@@ -34,6 +34,19 @@ jobs/<video_id>/
   out/gates.txt       check.py output
 ```
 
+Companion assets are NOT kept here. They are written straight into the public
+bucket, because the only consumer is Metricool's fetcher and a private copy
+would have to be copied out again to be of any use:
+
+```
+s3://iris-flow-videos-<account>/motion/
+  <video_id>.mp4              the reel
+  <video_id>/s1.jpg .. s6.jpg carousel slides, 1080x1350
+  <video_id>/image.jpg        the single still
+  <video_id>/story.mp4        15s story teaser
+  compilations/<id>.mp4       the weekly YouTube long-form cut
+```
+
 `plan.json`:
 ```json
 {"video_id":"...","topic":"...","fps":30,"frames":1440,"subsamples":16,
@@ -48,6 +61,28 @@ jobs/<video_id>/
 | `prep` | 2 / 4096 | topic → narration + scene → TTS → beats → inject → **probe-render 3 frames to prove the JS runs** → upload | `VIDEO_ID`, `TOPIC`, `TARGET_DURATION` |
 | `render` | 4 / 8192 | render frames `[FRAME_FROM, FRAME_TO]` → S3 | `VIDEO_ID`, `FRAME_FROM`, `FRAME_TO` |
 | `stitch` | 2 / 8192 | pull frames → `check.py` gates → encode + mux audio → upload | `VIDEO_ID` |
+| `postprocess` | 2 / 4096 | public copy → per-platform copy → carousel/story/still assets → up to 4 Metricool posts | `VIDEO_ID`, `SCHEDULE_TIME`, `INCLUDE_*`, `POST_*`, `DRY_RUN` |
+| `compile` | 4 / 8192 | pick 4-6 published pieces → theme + bridges → TTS → letterbox to 1920x1080 → concat → post to YouTube | `VIDEO_ID`, `DRY_RUN` |
+
+## Formats and where they go
+
+One authored scene produces four assets and up to four posts. The per-format
+daily caps live on the EventBridge rules, not in a counter: exactly one rule/day
+sets `post_carousel`, one sets `post_image`, two set `post_story`.
+
+| format | media | networks | when |
+|---|---|---|---|
+| reel | `video.mp4` | IG, TikTok, YouTube Short, FB | the slot's own time |
+| story | `story.mp4` (15s) | IG | reel + 90 min |
+| carousel | `s1..s6.jpg` | IG, TikTok photo post | next day 11:00 ET |
+| image | `image.jpg` | IG, FB | next day 09:00 ET |
+| longform | `compilations/*.mp4` | YouTube (`type=VIDEO`) | Thu, ~15:40 ET |
+
+Carousel and still frames are chosen from the piece's OWN caption-free windows,
+parsed out of `piece.html` (`.play(frame,a,b,c,d)` and `band(a,b,c,d)` both mean
+"visible from a to d"). A slide draws its own headline, so a frame that still
+has the piece's caption or data card on it is rejected. If fewer than 3 clean
+frames exist the carousel is skipped rather than shipped unreadable.
 
 `prep` is self-validating: if the authored scene throws a JS error, it retries the
 model with the error text, max 2 retries, then falls back to the bundled seed piece.
