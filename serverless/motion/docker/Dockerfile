@@ -148,7 +148,7 @@ RUN node --check /app/render.mjs \
  && MOTION_BUCKET=build-check AWS_DEFAULT_REGION=us-east-1 AWS_REGION=us-east-1 \
     python3 -c "import sys; sys.path.insert(0,'/app'); \
       import common, tts, narrate, render_shard, stitch, postprocess, prep, worker, \
-             postcopy, slides, metricool_client, compile_video; \
+             postcopy, slides, metricool_client, compile_video, winners; \
       print('all worker modules import')" \
  && ffmpeg -version > /dev/null \
  && ffprobe -version > /dev/null

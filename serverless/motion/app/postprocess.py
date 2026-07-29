@@ -319,8 +319,29 @@ async def run():
         audio = await mc.find_instagram_audio(bundle['audio_query'],
                                               min_ms=int(duration * 1000))
 
+    # GATES NOW DECIDE WHETHER THIS PUBLISHES.
+    #
+    # This job used to post unconditionally, on the reasoning that "a gate
+    # result is information" and stitch encodes a gate-failing render anyway.
+    # That reasoning did not survive contact: on 2026-07-29 both pieces that
+    # reached this point had FAILED their gates and both went to live accounts —
+    # one a black screen with captions at mean luma 7.9, the other swinging from
+    # luma 12 to 64 with 25% blown pixels. One had to be deleted by hand.
+    #
+    # A skipped slot costs one post out of a 98-topic queue. A bad post costs
+    # the account. The email is the deliverable when this trips: notify sends
+    # the failure mail with the gate output in it, so the run is not silent.
+    require_gates = _flag('REQUIRE_GATES', 'true')
+    gate_block = require_gates and gates_passed is False
+    if gate_block:
+        logger.error(
+            '[%s] GATES FAILED and REQUIRE_GATES is on — publishing nothing. '
+            'Gate output:\n%s', vid, (gates_text or '(no gates.txt)')[:2000])
+
     posts = {}
-    if dry_run:
+    if gate_block:
+        status = 'blocked_gates_failed'
+    elif dry_run:
         status = 'dry_run'
         logger.info(
             f'[{vid}] DRY_RUN -- would schedule:\n'
@@ -429,6 +450,10 @@ async def run():
         'post_image': post_image,
         'dry_run': dry_run,
         'gates_passed': gates_passed,
+        'require_gates': require_gates,
+        # Carried so the failure email can say WHY nothing published, instead of
+        # sending the operator to CloudWatch to find out.
+        'gates_text': (gates_text or '')[:4000],
         'status': status,
         'metricool': posts,
         'recorded_at': datetime.now(timezone.utc).isoformat(),
@@ -446,6 +471,15 @@ async def run():
     # notices; this turns it into the FAILED notify email. It cannot cause a
     # double post: the job definition's terminal catch-all evaluateOnExit rule
     # ends the job on attempt 1 for anything that is not a known transient.
+    # Raised AFTER the plan is saved so the assets, the copy and the gate output
+    # are all on record first. Both of these route the execution to the failure
+    # path, which is what actually sends the email.
+    if gate_block:
+        raise RuntimeError(
+            f'gates FAILED and REQUIRE_GATES is on — nothing was published for '
+            f'{vid}. The video and all its assets are in S3 and can be posted by '
+            f'hand from {public_url} if the gate call was wrong.\n\n'
+            f'{(gates_text or "(no gates.txt)")[:1500]}')
     if status == 'failed':
         raise RuntimeError(f'Metricool scheduling failed: '
                            f'{posts["reel"].get("error")}')

@@ -64,12 +64,18 @@ SUBSAMPLES = 24
 # would save 2.2 min of render and cost a whole extra ~4 min instance boot plus
 # its idle tail -- instance-minutes, not frames, are what Batch bills on EC2.
 SHARDS = 1
-# How many render -> look -> fix cycles the preflight repair may run. The skill
-# this pipeline automates records "one run took eight preflight cycles" with a
-# human in the loop; 3 is the compromise between that and a ~90 s + $0.30 cost
-# per cycle. A cycle that changes nothing exits the loop early, so the typical
-# good piece still pays for one.
-REPAIR_CYCLES = int(os.environ.get("REPAIR_CYCLES", "3"))
+# How many render -> look -> fix cycles the preflight repair may run.
+#
+# 6, up from 3, and the number comes from the skill this pipeline automates:
+# "one run took eight preflight cycles" with a human in the loop, on the piece
+# everyone agreed was the best. Three was a cost compromise made before the loop
+# had ever been shown to work; it now demonstrably does, and iteration is the
+# only mechanism here that judges the PICTURE rather than the numbers.
+#
+# ~90 s and ~$0.27 a cycle, and the loop exits as soon as the model reports
+# nothing left to fix — so a piece that comes out right first time still pays
+# for one, and only the pieces that need the work pay for six.
+REPAIR_CYCLES = int(os.environ.get("REPAIR_CYCLES", "6"))
 # 4, up from 3. Every attempt is now Opus 5 fed the previous error, and the two
 # largest causes of a wasted attempt (a JSON header and an over-strict anchor
 # match) are gone — so an attempt is now much more likely to be a real second
@@ -80,12 +86,18 @@ MAX_AUTHOR_ATTEMPTS = 4
 # before each attempt and before each repair cycle, so it bounds the run rather
 # than merely reporting on it.
 #
-# 2.20, up from 1.50. MEASURED at ~$0.37 per Opus 5 authoring attempt and ~$0.30
-# per repair cycle, so this funds 4 attempts (~$1.48) plus 2 repair cycles
-# (~$0.60) with change. Against ~$0.27 of GPU render and ~$0.05 of post copy,
-# worst case lands near $2.5 a video, inside the $3 budget this pipeline was
-# built to; the typical run authors first time and spends about $1.
-AUTHOR_COST_CEILING_USD = float(os.environ.get("AUTHOR_COST_CEILING_USD", "2.20"))
+# 3.60, funding 4 authoring attempts (~$1.48 at a MEASURED ~$0.37 each) plus 6
+# repair cycles (~$1.62 at ~$0.27 each) with headroom.
+#
+# This deliberately breaks the old "$3 a video" rule, and the trade is explicit:
+# cadence dropped from 5 videos a day to 3 at the same time, so the DAILY spend
+# is roughly flat while each piece can afford to be iterated on six times. Our
+# own analytics are what justify it — the top 3 reels carry 46% of all views, so
+# a better piece is worth far more than an extra piece.
+#
+# Typical run: authors first time, needs two or three repair cycles, spends
+# about $1.30. Only a piece that keeps failing spends the ceiling.
+AUTHOR_COST_CEILING_USD = float(os.environ.get("AUTHOR_COST_CEILING_USD", "3.60"))
 
 # Whether a total authoring failure may fall back to the bundled seed piece.
 #
@@ -387,6 +399,28 @@ def _extract_json(text):
         return json.loads(text[i:j + 1])
 
 
+def _retention_digest():
+    """
+    What held viewers last month, or '' — cached per process.
+
+    Deliberately OUTSIDE the cached system block: it changes as posts land, and
+    putting it in the cached prefix would either bust the cache on every run or
+    serve a stale digest for the life of the cache entry.
+    """
+    global _DIGEST
+    if _DIGEST is None:
+        try:
+            import winners
+            _DIGEST = winners.digest()
+        except Exception as e:                              # noqa: BLE001
+            log.warning("retention digest unavailable (%s) — authoring blind", e)
+            _DIGEST = ""
+    return _DIGEST
+
+
+_DIGEST = None
+
+
 def _user_prompt(topic, seconds, previous_error=None):
     anchor_help = "\n".join(f"  {n}: {a!r}" for n, a in ANCHORS)
     p = (f"Topic: {topic}\n"
@@ -395,6 +429,9 @@ def _user_prompt(topic, seconds, previous_error=None):
          f"{anchor_help}\n\n"
          "Make it beautiful and make every number on screen defensible. One clear "
          "idea per beat. Prefer one dense well-composed scene over many thin ones.")
+    digest = _retention_digest()
+    if digest:
+        p += "\n" + digest
     if previous_error:
         # The single highest-value thing to feed a repair attempt is the actual
         # runtime error, not a description of it.
@@ -798,6 +835,27 @@ def _preflight(piece_path, wd, plan_frames, fps, tag):
         cmd += ["--beats", beats_arg]
     g = subprocess.run(cmd, capture_output=True, text=True)
     gates = (g.stdout + g.stderr).strip()
+
+    # CAMERA CLEARANCE, which render.mjs has always computed on a strided run
+    # and which this function used to throw away — it read the frame count out
+    # of the render and ignored everything else it said.
+    #
+    # That report is the CAUSE behind the symptom check.py keeps flagging.
+    # MEASURED on a real piece: check.py said "blacks lifted: p1 luma 94.8 at
+    # f1140", and the frame turned out to be a flat beige wash between two dark
+    # frames — the camera was INSIDE the geometry for exactly one frame while
+    # crossing between two staging areas. The numeric gate can only see a bright
+    # frame; the clearance report names the object being flown through, which is
+    # what the model needs to move the camera key or make it a cut.
+    clearance = [ln for ln in (r.stdout or "").splitlines()
+                 if "camera clearance" in ln or "units from" in ln
+                 or "more" == ln.strip()[-4:]]
+    if clearance and "clear" not in clearance[0]:
+        gates += ("\n\nCAMERA PATH:\n" + "\n".join(clearance)
+                  + "\nA frame where the camera is inside geometry renders as a "
+                    "flat full-screen wash. Move that camera key clear of the "
+                    "object, or make it a cut (cut:1) so the camera never "
+                    "interpolates through the gap.")
     log.info("preflight gates (cycle%s):\n%s", tag, gates)
 
     try:

@@ -281,6 +281,18 @@ def _post_lines(plan):
         return None
     out = [f"  status         {post.get('status', 'unknown')}"
            + ('   [DRY RUN — nothing booked]' if post.get('dry_run') else '')]
+
+    # The gate block is the one status that needs explaining in the mail itself.
+    # Anything else and the operator can go and look; this one they need to be
+    # able to judge from the phone, because the alternative to publishing it is
+    # a slot that stays empty.
+    if post.get('status') == 'blocked_gates_failed':
+        out.append("  NOTHING WAS PUBLISHED — the render failed its quality gates.")
+        out.append(f"  The video is still at {post.get('public_url', '?')}")
+        out.append("  and can be posted by hand if the gates were wrong.")
+        for line in (post.get('gates_text') or '').splitlines():
+            if line.startswith('FAIL:') or 'gates FAILED' in line:
+                out.append(f"    {line}")
     if post.get('public_url'):
         out.append(f"  public url     {post['public_url']}")
     nets = [n for n, on in (('youtube', post.get('include_youtube')),

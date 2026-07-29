@@ -344,7 +344,24 @@ export class IrisMotionStack extends cdk.Stack {
 
     // One container, three shapes — dispatched by JOB_TYPE, same convention as
     // serverless/src/worker.py.
-    const prepJobDef = createJobDef('PrepJobDef', 'prep', 2, 4096, 20);
+    // 75 minutes, up from 20. prep is no longer one model call: it is up to 4
+    // authoring attempts (MEASURED 2-7 min each) followed by up to 6 preflight
+    // repair cycles (a strided render plus a vision call plus a probe, ~4 min
+    // each). Worst case is around 50 minutes and 20 would have killed a run
+    // that was still working. The loop exits as soon as the model says there is
+    // nothing left to fix, so a clean piece still finishes in about 10.
+    // The Metricool credentials are here for app/winners.py, which reads this
+    // channel's OWN reel retention and feeds the best and worst recent pieces
+    // into the authoring prompt. prep is not a publishing job and these are
+    // read-only uses of the key, but it is worth noticing that this is the
+    // second job that now carries them.
+    const prepJobDef = createJobDef(
+      'PrepJobDef', 'prep', 2, 4096, 75, {},
+      {
+        METRICOOL_API_KEY: batch.Secret.fromSecretsManager(apiSecrets, 'METRICOOL_API_KEY'),
+        METRICOOL_USER_ID: batch.Secret.fromSecretsManager(apiSecrets, 'METRICOOL_USER_ID'),
+        METRICOOL_BLOG_ID: batch.Secret.fromSecretsManager(apiSecrets, 'METRICOOL_BLOG_ID'),
+      });
     // 4 vCPU: SwiftShader rasterises on the CPU, so shard wall-clock scales
     // almost linearly with cores. 8 GiB holds the 1080x1920 canvas at ss=16.
     const renderJobDef = createJobDef('RenderJobDef', 'render', 4, 8192, 30);
@@ -397,6 +414,15 @@ export class IrisMotionStack extends cdk.Stack {
         METRICOOL_INSTAGRAM_AUDIO: 'true',
         METRICOOL_AUDIO_VOLUME: '12',
         METRICOOL_VIDEO_VOLUME: '100',
+        // QUALITY GATE ON PUBLISHING. 'true' means a render that fails
+        // check.py publishes NOTHING and sends the failure email instead.
+        //
+        // This job posted unconditionally until 2026-07-29, when both pieces
+        // that reached it had failed their gates and both went to live
+        // accounts — one a black screen at mean luma 7.9. A skipped slot costs
+        // one post out of a 98-topic queue; a bad post costs the account.
+        // Set to 'false' to go back to publishing regardless.
+        REQUIRE_GATES: 'true',
       },
       {
         METRICOOL_API_KEY: batch.Secret.fromSecretsManager(apiSecrets, 'METRICOOL_API_KEY'),
@@ -792,7 +818,9 @@ export class IrisMotionStack extends cdk.Stack {
     const stateMachine = new sfn.StateMachine(this, 'MotionStateMachine', {
       stateMachineName: 'iris-motion-pipeline',
       definitionBody: sfn.DefinitionBody.fromChainable(definition),
-      timeout: cdk.Duration.hours(2),
+      // 3 hours, up from 2: prep alone may now run 75 minutes when the repair
+      // loop uses its full budget, and render + stitch + postprocess add ~20.
+      timeout: cdk.Duration.hours(3),
       logs: {
         destination: new logs.LogGroup(this, 'MotionSfnLogGroup', {
           logGroupName: '/iris-motion/state-machine',
@@ -903,11 +931,12 @@ export class IrisMotionStack extends cdk.Stack {
     }));
 
     // 1× daily WITH TikTok, no YouTube. 15:00 UTC = 12pm ET.
-    // Carries the day's carousel: midday is IG's second-best hour (94) and a
-    // carousel wants the slot with the most dwell, not the most scroll.
+    // Carries BOTH the day's carousel and the day's still: midday is IG's
+    // second-best hour (94), and the two companions publish the following
+    // morning at 11:00 and 09:00 ET, so they never land together anyway.
     const motionScheduleTikTok = new events.Rule(this, 'MotionDailyScheduleTikTok', {
       ruleName: 'iris-motion-daily-tiktok',
-      description: 'Motion orchestrator 1× daily WITH TikTok, no YouTube (12pm ET) + carousel',
+      description: 'Motion orchestrator 1× daily WITH TikTok, no YouTube (12pm ET) + carousel + still',
       enabled: true,
       schedule: events.Schedule.cron({
         minute: '0',
@@ -916,43 +945,27 @@ export class IrisMotionStack extends cdk.Stack {
     });
     motionScheduleTikTok.addTarget(new targets.LambdaFunction(orchestratorFn, {
       event: events.RuleTargetInput.fromObject({
-        ...slotDefaults, include_youtube: false, include_tiktok: true, post_carousel: true,
+        ...slotDefaults, include_youtube: false, include_tiktok: true,
+        post_carousel: true, post_image: true,
       }),
     }));
 
-    // 1× daily IG/Facebook only. 11:00 UTC = 8am ET.
-    const motionScheduleIgFb = new events.Rule(this, 'MotionDailyScheduleNoYouTube', {
-      ruleName: 'iris-motion-daily-no-youtube',
-      description: 'Motion orchestrator 1× daily IG/Facebook only (8am ET)',
-      enabled: true,
-      schedule: events.Schedule.cron({
-        minute: '0',
-        hour: '11', // 1× daily, UTC
-      }),
-    });
-    motionScheduleIgFb.addTarget(new targets.LambdaFunction(orchestratorFn, {
-      event: events.RuleTargetInput.fromObject({
-        ...slotDefaults, include_youtube: false, include_tiktok: false,
-      }),
-    }));
+    // THE 08:00 ET AND 14:00 ET SLOTS ARE GONE. Cadence dropped from 5 videos a
+    // day to 3 on 2026-07-29, deliberately.
+    //
+    // Our own analytics are the argument: across 273 reels the top THREE carry
+    // 45.6% of all views, and publish-hour explains essentially none of it
+    // (Spearman -0.008, permutation p = 0.94). Volume is not the lever; the
+    // piece is. The three surviving hours are the best three of the five, and
+    // the budget freed by two fewer renders funds six preflight repair cycles
+    // per piece instead of three — the only mechanism here that judges the
+    // picture rather than the numbers.
+    //
+    // Daily spend is roughly flat: 5 x ~$1.20 becomes 3 x ~$2.00.
+    //
+    // The still image moved onto the 15:00 UTC slot alongside the carousel, so
+    // all three companion formats still go out daily.
 
-    // 1× daily IG/Facebook only. 17:00 UTC = 2pm ET. Carries the day's single
-    // still image, which posts +21h later into 11am ET — IG's weekly peak (98)
-    // and a gap between reel slots, so the two never land together.
-    const motionScheduleImage = new events.Rule(this, 'MotionDailyScheduleImage', {
-      ruleName: 'iris-motion-daily-image',
-      description: 'Motion orchestrator 1× daily IG/Facebook only (2pm ET) + still image',
-      enabled: true,
-      schedule: events.Schedule.cron({
-        minute: '0',
-        hour: '17', // 1× daily, UTC
-      }),
-    });
-    motionScheduleImage.addTarget(new targets.LambdaFunction(orchestratorFn, {
-      event: events.RuleTargetInput.fromObject({
-        ...slotDefaults, include_youtube: false, include_tiktok: false, post_image: true,
-      }),
-    }));
 
     // Weekly long-form. Targets the compile state machine DIRECTLY — there is
     // no queue to pop and no topic to choose, so the orchestrator Lambda would
