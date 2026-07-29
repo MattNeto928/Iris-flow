@@ -253,8 +253,35 @@ Hard rules, each learned from a real failure:
   On a radius-900 shell that means size ~0.6, NOT 4. If a point field is meant
   to read as dust or stars it must be small enough to be texture, not objects.
 - Use the existing helpers rather than rebuilding them: makePointField, makePanel,
-  makeCard, makeAxis, makeGlow, makeScrim, makeCaption, makeAnchoredLabel.
+  makeCard, makeAxis, makeGlow, makeScrim, makeCaption, makeAnchoredLabel,
+  setEnvironment, makeSkyDome, makeDepthField.
   Every make* returns a controller with .set() and .mesh — never reach past it.
+
+THE THREE ENVIRONMENT HELPERS. These exist because a subject alone on black is
+what a cheap render looks like, and all three are one line each.
+
+- setEnvironment({sky, ground, key, rim, intensity}) — IMAGE-BASED LIGHTING.
+  Already called once above the AUTHOR marker, so you always have it; CALL IT
+  AGAIN with colours that suit your subject. Without an environment map a
+  MeshStandardMaterial has nothing to reflect, so metalness renders near-black
+  and roughness barely reads — glass, ice, water, wet surfaces and metal are all
+  impossible. If your subject is any of those, tuning this matters more than
+  anything else you will do to the material.
+- makeSkyDome({top, bottom, glow, glowY}) — the far backdrop, in bgScene.
+  A flat black background is the most common reason a piece reads as cheap.
+  Even a very dark ramp with one warm band near the horizon gives the eye
+  somewhere to sit. Re-call it with colours that place the scene: cold blue-black
+  for space, brown-black for underground, deep teal for underwater.
+- makeDepthField(geometry, material, {count, near, far, spread}) — N instances
+  of a geometry scattered across a DEPTH RANGE in the main scene, so they get
+  parallax as the camera moves and real depth-of-field bokeh. This is the single
+  strongest "expensive-looking" trick available: reuse a geometry you already
+  built for the subject, scatter 40-100 of them from z -30 to -260, and the shot
+  goes from a specimen on a table to a place with weather in it.
+
+  Note the split: makePointField/STARS go in bgScene BECAUSE points at infinity
+  shred into aperture copies. makeDepthField goes in the MAIN scene precisely
+  BECAUSE you want it to blur.
 - A camera key may set cut:1 (10th element) to SNAP instead of interpolating.
   Use it between staging areas rather than flying the camera across the gap.
 - The safe box is x 60-900, y 200-1560 of 1080x1920. It is NOT centred; compose

@@ -159,6 +159,18 @@ const capScene = new THREE.Scene();
 const capCam = new THREE.OrthographicCamera(-W / 2, W / 2, H / 2, -H / 2, -500, 500);
 const FONT = '"Helvetica Neue", Helvetica, Arial, sans-serif';
 
+// DEFAULT ENVIRONMENT. Deliberately OUTSIDE the AUTHOR block, above the marker,
+// so that replacing the whole SCENE section cannot silently delete it -- which
+// is exactly what would happen if it lived below, and the result would be a
+// piece that renders flat and nobody would know why.
+//
+// Both are meant to be RE-CALLED from the SCENE section with colours that suit
+// the subject; calling setEnvironment again just replaces scene.environment.
+// makeSkyDome is a function declaration and hoists, so calling it here, above
+// its definition, is fine.
+setEnvironment();
+const SKY = makeSkyDome();
+
 // ============================================================== >>> AUTHOR: SCENE
 const key = new THREE.DirectionalLight(C(0xffd3a0), 2.9); key.position.set(38, 46, 26);
 const rim = new THREE.DirectionalLight(C(0x7fd4ff), 2.0); rim.position.set(-34, 18, -40);
@@ -245,6 +257,155 @@ function glowTexture(power = 2.4) {
   tex.colorSpace = THREE.SRGBColorSpace; tex.generateMipmaps = false;
   tex.minFilter = tex.magFilter = THREE.LinearFilter;
   return tex;
+}
+
+/* ---------------------------------------------------------------------------
+ * setEnvironment(opts) -- IMAGE-BASED LIGHTING. Call this in every piece.
+ *
+ * Until this existed, `scene.environment` was never set and every material in
+ * every piece was lit by exactly three analytic lights. That is why the renders
+ * looked plasticky: with no environment map a MeshStandardMaterial has nothing
+ * to reflect, so `metalness` renders as near-black and `roughness` barely
+ * reads. Chrome, glass, water and wet surfaces are all impossible without it.
+ *
+ * There is no HDRI file to load -- the renderer runs offline -- so the
+ * environment is BUILT: a gradient sky plus a few emissive quads standing in
+ * for a key and a rim, run through PMREMGenerator.fromScene(). Costs one
+ * prefilter at load, nothing per frame, and is fully deterministic.
+ *
+ * Tune `intensity` rather than deleting this: it multiplies into every
+ * material's reflection, so it is also the cheapest global exposure control.
+ * -------------------------------------------------------------------------*/
+function setEnvironment(opts = {}) {
+  const {
+    sky = 0x2a3a5c, ground = 0x0a0810, key = 0xffd9b0, rim = 0x7fd4ff,
+    intensity = 0.55, keyPos = [30, 40, 20], rimPos = [-34, 12, -30],
+  } = opts;
+
+  const env = new THREE.Scene();
+  // A big inverted box with a vertical gradient: the cheap stand-in for a sky.
+  {
+    const cv = document.createElement('canvas');
+    cv.width = 4; cv.height = 128;
+    const g = cv.getContext('2d');
+    const grd = g.createLinearGradient(0, 0, 0, 128);
+    grd.addColorStop(0, '#' + C(sky).getHexString());
+    grd.addColorStop(1, '#' + C(ground).getHexString());
+    g.fillStyle = grd; g.fillRect(0, 0, 4, 128);
+    const tex = new THREE.CanvasTexture(cv);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    env.add(new THREE.Mesh(
+      new THREE.BoxGeometry(200, 200, 200),
+      new THREE.MeshBasicMaterial({ map: tex, side: THREE.BackSide })));
+  }
+  // Emissive quads where the real lights are, so highlights land in the same
+  // place as the shading rather than fighting it.
+  const lamp = (hex, pos, size, power) => {
+    const m = new THREE.Mesh(
+      new THREE.PlaneGeometry(size, size),
+      new THREE.MeshBasicMaterial({ color: C(hex).multiplyScalar(power) }));
+    m.position.set(pos[0], pos[1], pos[2]);
+    m.lookAt(0, 0, 0);
+    env.add(m);
+  };
+  lamp(key, keyPos, 60, 3.0);
+  lamp(rim, rimPos, 45, 1.6);
+
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  pmrem.compileEquirectangularShader();
+  const rt = pmrem.fromScene(env, 0.04);
+  scene.environment = rt.texture;
+  scene.environmentIntensity = intensity;
+  pmrem.dispose();
+  return { texture: rt.texture,
+           set(v) { scene.environmentIntensity = v; } };
+}
+
+/* ---------------------------------------------------------------------------
+ * makeSkyDome(opts) -> { mesh, set(opacity) }   goes in bgScene
+ *
+ * A gradient dome with an optional horizon glow, for the FAR backdrop. Put it
+ * in bgScene, not scene: bgScene is drawn without the aperture offset, so a
+ * dome there stays smooth instead of being shredded into N aperture copies.
+ *
+ * A flat black background is the single most common reason a piece reads as
+ * cheap. Even a very dark blue-to-black ramp with one warm patch near the
+ * horizon gives the eye somewhere to sit.
+ * -------------------------------------------------------------------------*/
+function makeSkyDome(opts = {}) {
+  const {
+    top = 0x05070f, bottom = 0x1a1626, glow = 0x000000,
+    glowY = 0.42, glowWidth = 0.18, radius = 3000, opacity = 1,
+  } = opts;
+
+  const cv = document.createElement('canvas');
+  cv.width = 8; cv.height = 256;
+  const g = cv.getContext('2d');
+  const grd = g.createLinearGradient(0, 0, 0, 256);
+  grd.addColorStop(0, '#' + C(top).getHexString());
+  grd.addColorStop(1, '#' + C(bottom).getHexString());
+  g.fillStyle = grd; g.fillRect(0, 0, 8, 256);
+  if (glow) {
+    const y = (1 - glowY) * 256;
+    const gg = g.createLinearGradient(0, y - glowWidth * 256, 0, y + glowWidth * 256);
+    gg.addColorStop(0, 'rgba(0,0,0,0)');
+    gg.addColorStop(0.5, '#' + C(glow).getHexString());
+    gg.addColorStop(1, 'rgba(0,0,0,0)');
+    g.globalCompositeOperation = 'lighter';
+    g.fillStyle = gg; g.fillRect(0, 0, 8, 256);
+  }
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+
+  const mat = new THREE.MeshBasicMaterial({
+    map: tex, side: THREE.BackSide, transparent: true, opacity,
+    depthWrite: false, fog: false });
+  const mesh = new THREE.Mesh(new THREE.SphereGeometry(radius, 32, 24), mat);
+  bgScene.add(mesh);
+  return { mesh, material: mat, set(v) { mat.opacity = v; } };
+}
+
+/* ---------------------------------------------------------------------------
+ * makeDepthField(geometry, material, opts) -> { mesh, set(opacity) }
+ *
+ * Scatter N instances of one geometry across a DEPTH RANGE in the MAIN scene,
+ * so they get parallax as the camera moves AND real depth-of-field bokeh.
+ *
+ * This is the difference between a specimen on black and a place. The best
+ * piece this pipeline has made had its subject in front of a receding field of
+ * the same flower melting into bokeh; the worst had the subject alone in a
+ * void. One InstancedMesh of a geometry you already built costs almost nothing.
+ *
+ * NOTE the deliberate contrast with makePointField/STARS: those belong in
+ * bgScene because points at infinity shred under an aperture. THIS belongs in
+ * the main scene, precisely BECAUSE you want it to blur.
+ * -------------------------------------------------------------------------*/
+function makeDepthField(geometry, material, opts = {}) {
+  const {
+    count = 60, near = 30, far = 260, spread = 110, yMin = -40, yMax = 40,
+    scaleMin = 0.5, scaleMax = 1.4, rng = rnd, opacity = 1, parent = scene,
+  } = opts;
+
+  const mesh = new THREE.InstancedMesh(geometry, material, count);
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion();
+  const e = new THREE.Euler(), v = new THREE.Vector3(), s = new THREE.Vector3();
+  for (let i = 0; i < count; i++) {
+    // Depth is sampled with a square root so instances thin out with distance
+    // instead of piling up on the far plane.
+    const z = -(near + (far - near) * Math.sqrt(rng()));
+    v.set((rng() - 0.5) * spread, yMin + (yMax - yMin) * rng(), z);
+    e.set(rng() * 6.283, rng() * 6.283, rng() * 6.283);
+    q.setFromEuler(e);
+    const sc = scaleMin + (scaleMax - scaleMin) * rng();
+    s.set(sc, sc, sc);
+    m.compose(v, q, s);
+    mesh.setMatrixAt(i, m);
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+  if (material.transparent) material.opacity = opacity;
+  parent.add(mesh);
+  return { mesh, material,
+           set(v2) { material.opacity = v2; material.transparent = v2 < 1; } };
 }
 
 /* ===========================================================================
