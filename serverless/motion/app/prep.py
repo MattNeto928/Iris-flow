@@ -3,19 +3,32 @@ JOB_TYPE=prep — topic in, a validated renderable scene + narration track out.
 
 The expensive thing in this pipeline is not compute, it is the model call. A
 sharded 1440-frame render costs about $0.15; one Opus 5 authoring call costs
-about $0.85. So this job makes **one** call, with the bulky, unchanging part of
-the prompt marked for caching (cache reads bill at 0.1x), and it validates the
-result by actually rendering three frames before 30 minutes of shard time is
-committed to it.
+about $0.37. The bulky, unchanging part of the prompt is marked for caching
+(cache reads bill at 0.1x), and every candidate is validated by actually
+rendering three frames before 30 minutes of shard time is committed to it.
 
 Authoring is expressed as a list of {find, replace} edits against the template,
 not as a whole file. Emitting the full 45 KB piece.html would be ~12k output
 tokens of harness the model would be copying verbatim, and every copy is a
-chance to corrupt it. Edits are cheap, and `assert find in s` fails loudly.
+chance to corrupt it. Edits are cheap, and a missing anchor fails loudly.
 
-Model order: Claude (primary) -> Gemini (fallback) -> bundled seed piece. The
-seed guarantees the pipeline always produces a video; the run records which
-path it took in plan.json['authored_by'] so a silent downgrade is visible.
+EVERY MODEL CALL HERE IS OPUS 5 — authoring, retries and the vision repair.
+Gemini used to take the last authoring attempt as a provider hedge; on the two
+scheduled runs where it was ever reached it failed both times with its own JSON
+errors and both slots published nothing, so it is gone (it survives as the TTS
+fallback in tts.py, which is a genuinely independent failure domain).
+
+TWO LOOPS, and both matter more than the prompt does:
+  1. AUTHORING, up to MAX_AUTHOR_ATTEMPTS, each retry fed the previous error —
+     a parse failure, a rejected anchor, or the renderer's own stack trace.
+  2. PREFLIGHT REPAIR, up to REPAIR_CYCLES, each cycle re-rendering a strided
+     preflight, re-gating it and re-looking at a contact sheet. This is the
+     loop a human runs with the motion-video skill, and it was single-shot
+     until two published pieces came out of it completely unrepaired.
+
+The bundled seed piece guarantees a MANUAL run always produces a video; the run
+records which path it took in plan.json['authored_by'] so a silent downgrade is
+visible. Scheduled runs disable it and skip the slot instead.
 """
 
 import json
@@ -51,10 +64,28 @@ SUBSAMPLES = 24
 # would save 2.2 min of render and cost a whole extra ~4 min instance boot plus
 # its idle tail -- instance-minutes, not frames, are what Batch bills on EC2.
 SHARDS = 1
-MAX_AUTHOR_ATTEMPTS = 3
-# Hard ceiling. If authoring somehow spends more than this, stop and take the
-# seed -- a video that costs more than the budget is worse than the fallback.
-AUTHOR_COST_CEILING_USD = float(os.environ.get("AUTHOR_COST_CEILING_USD", "1.50"))
+# How many render -> look -> fix cycles the preflight repair may run. The skill
+# this pipeline automates records "one run took eight preflight cycles" with a
+# human in the loop; 3 is the compromise between that and a ~90 s + $0.30 cost
+# per cycle. A cycle that changes nothing exits the loop early, so the typical
+# good piece still pays for one.
+REPAIR_CYCLES = int(os.environ.get("REPAIR_CYCLES", "3"))
+# 4, up from 3. Every attempt is now Opus 5 fed the previous error, and the two
+# largest causes of a wasted attempt (a JSON header and an over-strict anchor
+# match) are gone — so an attempt is now much more likely to be a real second
+# opinion than a repeat of the same parse failure. A skipped slot publishes
+# nothing at all, which is far more expensive than one more authoring call.
+MAX_AUTHOR_ATTEMPTS = 4
+# Hard ceiling on the whole authoring + repair budget for one piece. Checked
+# before each attempt and before each repair cycle, so it bounds the run rather
+# than merely reporting on it.
+#
+# 2.20, up from 1.50. MEASURED at ~$0.37 per Opus 5 authoring attempt and ~$0.30
+# per repair cycle, so this funds 4 attempts (~$1.48) plus 2 repair cycles
+# (~$0.60) with change. Against ~$0.27 of GPU render and ~$0.05 of post copy,
+# worst case lands near $2.5 a video, inside the $3 budget this pipeline was
+# built to; the typical run authors first time and spends about $1.
+AUTHOR_COST_CEILING_USD = float(os.environ.get("AUTHOR_COST_CEILING_USD", "2.20"))
 
 # Whether a total authoring failure may fall back to the bundled seed piece.
 #
@@ -75,7 +106,6 @@ SEED_FALLBACK = os.environ.get("SEED_FALLBACK", "").strip().lower() \
     not in ("0", "false", "no", "off")
 
 CLAUDE_MODEL = "claude-opus-5"
-GEMINI_MODEL = "gemini-3.1-pro-preview"
 # Opus 5 list price. Cache reads are 0.1x input, cache writes 1.25x.
 PRICE = {"in": 5.0 / 1e6, "out": 25.0 / 1e6, "cache_read": 0.5 / 1e6,
          "cache_write": 6.25 / 1e6}
@@ -128,6 +158,32 @@ BufferGeometry you generate — the way the template's hero is assembled. A scen
 whose only geometry is a backdrop plane is a failed scene, however pretty the
 gradient is.
 
+BUILD SEVERAL DISTINCT OBJECTS, NOT ONE. A scene is a place, not a specimen on a
+white background, and this is the difference between the pieces that work and
+the ones that do not. The best piece this pipeline has produced had, on screen
+at once: a bee assembled from body segments, legs and translucent wings; a
+flower with separate petals, stamens and a stem; a field of other flowers
+receding into bokeh behind it; and drifting pollen. The worst had a thin line
+and a caption.
+
+Every scene needs at least THREE distinguishable elements:
+  1. THE SUBJECT — the thing the narration is about, built properly, in
+     several parts so it reads as an object rather than a shape.
+  2. WHAT IT ACTS ON OR AGAINST — the raindrop the ray enters, the water the
+     bubble collapses into, the flower the bee lands on. A mechanism has two
+     sides; build both.
+  3. CONTEXT THAT GIVES SCALE AND DEPTH — a receding field of the same object,
+     a ground plane, a horizon, suspended particles, a cutaway of the
+     surrounding medium. Something at a different distance from the camera, so
+     depth of field has two planes to separate and the subject has a size.
+Reuse geometry with InstancedMesh for the third one; a hundred instances of one
+flower is cheap and turns a specimen into a place.
+
+DO NOT let the subject be a single featureless sphere. A piece about a
+cavitation bubble that renders one blue ball filling the frame for twenty
+seconds has built nothing: give the bubble a surface that deforms, put the claw
+that made it in shot, show the water around it, cut away to the collapse.
+
 EVERY BEAT NEEDS SOMETHING ON SCREEN, ALL THE WAY TO THE LAST FRAME.
 - The final beat is the most commonly dead one: the narration ends, the captions
   have exited, and the last 10-15 seconds are an empty backdrop. Measured on a
@@ -139,13 +195,47 @@ EVERY BEAT NEEDS SOMETHING ON SCREEN, ALL THE WAY TO THE LAST FRAME.
 - A caption alone is not content. If the only thing changing on screen is text,
   the beat is a slide, not a shot.
 
-CONTRAST. Aim for a dark scene with bright subjects. The gates measure the 1st
-percentile of luma and expect low single digits; a full-frame pastel wash reads
-as flat and washed out, and bloom has nothing to bite on. If the subject is
-genuinely bright (a sky, a flame), keep something dark in frame for it to read
-against.
+CONTRAST — AND THE FLOOR MATTERS AS MUCH AS THE CEILING. Aim for a dark scene
+with BRIGHT SUBJECTS. Both halves are gated:
+- Ceiling: the 1st percentile of luma must stay in low single digits. A
+  full-frame pastel wash reads as flat, and bloom has nothing to bite on. If the
+  subject is genuinely bright (a sky, a flame), keep something dark in frame for
+  it to read against.
+- FLOOR: whole-piece mean luma must exceed 18/255, and no single beat may sit
+  below 10. "Dark scene" means dark BACKGROUND with a lit subject in front of
+  it, never a dark screen. MEASURED failure: a piece about crepuscular rays
+  rendered at mean luma 7.9 with beats as low as 4.0 — a black rectangle with
+  white captions — and it published. For calibration, a good piece runs a mean
+  near 40-80 with beats between 45 and 120.
+- Practically: give the scene a real key light, put an emissive or strongly lit
+  material on the subject, and check that the SUBJECT is what is bright. Light
+  falling only on a backdrop reads as an empty room.
+
+CAMERA. The camera is a third of the storytelling and CAMKEYS is where most
+pieces under-use it. Rules that have held up:
+- MOVE ON EVERY BEAT. A static camera for 40 seconds reads as a screenshot,
+  however good the geometry. Push in on a reveal, orbit to show that a thing is
+  three-dimensional, pull back to give scale at the end.
+- MATCH THE MOVE TO THE BEAT. Naming the subject wants a slow push in. The turn
+  wants a cut or a fast reframe. A mechanism wants an orbit or a track along the
+  thing. The landing wants a pull back that puts the subject in its context.
+- CHANGE SCALE ACROSS THE PIECE. If every shot is framed at the same distance
+  the piece has no rhythm. Go close enough that the subject leaves frame at
+  least once, and wide enough to see where it lives at least once.
+- CUT RATHER THAN FLY between staging areas that are far apart (see cut:1
+  below). A ten-second drift across empty space is ten seconds of nothing.
+- Keep the subject inside x60-900, y200-1560. Content outside that box is
+  reported by the gates and is usually a camera that drifted off its subject.
 
 Hard rules, each learned from a real failure:
+- CAPTION WINDOWS IN THE SAME SCREEN BAND MUST NOT OVERLAP. Every caption is
+  `play(frame, inStart, inEnd, outStart, outEnd)` and is VISIBLE from inStart to
+  outEnd. Two captions whose [inStart, outEnd] ranges overlap, and which sit at
+  the same y, render on top of each other and produce unreadable mush. MEASURED:
+  a published piece showed "THEYNARE PARALLEL" where two captions collided.
+  Before you finish, list every caption's [inStart, outEnd] and check that any
+  two that share a band are disjoint. A stacked pair (a title with a subtitle
+  beneath it) is fine and expected — that is two different bands.
 - `new THREE.Color(r,g,b)` treats floats as ALREADY LINEAR. Use the template's
   `C(0xRRGGBB)` helper for every authored colour.
 - `Matrix4.lookAt(eye,target)` sets +z to normalize(eye-target). To aim a
@@ -172,15 +262,20 @@ Hard rules, each learned from a real failure:
 - A single NaN in shading turns the WHOLE frame black, because the bloom mip
   chain spreads it. Guard any normalize() on a difference of two path points.
 
-Return your answer in EXACTLY this format. The header is JSON; the EDITS are
-NOT, because they carry JavaScript, and embedding multi-kilobyte code inside
-JSON strings means escaping every quote, newline and backslash perfectly across
-the whole payload. One slip discards everything — MEASURED: a 30,505-character
-response was thrown away over a single delimiter.
+Return your answer in EXACTLY this format. NOTHING here is JSON. Not the header,
+not the edits. Escaping every quote, newline and backslash of a multi-kilobyte
+payload perfectly is a coin flip, and one slip discards the whole response —
+MEASURED: a 30,505-character response thrown away over a single delimiter, and
+three more attempts lost in one day to a header whose narration contained an
+apostrophe.
 
-HEADER
-{"title": "short title card text",
- "narration": [{"id": "hook", "text": "one or two spoken sentences"}, ...]}
+===TITLE===
+short title card text, one line
+===NARRATION===
+One segment per line, formatted as:
+  id | one or two spoken sentences
+The id is a short lowercase word (hook, turn, mechanism, land). Write the spoken
+text literally: apostrophes, quotes and numbers all fine, nothing is escaped.
 
 <<<<<<< FIND
 the exact text to find, verbatim, newlines and all
@@ -341,18 +436,42 @@ def author_claude(topic, seconds, template, previous_error=None):
     return _parse_authored(text), _price(usage, True), "claude"
 
 
-def author_gemini(topic, seconds, template, previous_error=None):
-    from google import genai
-    from google.genai import types
-    client = genai.Client(api_key=os.environ["GOOGLE_AI_API_KEY"])
-    r = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=(SYSTEM + "\n\nTEMPLATE:\n" + template + "\n\n"
-                  + _user_prompt(topic, seconds, previous_error)),
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json", max_output_tokens=32000),
-    )
-    return _parse_authored(r.text), 0.0, "gemini"
+# author_gemini USED TO LIVE HERE and has been deleted rather than left dormant.
+# It was the third authoring attempt, and on the two scheduled runs where it was
+# ever actually reached it failed both times with its own JSON errors while
+# burning the last attempt — so both slots published nothing. It also requested
+# response_mime_type="application/json", which the block-delimited format above
+# no longer produces, so it could not have worked again without being rewritten.
+# Dead code that advertises itself as a fallback is worse than no fallback: the
+# next person to read this would believe there was a hedge in place.
+#
+# Authoring is Opus 5 on every attempt. Gemini remains the TTS fallback in
+# app/tts.py, which is a genuinely independent failure domain.
+
+
+def _loose_span(haystack, needle):
+    """
+    Locate `needle` in `haystack` ignoring differences in RUNS OF WHITESPACE.
+
+    Returns (start, end) of the single match, None for no match, and raises on
+    an ambiguous one. Indentation and line wrapping are the only things allowed
+    to differ; every non-space character must still match in order.
+
+    This exists because the exact-match failures were overwhelmingly reflow, not
+    invention. MEASURED across two scheduled runs, both of which were skipped
+    entirely: two attempts died on the POSE anchor with "you invented the
+    anchor" when the model had reproduced the region correctly and re-indented
+    it. Whitespace is the one dimension of a code anchor that carries no meaning
+    and that a model reliably perturbs.
+    """
+    pattern = re.compile(r"\s+".join(re.escape(tok) for tok in needle.split()))
+    hits = list(pattern.finditer(haystack))
+    if not hits:
+        return None
+    if len(hits) > 1:
+        raise ValueError(f"anchor matches {len(hits)} places after whitespace "
+                         f"normalisation, must be unique: {needle[:120]!r}")
+    return hits[0].span()
 
 
 def apply_edits(template, edits):
@@ -362,26 +481,40 @@ def apply_edits(template, edits):
     `find` must be UNIQUE: a prefix match is how a previous run silently
     prepended a whole function to line 1 of the document and produced a
     ReferenceError a thousand lines from the cause.
+
+    Exact match first, then a whitespace-insensitive retry. The relaxation only
+    ever forgives indentation, never content.
     """
     s = template
     for i, e in enumerate(edits):
         find, repl = e["find"], e["replace"]
         n = s.count(find)
-        if n == 0:
-            # Distinguish "never existed" from "an earlier edit ate it" — the
-            # second is by far the more common, and the model can only fix it if
-            # the message says so.
-            why = ("it was still in the ORIGINAL template, so an EARLIER edit in "
-                   "this list replaced the region containing it — your edits "
-                   "overlap"
-                   if find in template else
-                   "it is not in the template at all — you invented the anchor")
-            raise ValueError(f"edit {i}: anchor not found. {why}. "
-                             f"anchor was: {find[:200]!r}")
         if n > 1:
             raise ValueError(f"edit {i}: anchor matches {n} places, must be "
                              f"unique: {find[:120]!r}")
-        s = s.replace(find, repl, 1)
+        if n == 1:
+            s = s.replace(find, repl, 1)
+            continue
+
+        span = _loose_span(s, find)
+        if span:
+            log.info("edit %d: anchor matched only after whitespace "
+                     "normalisation — applied", i)
+            s = s[:span[0]] + repl + s[span[1]:]
+            continue
+
+        # Distinguish "never existed" from "an earlier edit ate it" — the
+        # second is by far the more common, and the model can only fix it if
+        # the message says so. Both checks use the loose match too, so the
+        # diagnosis is not itself defeated by re-indentation.
+        overlapped = template.count(find) or _loose_span(template, find)
+        why = ("it was still in the ORIGINAL template, so an EARLIER edit in "
+               "this list replaced the region containing it — your edits "
+               "overlap"
+               if overlapped else
+               "it is not in the template at all — you invented the anchor")
+        raise ValueError(f"edit {i}: anchor not found. {why}. "
+                         f"anchor was: {find[:200]!r}")
     return s
 
 
@@ -412,12 +545,25 @@ for these first, in this order — they are the failures that actually happen:
 2. NO SUBJECT. If the piece is a background gradient with text over it, that is
    the failure mode to fix — build the thing the video is about as real
    geometry and stage the camera on it.
-3. WASHED OUT. A flat pastel frame with no dark anywhere. The gates report the
+3. TOO DARK. If the gates say "scene is unlit" or a beat is below luma 10, the
+   scene has no lit subject: a dark BACKGROUND is correct, a dark SCREEN is not.
+   Add or raise a key light, make the subject's material emissive, and confirm
+   the light lands on the SUBJECT rather than on a backdrop. A whole-piece mean
+   luma under 18 is a failure; a good piece runs 40-80.
+4. TOO EMPTY. One object alone in the void. A scene needs the subject, the thing
+   it acts on, and something at another depth for scale — a receding field, a
+   ground plane, suspended particles. InstancedMesh makes the third one cheap.
+5. WASHED OUT. A flat pastel frame with no dark anywhere. The gates report the
    1st percentile of luma; low single digits is the target.
-4. BLOWN OUT. Large white areas, or a clipped-pixel figure above ~2%.
-5. UNREADABLE TYPE. Captions overlapping the subject, or too small to read at
-   thumbnail size — which is how this will actually be watched.
-6. MONOTONY. Six tiles that look identical mean six seconds where nothing
+6. BLOWN OUT. Large white areas, or a clipped-pixel figure above ~2%.
+7. STATIC CAMERA. If consecutive tiles are framed identically, the camera is not
+   working. Add a push, an orbit or a pull back on that beat, and vary the
+   framing distance across the piece.
+8. UNREADABLE TYPE. Captions overlapping the subject, captions overlapping EACH
+   OTHER (two whose [inStart, outEnd] windows overlap at the same y render as
+   mush — a shipped piece read "THEYNARE PARALLEL"), or type too small to read
+   at thumbnail size, which is how this will actually be watched.
+9. MONOTONY. Six tiles that look identical mean six seconds where nothing
    happened.
 
 Return your answer in EXACTLY this format. Not JSON — the replacement blocks
@@ -443,11 +589,36 @@ Repeat the block per edit. Write the code literally, with real newlines. Emit no
 blocks at all if there is nothing to fix.
 
 The edits apply to the CURRENT piece.html, which is given to you below — not to
-the original template. Same rules as before: each `find` must appear EXACTLY
-ONCE, edits must not overlap, and anything you delete must not still be
-referenced by pose().
+the original template.
 
-If the sheet genuinely looks good, return {"assessment": "...", "edits": []}.
+NON-OVERLAPPING ANCHORS IS THE RULE THAT ACTUALLY BREAKS THIS. Edits are applied
+IN ORDER to the evolving document. If edit 3 replaces a block, edit 9 cannot
+anchor on text that was inside that block — it no longer exists, the whole list
+is rejected, and NOTHING is changed. MEASURED: on two consecutive scheduled runs
+every proposed repair was discarded exactly this way, and both pieces published
+unrepaired. It is the single most common way this call is wasted.
+
+So, before you send:
+- For each edit, ask which earlier edit's replacement region contains its
+  anchor. If any does, merge the two into ONE edit with a wider anchor.
+- Prefer FEWER, LARGER edits. One edit replacing a whole function is safer than
+  six edits inside it, and costs the same.
+- Each `find` must appear EXACTLY ONCE in the current document.
+- Anything you delete must not still be referenced by pose().
+
+CLEAN GATES DO NOT MEAN A GOOD PIECE. The gates detect a BROKEN render — dead
+frames, lifted blacks, blown highlights, an unlit scene. They cannot see a
+sparse scene, a camera that never moves, a subject that is one grey sphere, or a
+payoff that never arrives. If the gates pass and the sheet is still dull, the
+dull sheet is the thing to fix. Judge the picture, not the numbers.
+
+You may be asked again after your edits land, with a fresh sheet. That is normal
+and it is how this is meant to work: fix the biggest problem each round rather
+than trying to solve everything in one pass.
+
+If the sheet genuinely looks good — a built subject, something at more than one
+depth, visible camera movement, readable type, and a beat-to-beat progression —
+return an assessment saying so and NO edit blocks. That is the signal to stop.
 Do not invent work. A cosmetic tweak that risks a ReferenceError is worse than
 leaving it alone."""
 
@@ -459,17 +630,57 @@ _EDIT_RE = re.compile(
 
 def _parse_authored(text):
     """
-    HEADER json + conflict-marker edits -> the same dict the JSON format gave.
+    ===TITLE=== / ===NARRATION=== blocks + conflict-marker edits -> dict.
 
-    The header stays JSON because it is small, flat and has nothing to escape;
-    the edits do not, for the reason in the prompt.
+    THE HEADER USED TO BE JSON and it was the single largest source of lost
+    authoring attempts. On 2026-07-29 alone, three of six attempts across two
+    scheduled runs died here:
+        Expecting property name enclosed in double quotes: line 1 column 2
+        Extra data: line 1 column 3
+        Expecting ',' delimiter: line 49 column 8
+    Both scheduled slots were skipped as a result. The narration is PROSE — it
+    contains apostrophes, quotes, degree signs and numbers — and the old regex
+    `\\{.*?\\}` was non-greedy, so it also truncated at the first `}` that
+    happened to fall inside a string. There is nothing here worth the escaping
+    risk: a title is one line and narration is one line per segment.
     """
     blocks = _parse_edit_blocks(text)
-    m = re.search(r"HEADER\s*\n(\{.*?\})\s*(?:\n\s*<<<<<<<|\Z)", text, re.S)
-    head = _extract_json(m.group(1)) if m else _extract_json(text)
-    return {"title": head.get("title", ""),
-            "narration": head.get("narration") or [],
+    sections = _parse_sections(text)
+
+    narration = []
+    for line in (sections.get("NARRATION") or "").splitlines():
+        line = re.sub(r"^\s*[-*]\s*", "", line.strip())
+        if not line:
+            continue
+        seg_id, sep, spoken = line.partition("|")
+        if not sep:
+            # A line with no pipe is still speech; give it a positional id
+            # rather than dropping a segment on a formatting slip.
+            seg_id, spoken = f"seg{len(narration) + 1}", line
+        seg_id = re.sub(r"[^a-z0-9_]", "", seg_id.strip().lower()) or \
+            f"seg{len(narration) + 1}"
+        spoken = spoken.strip()
+        if spoken:
+            narration.append({"id": seg_id, "text": spoken})
+
+    return {"title": (sections.get("TITLE") or "").strip().splitlines()[0]
+            if sections.get("TITLE") else "",
+            "narration": narration,
             "edits": blocks["edits"]}
+
+
+def _parse_sections(text):
+    """===NAME=== delimited sections -> {name: body}. Same shape as postcopy."""
+    out = {}
+    parts = re.split(r"^={2,}\s*([A-Z][A-Z0-9_]*)\s*={2,}\s*$", text, flags=re.M)
+    for i in range(1, len(parts) - 1, 2):
+        body = parts[i + 1]
+        # Stop a section at the first edit block: the edits follow the header
+        # and must not be swallowed into NARRATION.
+        body = re.split(r"^<<<<<<<+ *FIND", body, flags=re.M)[0]
+        if body.strip():
+            out[parts[i].strip().upper()] = body.strip()
+    return out
 
 
 def _parse_edit_blocks(text):
@@ -505,32 +716,37 @@ def _contact_sheet(frames_dir, dest, cols=6, rows=4):
     return dest
 
 
-def preflight_repair(piece_path, wd, plan_frames, fps, attempt_cost):
+def _beats_arg(piece_path):
     """
-    Render a strided preflight, gate it, LOOK at it, and let the model fix it.
+    The piece's own BEATS table as check.py's `name:a-b,name:a-b` argument.
 
-    This is the loop a human runs with the motion-video skill -- render a
-    handful of frames, put them in a contact sheet, look, batch the fixes -- and
-    it is the step whose absence produced the two bad pieces so far. Both were
-    mechanically perfect: valid MP4, right length, right codec, and 13 seconds
-    of empty frame that no numeric gate can see.
-
-    Cheap on purpose: ~24 frames at ss2 is about a minute on Fargate, against
-    ~$0.30 for the repair call and a full render that would otherwise be spent
-    on a scene nobody would watch.
-
-    Returns (repaired: bool, cost_usd: float). Never raises -- a failed repair
-    leaves the original piece in place, because the original at least renders.
+    Read back out of the rendered document rather than threaded through as a
+    parameter: inject_timing has already written the real, audio-measured
+    frame ranges in there, so this is the one place guaranteed to agree with
+    what actually rendered.
     """
-    import anthropic
+    try:
+        src = Path(piece_path).read_text()
+    except Exception:                                       # noqa: BLE001
+        return ""
+    m = re.search(r"const BEATS = \[(.*?)\n\];", src, re.S)
+    if not m:
+        return ""
+    rows = re.findall(r"id:\s*'([^']+)'\s*,\s*from:\s*(\d+)\s*,\s*to:\s*(\d+)",
+                      m.group(1))
+    return ",".join(f"{n}:{a}-{b}" for n, a, b in rows)
+
+
+def _preflight(piece_path, wd, plan_frames, fps, tag):
+    """Strided render + gates + contact sheet -> (n_frames, gates, png_b64)."""
     import base64
 
     # .resolve(): render.mjs resolves a RELATIVE --out against its own ROOT, not
     # against cwd, so a relative workdir silently writes the frames somewhere
     # else and the glob below finds nothing. Same trap that made probe_render
     # always report failure.
-    frames = (Path(wd) / "preflight").resolve()
-    sheet = (Path(wd) / "preflight_sheet.png").resolve()
+    frames = (Path(wd) / f"preflight{tag}").resolve()
+    sheet = (Path(wd) / f"preflight_sheet{tag}.png").resolve()
     stride = max(1, plan_frames // 24)
     r = subprocess.run(
         ["node", str(APP / "render.mjs"), "--page", page_url_path(piece_path),
@@ -538,78 +754,182 @@ def preflight_repair(piece_path, wd, plan_frames, fps, attempt_cost):
         cwd=wd, capture_output=True, text=True, timeout=1800, env=render_env())
     n = len(list(frames.glob("*.png")))
     if r.returncode != 0 or n < 8:
-        log.warning("preflight render produced %d frames — skipping repair", n)
-        return False, 0.0
+        log.warning("preflight render produced %d frames", n)
+        return 0, "", None
 
-    g = subprocess.run(
-        [sys.executable, str(APP / "check.py"), "--frames", str(frames),
-         "--fps", str(fps)],
-        capture_output=True, text=True)
+    # --beats IS NOT OPTIONAL HERE. Without it check.py can only judge the piece
+    # as a whole, and the failure this loop exists to catch is LOCAL: one dead
+    # beat inside an otherwise lit piece. MEASURED on a real authored piece —
+    # whole-piece mean luma 35.3 ("all gates passed"), and with the same frames
+    # gated per beat: hook 6.5, turn 4.0, land 2.3, i.e. the opening eight
+    # seconds and the entire closing shot were black. The beats are already
+    # injected into piece.html by inject_timing, so they cost nothing to read.
+    cmd = [sys.executable, str(APP / "check.py"), "--frames", str(frames),
+           "--fps", str(fps)]
+    beats_arg = _beats_arg(piece_path)
+    if beats_arg:
+        cmd += ["--beats", beats_arg]
+    g = subprocess.run(cmd, capture_output=True, text=True)
     gates = (g.stdout + g.stderr).strip()
-    log.info("preflight gates:\n%s", gates)
+    log.info("preflight gates (cycle%s):\n%s", tag, gates)
 
     try:
         _contact_sheet(frames, sheet)
-        png = base64.standard_b64encode(sheet.read_bytes()).decode()
+        return n, gates, base64.standard_b64encode(sheet.read_bytes()).decode()
     except Exception as e:                                  # noqa: BLE001
         log.warning("could not build contact sheet: %s", e)
-        return False, 0.0
+        return n, gates, None
 
-    piece = piece_path.read_text()
+
+def preflight_repair(piece_path, wd, plan_frames, fps, attempt_cost,
+                     max_cycles=None):
+    """
+    Render a strided preflight, gate it, LOOK at it, let the model fix it, and
+    then LOOK AGAIN. Iterative, because one pass demonstrably is not enough.
+
+    This is the loop a human runs with the motion-video skill. The skill's own
+    notes put a number on it: "one run took EIGHT preflight cycles". This ran
+    exactly one, single-shot, with no retry on failure -- and on 2026-07-29 both
+    scheduled pieces that reached it came out of it completely unrepaired:
+
+        repair edits did not apply (edit 17: anchor not found ... your edits
+        overlap) - keeping original      -> repair pass: no change
+        repair edits did not apply (edit 1: anchor not found ... your edits
+        overlap) - keeping original      -> repair pass: no change
+
+    Both then published. The vision pass had correctly identified that they
+    needed work; the edits were simply thrown away, silently, and prep carried
+    on. A repair that cannot survive its own most common failure mode is not a
+    repair pass, it is a log line.
+
+    Two changes:
+      - An apply failure now FEEDS THE ERROR BACK and re-asks, exactly as the
+        authoring loop has always done. Overlapping anchors are a fixable
+        mistake and the model fixes them when told.
+      - The whole thing loops while the gates still fail, re-rendering and
+        re-looking each time, so a fix that helps but does not finish gets
+        another turn.
+
+    Returns (repaired: bool, cost_usd: float). Never raises -- a failed repair
+    leaves the last piece that RENDERED in place, because that at least renders.
+    """
+    import anthropic
+
+    cycles = max_cycles if max_cycles is not None else REPAIR_CYCLES
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    try:
-        with client.messages.stream(
-            # 24000, not 16000: MEASURED, a real repair emitted 16,679 output
-            # tokens (13 edits carrying whole replacement blocks) and 16000 cut
-            # the JSON mid-string, which surfaces as an unparseable response
-            # rather than as "too small".
-            model=CLAUDE_MODEL, max_tokens=24000,
-            thinking={"type": "disabled"},
-            system=REPAIR_SYSTEM,
-            messages=[{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64",
-                                             "media_type": "image/png",
-                                             "data": png}},
-                {"type": "text", "text":
-                    f"{n} frames, evenly spaced across the whole piece.\n\n"
-                    f"GATES:\n{gates}\n\nCURRENT piece.html:\n{piece}"},
-            ]}],
-        ) as stream:
-            resp = stream.get_final_message()
-        text = "".join(b.text for b in resp.content if b.type == "text")
-        usage = (resp.usage.model_dump() if hasattr(resp.usage, "model_dump")
-                 else dict(resp.usage))
-        cost = _price(usage, False)
-        spec = _parse_edit_blocks(text)
-    except Exception as e:                                  # noqa: BLE001
-        log.warning("repair call failed: %s", e)
-        return False, 0.0
+    total_cost = 0.0
+    repaired = False
+    apply_error = None
 
-    log.info("repair assessment: %s", spec.get("assessment", "")[:400])
-    edits = spec.get("edits") or []
-    if not edits:
-        log.info("model reports nothing to fix")
-        return False, cost
+    for cycle in range(cycles):
+        if attempt_cost + total_cost > AUTHOR_COST_CEILING_USD:
+            log.warning("repair stopping: spend $%.2f would exceed the $%.2f "
+                        "ceiling", attempt_cost + total_cost,
+                        AUTHOR_COST_CEILING_USD)
+            break
 
-    # Apply to a COPY. If the repaired piece does not render, the original is
-    # still on disk and still works -- a repair must never be able to make
-    # things worse than not repairing.
-    backup = piece_path.read_text()
-    try:
-        piece_path.write_text(apply_edits(backup, edits))
-    except Exception as e:                                  # noqa: BLE001
-        log.warning("repair edits did not apply (%s) — keeping original", e)
-        piece_path.write_text(backup)
-        return False, cost
+        n, gates, png = _preflight(piece_path, wd, plan_frames, fps,
+                                   f"{cycle}" if cycle else "")
+        if not png:
+            break
 
-    ok, out = probe_render(piece_path, wd)
-    if not ok:
-        log.warning("repaired piece failed its probe render — reverting:\n%s",
-                    out[:800])
-        piece_path.write_text(backup)
-        return False, cost
-    log.info("repair applied: %d edits, $%.3f", len(edits), cost)
-    return True, cost
+        # THERE IS DELIBERATELY NO "GATES ARE CLEAN, STOP" EXIT.
+        #
+        # Two earlier versions had one and both were wrong, for the same reason:
+        # the gates detect a BROKEN render, never a dull one. They cannot see a
+        # sparse scene, a static camera, or a payoff that never lands.
+        #   v1: `if gates_clean and cycle: break` — cycle 0's fix was rejected by
+        #       the probe render, and cycle 1 exited on clean gates before the
+        #       retry could run. The piece shipped with defects the model had
+        #       already written down.
+        #   v2: also required `repaired` — better, but it still stopped after one
+        #       successful fix on a piece whose own repair assessment had called
+        #       the sky beats "nearly black ... captions floating on nothing".
+        #       Gates said clean; the piece was mediocre.
+        #
+        # The honest terminator is the MODEL returning no edits, handled below.
+        # Otherwise this runs its full budget, which is what the skill it
+        # automates does — eight cycles, by hand, on the piece everyone liked.
+        # Each cycle is ~90 s and ~$0.27, and reverts anything that regresses.
+        gates_clean = "gates FAILED" not in gates and "FAIL:" not in gates
+        log.info("repair cycle %d: gates %s", cycle,
+                 "clean" if gates_clean else "FAILING")
+
+        piece = piece_path.read_text()
+        ask = (f"{n} frames, evenly spaced across the whole piece.\n\n"
+               f"GATES:\n{gates}\n\nCURRENT piece.html:\n{piece}")
+        if apply_error:
+            ask = ("YOUR PREVIOUS EDITS WERE REJECTED AND NOTHING WAS CHANGED. "
+                   f"The error was:\n{apply_error}\n\nRe-read the rules about "
+                   "non-overlapping anchors, then send a corrected edit list "
+                   "against the piece below, which is UNCHANGED from before.\n\n"
+                   + ask)
+
+        try:
+            with client.messages.stream(
+                # 24000, not 16000: MEASURED, a real repair emitted 16,679
+                # output tokens (13 edits carrying whole replacement blocks) and
+                # 16000 cut the response mid-string.
+                model=CLAUDE_MODEL, max_tokens=24000,
+                thinking={"type": "disabled"},
+                system=REPAIR_SYSTEM,
+                messages=[{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64",
+                                                 "media_type": "image/png",
+                                                 "data": png}},
+                    {"type": "text", "text": ask},
+                ]}],
+            ) as stream:
+                resp = stream.get_final_message()
+            text = "".join(b.text for b in resp.content if b.type == "text")
+            usage = (resp.usage.model_dump() if hasattr(resp.usage, "model_dump")
+                     else dict(resp.usage))
+            total_cost += _price(usage, False)
+            spec = _parse_edit_blocks(text)
+        except Exception as e:                              # noqa: BLE001
+            log.warning("repair call failed on cycle %d: %s", cycle, e)
+            break
+
+        log.info("repair cycle %d assessment: %s", cycle,
+                 (spec.get("assessment") or "(none given)")[:400])
+        edits = spec.get("edits") or []
+        if not edits:
+            log.info("model reports nothing to fix — stopping")
+            break
+
+        # Apply to a COPY. If the repaired piece does not render, the previous
+        # one is still on disk and still works -- a repair must never be able to
+        # make things worse than not repairing.
+        backup = piece_path.read_text()
+        try:
+            piece_path.write_text(apply_edits(backup, edits))
+        except Exception as e:                              # noqa: BLE001
+            piece_path.write_text(backup)
+            apply_error = str(e)
+            log.warning("repair cycle %d: edits did not apply (%s) — "
+                        "re-asking with the error", cycle, apply_error)
+            continue
+
+        ok, out = probe_render(piece_path, wd)
+        if not ok:
+            piece_path.write_text(backup)
+            apply_error = f"the edited piece threw on render:\n{out[:1200]}"
+            # The renderer's own error is LOGGED, not just fed back. Without it
+            # the operator sees "failed its probe render" and has no way to tell
+            # a ReferenceError from a timeout, which is exactly the position the
+            # first run of this loop left us in.
+            log.warning("repair cycle %d: repaired piece failed its probe "
+                        "render — reverting and re-asking:\n%s",
+                        cycle, out[:1200])
+            continue
+
+        apply_error = None
+        repaired = True
+        log.info("repair cycle %d applied: %d edits (running repair $%.3f)",
+                 cycle, len(edits), total_cost)
+
+    log.info("repair finished: repaired=%s cost $%.3f", repaired, total_cost)
+    return repaired, total_cost
 
 
 def probe_render(piece_path, wd, ss=2):
@@ -698,17 +1018,22 @@ def run():
     if not force_seed:
         if os.environ.get("ANTHROPIC_API_KEY"):
             providers.append(author_claude)
-        if os.environ.get("GOOGLE_AI_API_KEY"):
-            providers.append(author_gemini)
     else:
         log.info("FORCE_SEED set — skipping model authoring")
 
-    # One flat attempt list, consumed once. Claude gets the first two tries
-    # (the second is a repair fed the actual renderer error); Gemini is the
-    # third, so a provider outage or an empty credit balance still yields a
-    # video without doubling the spend.
-    attempts = ([providers[0]] * min(2, MAX_AUTHOR_ATTEMPTS) + providers[1:]
-                )[:MAX_AUTHOR_ATTEMPTS] if providers else []
+    # EVERY ATTEMPT IS OPUS 5. Gemini used to take the last one as a
+    # provider-outage hedge, and MEASURED over the two scheduled runs it was
+    # actually needed for, it failed BOTH times with its own JSON errors
+    # (`Expecting ',' delimiter: line 49`, `Extra data: line 29`) while
+    # producing nothing usable. It was not a hedge, it was a wasted attempt at
+    # the point of maximum urgency — and it is not the model this pipeline is
+    # supposed to be authoring with, so it has been deleted outright rather
+    # than left dormant as a fallback that no longer parses.
+    #
+    # Each retry is fed the PREVIOUS error (a parse failure, a bad anchor, or
+    # the renderer's own stack trace), which is what makes a second attempt
+    # meaningfully different from a re-roll.
+    attempts = providers[:1] * MAX_AUTHOR_ATTEMPTS if providers else []
     for i, fn in enumerate(attempts):
         if cost > AUTHOR_COST_CEILING_USD:
             log.error("author spend $%.2f exceeded the $%.2f ceiling — stopping",

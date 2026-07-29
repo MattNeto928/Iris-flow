@@ -105,6 +105,37 @@ def main():
                     help="max allowed 1st-percentile luma outside exempt frames")
     ap.add_argument("--max-clipped", type=float, default=0.16,
                     help="max allowed fraction of a frame at >=254")
+    # BRIGHTNESS FLOOR. Everything else here catches a render that is BROKEN;
+    # this catches one that is EMPTY, which until now no gate could see.
+    #
+    # MEASURED, from the piece that made this necessary: a crepuscular-rays
+    # piece rendered at whole-piece mean luma 7.9/255, per-beat 5.0 to 12.7 —
+    # a black screen with captions on it, no subject geometry at all — and
+    # check.py printed "all gates passed". It published.
+    #
+    # Reference points on the same scale: the ice piece that everyone agreed
+    # looked good ran mean 77.4 with per-beat 49-121, and the pistol shrimp,
+    # which was mediocre but not empty, ran mean 38.3. So 18 sits well below
+    # anything acceptable and well above the failure. Per-beat 10 catches the
+    # narrower case of one dead beat inside an otherwise lit piece — usually
+    # the last one, after the captions have exited.
+    ap.add_argument("--min-mean-luma", type=float, default=18.0,
+                    help="min allowed whole-piece mean luma (0 disables)")
+    ap.add_argument("--min-beat-luma", type=float, default=10.0,
+                    help="min allowed per-beat mean luma (0 disables)")
+    # DEAD STRETCHES. A mean and a per-beat mean both AVERAGE, and averaging is
+    # exactly what hides "six seconds of nothing in the middle". MEASURED on an
+    # authored piece whose numbers all passed (whole-piece mean 22.7, worst beat
+    # 17.9): the vision pass looked at the same frames and reported "frames 4,
+    # 5, 9, 10, 11, 12 and 13 show nothing but a dark blue gradient" — 7 of 24.
+    # Counting dark FRAMES rather than averaging them separates cleanly:
+    #   ice (good)   0.0% of frames below luma 12
+    #   rays (bad)  92.3%
+    #   that piece  ~29%
+    ap.add_argument("--dark-luma", type=float, default=12.0,
+                    help="a frame below this mean luma counts as dark")
+    ap.add_argument("--max-dark-frac", type=float, default=0.25,
+                    help="max allowed fraction of dark frames (0 disables)")
     ap.add_argument("--safe", default="60,900,200,1560", help="x0,x1,y0,y1 of the safe box")
     ap.add_argument("--jobs", type=int, default=0, help="worker processes (0 = cpu count)")
     ap.add_argument("--fps", type=int, default=24,
@@ -179,6 +210,21 @@ def main():
         worst = idx[int(keep[clipped[keep].argmax()])]
         fails.append(f"blown highlights: {clipped[keep].max()*100:.1f}% of f{worst} at >=254 "
                      f"(limit {args.max_clipped*100:.0f}%)")
+    if args.min_mean_luma and means[keep].mean() < args.min_mean_luma:
+        fails.append(
+            f"scene is unlit: whole-piece mean luma {means[keep].mean():.1f} "
+            f"(floor {args.min_mean_luma:.0f}) -- this is a dark frame with "
+            f"captions on it, not a scene. Light the subject, or build one.")
+    if args.max_dark_frac:
+        dark_mask = means[keep] < args.dark_luma
+        dark_frac = float(dark_mask.mean())
+        if dark_frac > args.max_dark_frac:
+            worst = [int(idx[int(keep[j])]) for j in np.flatnonzero(dark_mask)][:12]
+            fails.append(
+                f"dead stretches: {dark_frac*100:.0f}% of frames are below luma "
+                f"{args.dark_luma:.0f} (limit {args.max_dark_frac*100:.0f}%) -- "
+                f"e.g. f{worst}. The averages can look fine while whole seconds "
+                f"of the middle show nothing.")
 
     scope = f"{len(idx)} of {total}" if args.stride > 1 else f"{total}"
     if span != total:
@@ -201,12 +247,25 @@ def main():
     if beats:
         print("\nper-beat:")
         pos = {f: j for j, f in enumerate(idx)}
+        dim = []
         for name, a, b in beats:
             sel = [pos[f] for f in idx if a <= f <= b]
             if not sel:
                 continue
-            print(f"  {name:12s} f{a:4d}-{b:<4d}  luma {means[sel].mean():5.1f}   "
+            beat_luma = means[sel].mean()
+            print(f"  {name:12s} f{a:4d}-{b:<4d}  luma {beat_luma:5.1f}   "
                   f"lit {lit[sel].mean()*100:5.2f}%")
+            if args.min_beat_luma and beat_luma < args.min_beat_luma:
+                dim.append(f"{name} (f{a}-{b}, luma {beat_luma:.1f})")
+        # Appended AFTER the per-beat table is printed, so the report shows the
+        # numbers that produced the verdict. The `if fails:` block below has not
+        # run yet -- ordering here is load-bearing.
+        if dim:
+            fails.append(
+                f"dead beat(s) below luma {args.min_beat_luma:.0f}: "
+                f"{', '.join(dim)} -- the beat drives nothing on screen. "
+                f"The LAST beat is the usual offender: the narration ends, the "
+                f"captions exit, and the shot is left empty.")
 
     if fails:
         print()
