@@ -708,7 +708,7 @@ def assert_authored(piece, spec):
             f"piece rewrites BEATS, SCENE, CAMKEYS, POSE and CAPTIONS")
 
 
-def apply_edits(template, edits):
+def apply_edits(template, edits, skip_consumed=False):
     """
     Apply {find, replace} in order, failing loudly on a stale anchor.
 
@@ -718,6 +718,21 @@ def apply_edits(template, edits):
 
     Exact match first, then a whitespace-insensitive retry. The relaxation only
     ever forgives indentation, never content.
+
+    skip_consumed=True downgrades ONE specific failure from fatal to a skip: an
+    anchor that is absent from the evolving document but still present in the
+    ORIGINAL, i.e. an earlier edit in this same list already rewrote the region
+    it points at. Used by the repair loop, not by authoring.
+
+    Why: MEASURED on a live run, three consecutive repair cycles were discarded
+    with the identical error on the identical anchor — the model sent "replace
+    all of CAMKEYS" as edit 0 and "patch the color lines inside CAMKEYS" as edit
+    1, was told the edits overlapped, and sent the same shape again. Feeding the
+    error back does not teach it. But edit 0 is a WHOLESALE rewrite of that
+    region and is the model's newer intent for it, so edit 1 is very nearly
+    always redundant: skipping it keeps the useful 90% of the list instead of
+    throwing all of it away, and the loop re-gates afterwards, so anything the
+    skip actually lost gets another cycle to be fixed properly.
     """
     s = template
     for i, e in enumerate(edits):
@@ -742,6 +757,12 @@ def apply_edits(template, edits):
         # the message says so. Both checks use the loose match too, so the
         # diagnosis is not itself defeated by re-indentation.
         overlapped = template.count(find) or _loose_span(template, find)
+        if overlapped and skip_consumed:
+            log.warning(
+                "edit %d SKIPPED: an earlier edit in this list already rewrote "
+                "the region it anchors on, so it is superseded. Keeping the rest "
+                "of the list. anchor was: %r", i, find[:120])
+            continue
         why = ("it was still in the ORIGINAL template, so an EARLIER edit in "
                "this list replaced the region containing it — your edits "
                "overlap"
@@ -1175,7 +1196,10 @@ def preflight_repair(piece_path, wd, plan_frames, fps, attempt_cost,
         # make things worse than not repairing.
         backup = piece_path.read_text()
         try:
-            piece_path.write_text(apply_edits(backup, edits))
+            # skip_consumed: a superseded edit costs one skipped tweak; a
+            # rejected LIST costs the whole cycle, and three cycles in a row
+            # were lost to exactly that.
+            piece_path.write_text(apply_edits(backup, edits, skip_consumed=True))
         except Exception as e:                              # noqa: BLE001
             piece_path.write_text(backup)
             apply_error = str(e)
