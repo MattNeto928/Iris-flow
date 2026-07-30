@@ -282,41 +282,75 @@ function setEnvironment(opts = {}) {
     intensity = 0.55, keyPos = [30, 40, 20], rimPos = [-34, 12, -30],
   } = opts;
 
-  const env = new THREE.Scene();
-  // A big inverted box with a vertical gradient: the cheap stand-in for a sky.
-  {
-    const cv = document.createElement('canvas');
-    cv.width = 4; cv.height = 128;
-    const g = cv.getContext('2d');
-    const grd = g.createLinearGradient(0, 0, 0, 128);
-    grd.addColorStop(0, '#' + C(sky).getHexString());
-    grd.addColorStop(1, '#' + C(ground).getHexString());
-    g.fillStyle = grd; g.fillRect(0, 0, 4, 128);
-    const tex = new THREE.CanvasTexture(cv);
-    tex.colorSpace = THREE.SRGBColorSpace;
-    env.add(new THREE.Mesh(
-      new THREE.BoxGeometry(200, 200, 200),
-      new THREE.MeshBasicMaterial({ map: tex, side: THREE.BackSide })));
+  // BUILT AS A FLOAT32 EQUIRECTANGULAR DataTexture, then prefiltered.
+  //
+  // Two constraints forced this shape, and both were measured rather than
+  // guessed:
+  //
+  // 1. NOT fromScene(). That renders a 256px cubemap through the whole
+  //    pipeline — milliseconds on a GPU, and enough under SwiftShader to blow
+  //    the renderer's page-load budget. prep runs on Fargate, which has no GPU,
+  //    so the first scheduled run after this helper landed failed EVERY
+  //    authoring attempt with "Navigation timeout of 30000 ms exceeded". The
+  //    scenes were fine; the page never finished loading.
+  //
+  // 2. NOT an 8-bit canvas either, which was the first fix and was far too
+  //    weak. A canvas clamps at 1.0, and fromScene's lamps were emissive at 3x,
+  //    so the environment lost most of its energy: measured against a no-IBL
+  //    render, fromScene moved 92% of pixels and the canvas version moved 10.6%
+  //    (mean |diff| 11.2 vs 1.9). An environment map is HDR by nature — the
+  //    whole point is that the bright parts are BRIGHTER than white.
+  //
+  // A Float32 array is both: no scene render, and real values above 1.0.
+  const EW = 128, EH = 64;
+  const data = new Float32Array(EW * EH * 4);
+  const skyC = C(sky), groundC = C(ground);
+
+  // Lights, as HDR lobes on the sphere. `power` is radiance, so >1 is normal.
+  const lamps = [
+    { c: C(key), p: keyPos, tight: 3.4, power: 7.0 },
+    { c: C(rim), p: rimPos, tight: 4.5, power: 2.6 },
+  ].map((l) => {
+    const len = Math.hypot(l.p[0], l.p[1], l.p[2]) || 1;
+    return { ...l, d: [l.p[0] / len, l.p[1] / len, l.p[2] / len] };
+  });
+
+  for (let y = 0; y < EH; y++) {
+    const theta = (y + 0.5) / EH * Math.PI;          // 0 = up
+    const t = y / (EH - 1);
+    for (let x = 0; x < EW; x++) {
+      const phi = ((x + 0.5) / EW - 0.5) * Math.PI * 2;
+      // Direction of this texel, matching three's equirect convention.
+      const dx = Math.sin(theta) * Math.sin(phi);
+      const dy = Math.cos(theta);
+      const dz = -Math.sin(theta) * Math.cos(phi);
+      let r = skyC.r + (groundC.r - skyC.r) * t;
+      let g2 = skyC.g + (groundC.g - skyC.g) * t;
+      let b = skyC.b + (groundC.b - skyC.b) * t;
+      for (const l of lamps) {
+        const dot = dx * l.d[0] + dy * l.d[1] + dz * l.d[2];
+        if (dot <= 0) continue;
+        const w = Math.pow(dot, l.tight) * l.power;
+        r += l.c.r * w; g2 += l.c.g * w; b += l.c.b * w;
+      }
+      const i = (y * EW + x) * 4;
+      data[i] = r; data[i + 1] = g2; data[i + 2] = b; data[i + 3] = 1;
+    }
   }
-  // Emissive quads where the real lights are, so highlights land in the same
-  // place as the shading rather than fighting it.
-  const lamp = (hex, pos, size, power) => {
-    const m = new THREE.Mesh(
-      new THREE.PlaneGeometry(size, size),
-      new THREE.MeshBasicMaterial({ color: C(hex).multiplyScalar(power) }));
-    m.position.set(pos[0], pos[1], pos[2]);
-    m.lookAt(0, 0, 0);
-    env.add(m);
-  };
-  lamp(key, keyPos, 60, 3.0);
-  lamp(rim, rimPos, 45, 1.6);
+
+  const tex = new THREE.DataTexture(data, EW, EH, THREE.RGBAFormat,
+                                    THREE.FloatType);
+  tex.mapping = THREE.EquirectangularReflectionMapping;
+  // Already linear: C() decoded from sRGB, and the lamp maths is linear too.
+  tex.colorSpace = THREE.LinearSRGBColorSpace;
+  tex.needsUpdate = true;
 
   const pmrem = new THREE.PMREMGenerator(renderer);
-  pmrem.compileEquirectangularShader();
-  const rt = pmrem.fromScene(env, 0.04);
+  const rt = pmrem.fromEquirectangular(tex);
   scene.environment = rt.texture;
   scene.environmentIntensity = intensity;
   pmrem.dispose();
+  tex.dispose();
   return { texture: rt.texture,
            set(v) { scene.environmentIntensity = v; } };
 }

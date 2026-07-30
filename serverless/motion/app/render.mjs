@@ -121,7 +121,14 @@ page.on('response', (r) => {
 });
 
 const url = `http://localhost:${port}/${PAGE}?render=1` + (ss ? `&ss=${ss}` : '');
-await page.goto(url, { waitUntil: 'load' });
+// 120s, not puppeteer's default 30. Belt and braces behind the cheap
+// setEnvironment(): module-scope work now includes an environment prefilter, and
+// under SwiftShader (Fargate has no GPU) anything shader-shaped is ~40x slower
+// than the numbers you get developing on a laptop GPU. A 30s default turned a
+// slow load into "Navigation timeout of 30000 ms exceeded", which reads like a
+// broken scene rather than a slow one and failed three authoring attempts in a
+// row before the real cause was found.
+await page.goto(url, { waitUntil: 'load', timeout: 120000 });
 await page.waitForFunction('window.__ready === true', { timeout: 30000 }).catch(() => {});
 
 if (errors.length) {

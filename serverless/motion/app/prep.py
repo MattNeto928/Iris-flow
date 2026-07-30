@@ -155,6 +155,23 @@ common way these fail:
 - Each `find` must match EXACTLY ONCE in the whole document. If a short string
   appears twice, extend it until it is unique.
 
+SIZE BUDGET — 5 TO 9 EDITS, AND THE WHOLE RESPONSE UNDER ~28,000 TOKENS.
+There are five authorable regions (BEATS, SCENE, CAMKEYS, POSE, CAPTIONS), so
+five to nine edits is the natural shape: one per region, plus a few for
+materials or a helper. Replace WHOLE REGIONS rather than making many small
+incisions inside them — one edit carrying a rewritten pose() is safer than six
+edits inside pose(), cannot overlap itself, and costs the same tokens.
+
+This is a hard constraint, not advice. MEASURED across recent runs: attempts
+that finished used 12,000-15,000 output tokens, and attempts that ran to the
+32,000 cap were TRUNCATED mid-list — losing the later anchors, which are
+CAMKEYS, POSE and CAPTIONS. One such response shipped a piece whose captions
+still read "REPLACE THIS LINE". A truncated response is rejected outright, so
+going long does not buy you a bigger scene, it buys you nothing.
+
+If the scene you have in mind does not fit, make the SCENE simpler, not the
+edits smaller.
+
 BUILD THE THING. This is the single biggest quality lever and the one most
 often missed. The subject of the video must exist as REAL 3D GEOMETRY that the
 camera moves around — not as a background gradient with captions on top.
@@ -492,11 +509,32 @@ def author_claude(topic, seconds, template, previous_error=None):
     log.info("claude: stop=%s blocks=%s out=%s text=%d chars",
              r.stop_reason, kinds, usage.get("output_tokens"), len(text))
     if not text.strip():
-        # Name the real cause instead of letting json.loads('') do it.
+        # Name the real cause instead of letting the parser do it.
         raise RuntimeError(
             f"model returned no text (stop_reason={r.stop_reason}, blocks={kinds}, "
             f"output_tokens={usage.get('output_tokens')}) — "
             f"max_tokens likely exhausted by thinking")
+
+    # A TRUNCATED RESPONSE IS A FAILED ATTEMPT, not a partial success.
+    #
+    # This is subtle and it published placeholder text before it was caught.
+    # MEASURED on a scheduled run: `stop=max_tokens out=32000 text=69209 chars`.
+    # The model was still emitting edits when the budget ran out, so the list
+    # arrived with its EARLY edits intact and its later ones missing — and the
+    # early ones are BEATS and SCENE while CAPTIONS comes last. Every edit that
+    # did arrive applied cleanly, and probe_render passed because the piece still
+    # renders perfectly: it renders the TEMPLATE. The scene was accepted with its
+    # captions still reading "REPLACE THIS LINE / AND THIS ONE / TITLE".
+    #
+    # Nothing downstream can catch this. The gates see a lit scene with type on
+    # it. Only the vision pass noticed, and only because it happened to run.
+    if r.stop_reason == "max_tokens":
+        raise RuntimeError(
+            f"response was TRUNCATED at max_tokens ({usage.get('output_tokens')} "
+            f"output tokens, {len(text)} chars). The edit list is incomplete, so "
+            f"the later anchors — usually CAPTIONS — were never written. Send "
+            f"FEWER, LARGER edits: one edit replacing a whole block beats six "
+            f"inside it and costs the same.")
     return _parse_authored(text), _price(usage, True), "claude"
 
 
@@ -536,6 +574,43 @@ def _loose_span(haystack, needle):
         raise ValueError(f"anchor matches {len(hits)} places after whitespace "
                          f"normalisation, must be unique: {needle[:120]!r}")
     return hits[0].span()
+
+
+# Strings that exist ONLY in the unedited template. If any survive into an
+# authored piece, the CAPTIONS region was never really written.
+PLACEHOLDERS = ("REPLACE THIS LINE", "AND THIS ONE", "makeCaption('TITLE'")
+
+
+def assert_authored(piece, spec):
+    """
+    Refuse a piece that is still substantially the template.
+
+    probe_render proves the JavaScript RUNS, and the unedited template runs
+    beautifully — so "it rendered" was never evidence that anything had been
+    authored. A truncated edit list produced exactly this: valid piece, valid
+    render, captions reading "REPLACE THIS LINE".
+
+    Raising here sends the attempt back round the authoring loop with a message
+    that names the problem, which is the only place it can still be fixed
+    cheaply.
+    """
+    left = [p for p in PLACEHOLDERS if p in piece]
+    if left:
+        raise ValueError(
+            f"the piece still contains template placeholder text {left} — the "
+            f"CAPTIONS region was never edited. Every caption must say something "
+            f"about this topic. If your edit list was cut short, send fewer and "
+            f"larger edits.")
+    if not (spec.get("narration") or []):
+        raise ValueError("no narration segments were returned; the piece has "
+                         "nothing to say and nothing to time the beats against")
+    if len(spec.get("edits") or []) < 3:
+        # BEATS, SCENE, CAMKEYS, POSE and CAPTIONS are five distinct regions;
+        # fewer than three edits cannot have touched enough of them to be a
+        # piece about anything.
+        raise ValueError(
+            f"only {len(spec.get('edits') or [])} edit(s) returned — a real "
+            f"piece rewrites BEATS, SCENE, CAMKEYS, POSE and CAPTIONS")
 
 
 def apply_edits(template, edits):
@@ -1130,6 +1205,7 @@ def run():
             cand, c, src = fn(topic, seconds, template, err)
             cost += c
             piece = apply_edits(template, cand["edits"])
+            assert_authored(piece, cand)
             (Path(wd) / "piece.html").write_text(piece)
             ok, out = probe_render(Path(wd) / "piece.html", wd)
             if ok:
