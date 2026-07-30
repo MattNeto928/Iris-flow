@@ -160,7 +160,11 @@ MUSIC_BUCKET = os.environ.get('MUSIC_BUCKET_NAME', 'iris-flow-music-482625028438
 # than re-derived so a motion post sounds like the STEM posts it replaces:
 # _add_background_music in serverless/src/video_pipeline.py. The offset skips the
 # intro of a track that was chosen for its middle.
-MUSIC_VOLUME = float(os.environ.get('MUSIC_VOLUME', '0.20'))
+# 0.10, halved from 0.20 on the note that the bed was too loud against the
+# narration. The voice is mixed at 1.0 and ElevenLabs delivers it fairly hot, so
+# a bed at a fifth of that was competing with consonants rather than sitting
+# under them. Env-overridable, so this can be nudged without a redeploy.
+MUSIC_VOLUME = float(os.environ.get('MUSIC_VOLUME', '0.10'))
 MUSIC_START_S = 15
 
 

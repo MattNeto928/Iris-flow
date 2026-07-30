@@ -50,12 +50,17 @@ sfn = boto3.client('stepfunctions')
 DRY_RUN = os.environ.get('MOTION_DRY_RUN', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
 TOPIC_QUEUE_URL = os.environ.get('QUEUE_URL') or os.environ['TOPIC_QUEUE_URL']
 STATE_MACHINE_ARN = os.environ['STATE_MACHINE_ARN']
-# 60 s matches app/prep.py's own TARGET_DURATION fallback, so a scheduled run
-# and a bare `docker run` of the prep job produce the same length piece. It also
-# sits well inside the retention window the STEM default was tuned against
-# (measured watch-through falls sharply past ~90 s of runtime), and the
-# narration budget is 1.4 words/s — 60 s is about 84 spoken words.
-TARGET_DURATION = int(os.environ.get('TARGET_DURATION', '60'))
+# 75 s, up from 60. Still inside the retention window (measured watch-through
+# falls sharply past ~90 s) and it buys the room the pieces actually need: at
+# 3.2 spoken words/second that is about 105 words and 8-10 beats, against the
+# 6 beats a 60 s target was producing.
+#
+# NOTE THE GAP THIS HAS TO CLOSE. The target is advisory — real duration comes
+# from the MEASURED narration audio, so the piece is as long as the script is.
+# Against a 60 s target recent pieces came in at 41-46 s, because the model wrote
+# six segments and stopped. The authoring prompt now states the segment count and
+# the word budget explicitly rather than leaving the target to imply them.
+TARGET_DURATION = int(os.environ.get('TARGET_DURATION', '75'))
 EXEC_PREFIX = os.environ.get('EXEC_PREFIX', 'iris-motion')
 
 # Random scheduling window: post anywhere from MIN_DELAY_MIN to MAX_DELAY_MIN

@@ -213,6 +213,42 @@ cavitation bubble that renders one blue ball filling the frame for twenty
 seconds has built nothing: give the bubble a surface that deforms, put the claw
 that made it in shot, show the water around it, cut away to the collapse.
 
+GEOMETRY HAS TO EARN ITS PLACE. THE TWO REAL EXAMPLES, AND WHY ONE WORKED:
+
+  THE BEE (worked). Body from three scaled, overlapping spheres so the thorax
+  and abdomen read separately. Six legs from thin cylinders with a joint each.
+  Wings as translucent quads with a curved leading edge, moving fast enough to
+  motion-blur. Stripes from banded materials, not a texture. A flower with
+  individually placed petals, a stamen cluster, a stem. Pollen as instanced
+  specks. Nothing in that scene was a box.
+
+  THE CONTINENTS (failed, and a viewer called it out unprompted). Earth's
+  landmasses as a handful of flat extruded RECTANGLES stuck on a sphere. Every
+  gate passed — they are lit, exposed, on-screen — and it still looked like
+  placeholder art, because a rectangle is not a shape anyone recognises as land.
+
+The rule that separates them: IF THE REAL THING HAS AN IRREGULAR SILHOUETTE,
+BUILD AN IRREGULAR SILHOUETTE. A box or an extruded rectangle is acceptable only
+for something that really is boxy — a crystal facet, a brick, a screen.
+
+For anything organic, geological or fluid, use:
+- LatheGeometry for anything with a profile: a drop, a horn, a shell, a vase.
+- TubeGeometry along a CatmullRomCurve3 for anything that flows: a limb, a
+  ribbon, a current, a vine, a bolt of lightning.
+- A displaced sphere for anything lumpy: deform the vertices of an
+  IcosahedronGeometry with layered sines to get a rock, an island, a cloud, an
+  asteroid. Ten lines, and it never reads as a primitive again.
+- ExtrudeGeometry over a Shape built from BEZIER curves, not straight lines,
+  when you need a flat-ish plate with a real outline — this is the correct way
+  to make a continent, a leaf, a wing, a coastline.
+- Several smaller pieces instead of one big one. The bee's body is three
+  spheres. Detail reads as craft; a single primitive reads as a placeholder.
+
+Two more that cost nothing and change how solid a thing looks: give the subject
+a SECOND material (a rim, an interior, a wet edge) so it is not one flat colour,
+and put at least one CONCAVE feature on it — a hole, a socket, a mouth, a
+notch. Convex-only shapes look inflated.
+
 EVERY BEAT NEEDS SOMETHING ON SCREEN, ALL THE WAY TO THE LAST FRAME.
 - The final beat is the most commonly dead one: the narration ends, the captions
   have exited, and the last 10-15 seconds are an empty backdrop. Measured on a
@@ -240,21 +276,54 @@ with BRIGHT SUBJECTS. Both halves are gated:
   material on the subject, and check that the SUBJECT is what is bright. Light
   falling only on a backdrop reads as an empty room.
 
-CAMERA. The camera is a third of the storytelling and CAMKEYS is where most
-pieces under-use it. Rules that have held up:
-- MOVE ON EVERY BEAT. A static camera for 40 seconds reads as a screenshot,
-  however good the geometry. Push in on a reveal, orbit to show that a thing is
-  three-dimensional, pull back to give scale at the end.
+CAMERA. This is the most under-used part of the whole template and the most
+common reason a finished piece feels cheap. A piece can pass every gate, be
+perfectly lit, and still be lifeless because the camera did nothing.
+
+THE FAILURE TO AVOID, described exactly as a viewer described it: "the camera
+cuts are jumpy, yet it stays in the same place." That is a piece with cuts whose
+shots are nearly identical — so each cut is a visual jolt that buys no new
+information. A cut that lands on the same framing is strictly worse than no cut.
+
+- EVERY CUT MUST CHANGE THE SHOT, not nudge it. Across a cut, at least TWO of
+  these must change substantially: distance to the subject, azimuth (which side
+  you are looking from), height, and what is actually in frame. A cut from
+  three-quarter-front-medium to three-quarter-front-medium is a mistake.
+- 8 TO 12 CAMERA KEYS for a 75-second piece, and 3 to 5 of them CUTS (cut:1).
+  Two keys and a slow drift is not coverage.
+- GO ROUND THE SUBJECT. Vary azimuth across the piece by 180 degrees or more in
+  total. Front, then high three-quarter, then low and close, then profile,
+  then wide. If every shot is from the same side, the subject may as well be
+  flat — and the viewer never learns it is a 3D object at all.
+- CHANGE SCALE HARD. At least one shot close enough that the subject overflows
+  the frame, and at least one wide enough to see where it lives. If every shot
+  is framed at the same distance the piece has no rhythm.
 - MATCH THE MOVE TO THE BEAT. Naming the subject wants a slow push in. The turn
-  wants a cut or a fast reframe. A mechanism wants an orbit or a track along the
-  thing. The landing wants a pull back that puts the subject in its context.
-- CHANGE SCALE ACROSS THE PIECE. If every shot is framed at the same distance
-  the piece has no rhythm. Go close enough that the subject leaves frame at
-  least once, and wide enough to see where it lives at least once.
+  wants a hard cut. A mechanism wants an orbit or a track along the thing. The
+  landing wants a pull back that puts the subject in its context.
 - CUT RATHER THAN FLY between staging areas that are far apart (see cut:1
   below). A ten-second drift across empty space is ten seconds of nothing.
 - Keep the subject inside x60-900, y200-1560. Content outside that box is
   reported by the gates and is usually a camera that drifted off its subject.
+- Never place a camera key inside or within ~2 units of geometry. A frame shot
+  from inside an object renders as a flat full-screen wash; the renderer reports
+  the clearance and the gates will flag the bright frame.
+
+REVEAL THE SCENE OVER TIME — DO NOT BUILD IT ALL ON FRAME 0.
+A piece that shows everything in the first shot has nothing left to give, and
+every later beat is the same picture with new words on it.
+
+- EACH BEAT SHOULD BRING SOMETHING NEW ON SCREEN: a new object, a new part of
+  the subject, a cutaway, a cross-section, a second copy at another scale.
+  Fade it in, grow it, slide it in from off-frame, or cut to it.
+- Build objects for LATER beats and keep them at opacity 0 or scale 0 until
+  their beat arrives — pose() is pure in frame, so gate their visibility on the
+  frame number exactly as the captions do.
+- The strongest structure: name the thing (one object) -> the turn (something
+  changes about it) -> mechanism (a second object arrives and interacts with
+  it) -> detail (cut inside, or a data card with the number) -> land (pull back
+  and show all of it together for the first time).
+- So the LAST beat is usually the fullest frame of the piece, not the emptiest.
 
 Hard rules, each learned from a real failure:
 - CAPTION WINDOWS IN THE SAME SCREEN BAND MUST NOT OVERLAP. Every caption is
@@ -361,26 +430,52 @@ it is what the last two scripts did. Every piece follows this arc:
 2. THE TURN (segment 2). The counterintuitive claim, stated flatly. "Lightning
    doesn't fall. It climbs." This is the reason to keep watching, and it is a
    promise you must then pay off.
-3. THE MECHANISM (3-5 segments). One causal step each, in order, each one
-   earning the next. No step may be skipped as obvious.
+3. THE MECHANISM (4-6 segments). One causal step each, in order, each one
+   earning the next. No step may be skipped as obvious. Each of these segments
+   is also a BEAT, and each beat brings a new object on screen — so the number
+   of mechanism steps you write decides how much the piece has to show.
 4. LAND IT (final segment). Close the loop opened in 1 and 2 — say what the
-   viewer now understands that they did not 40 seconds ago, and NAME THE
+   viewer now understands that they did not 75 seconds ago, and NAME THE
    PHENOMENON again so it is memorable and searchable. A piece that just stops
    has no ending; a piece whose last line restates the turn does.
 
 Write it so the first and last lines could stand alone as the whole idea.
 
-LENGTH. BUDGET WORDS AT 3.2 WORDS/SECOND — MEASURED for this narrator at its
-configured pace. A 45 s piece is about 145 words, a 60 s piece about 190. That
-is roughly 18-22 words per segment: two or three real sentences.
+LENGTH — 9 SEGMENTS, 26 WORDS EACH, 235 WORDS TOTAL. COUNT THEM.
+
+Budget at 3.2 WORDS/SECOND, measured for this narrator at its configured pace.
+9 x 26 = 234 words = 73 seconds. That is the target.
+
+THE PER-SEGMENT COUNT IS THE PART THAT KEEPS GETTING MISSED, so here is the
+size of one correct segment, at 26 words:
+
+  "Salty and chilled, that water becomes heavier than everything beneath it. It
+   sinks two miles, and the whole Atlantic slides north to take its place."
+
+Compare a segment that is too short, at 14 words — this is the length recent
+scripts actually used, and nine of these is a 45-second piece:
+
+  "Cold water is dense. Salty water is denser. Together they sink."
+
+MEASURED FAILURES, so you know this is a real constraint and not a preference:
+against a 60-second target, recent pieces came in at 41, 43 and 46 seconds. The
+most recent, against a 75-second target, wrote nine segments of 19 words and
+landed at 54. Real duration comes from the measured narration AUDIO — the piece
+is exactly as long as the script, nothing downstream can stretch it, and camera
+keys written past the end of the audio are simply never seen.
+
+BEFORE YOU FINISH: count the words in your narration. If the total is under 210,
+the script is too short, and the fix is another MECHANISM STEP with its own new
+object on screen — never longer sentences about a step you already covered.
 
 If you have seen an older version of this instruction quoting 1.4 words/second
 and a 60-word ceiling, IGNORE IT. That number was an artifact of a previous
 voice that padded its output with silence, and writing to it produces a script
-too thin to introduce its own subject or close it — which was the single most
-common complaint about these pieces. You now have room for a real opening and a
-real ending. Use it, but do not pad: sparse, declarative, Anglo-Saxon, every
-sentence earning its place. The visual still carries the weight.
+too thin to introduce its own subject or close it. You now have room for a real
+opening, a real mechanism and a real ending. Use it, but do not pad: sparse,
+declarative, Anglo-Saxon, every sentence earning its place. Length comes from
+having MORE STEPS in the mechanism, never from longer sentences about the same
+step. The visual still carries the weight.
 
 Narration carries the ARGUMENT. Captions carry numbers and labels — never write
 a line that just reads a caption aloud, and never put a number in the narration
@@ -695,15 +790,33 @@ for these first, in this order — they are the failures that actually happen:
 5. WASHED OUT. A flat pastel frame with no dark anywhere. The gates report the
    1st percentile of luma; low single digits is the target.
 6. BLOWN OUT. Large white areas, or a clipped-pixel figure above ~2%.
-7. STATIC CAMERA. If consecutive tiles are framed identically, the camera is not
-   working. Add a push, an orbit or a pull back on that beat, and vary the
-   framing distance across the piece.
-8. UNREADABLE TYPE. Captions overlapping the subject, captions overlapping EACH
-   OTHER (two whose [inStart, outEnd] windows overlap at the same y render as
-   mush — a shipped piece read "THEYNARE PARALLEL"), or type too small to read
-   at thumbnail size, which is how this will actually be watched.
-9. MONOTONY. Six tiles that look identical mean six seconds where nothing
-   happened.
+7. THE CAMERA IS NOT WORKING. Two versions of this, and the second is the one
+   that keeps shipping:
+   (a) STATIC — consecutive tiles framed identically. Add a push, an orbit or a
+       pull back.
+   (b) JUMPY BUT STILL — there ARE cuts, and every shot is from the same side at
+       the same distance, so each cut is a jolt that shows nothing new. This is
+       worse than no cuts. Across the whole sheet the subject should be seen
+       from at least three clearly different ANGLES and at least two clearly
+       different DISTANCES. If it is not, move the camera keys round the
+       subject; do not just add more cuts.
+8. PLACEHOLDER GEOMETRY. A shape that is recognisably a three.js primitive doing
+   duty for something organic — flat extruded rectangles as continents, a bare
+   sphere as a planet, a cylinder as a limb. It will pass every gate and still
+   look like unfinished work. Replace it with a lathe, a tube along a curve, a
+   displaced icosahedron, or an extrude over a Bezier Shape.
+9. EVERYTHING REVEALED AT ONCE. If tile 1 already contains every object in the
+   piece, the later beats have nothing to give. Hold objects at opacity 0 until
+   their beat, and check that the LAST beat is the fullest frame, not the
+   emptiest.
+10. UNREADABLE TYPE. Captions overlapping the subject, captions overlapping EACH
+    OTHER (two whose [inStart, outEnd] windows overlap at the same y render as
+    mush — a shipped piece read "THEYNARE PARALLEL"), or type too small to read
+    at thumbnail size, which is how this will actually be watched.
+11. MONOTONY. Six tiles that look identical mean six seconds where nothing
+    happened. This is the most common thing left un-fixed after a repair pass
+    that concentrated on faults — passing every gate is not the same as being
+    worth watching, and a dull piece is a failed piece.
 
 Return your answer in EXACTLY this format. Not JSON — the replacement blocks
 are JavaScript, and embedding them in JSON strings means escaping every quote,

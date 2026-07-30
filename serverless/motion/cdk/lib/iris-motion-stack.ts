@@ -367,7 +367,11 @@ export class IrisMotionStack extends cdk.Stack {
     const renderJobDef = createJobDef('RenderJobDef', 'render', 4, 8192, 30);
     // 2 vCPU but still 8 GiB: stitch is ffmpeg-bound, not CPU-bound, and the
     // memory is for decoding the frame sequence, not for parallelism.
-    const stitchJobDef = createJobDef('StitchJobDef', 'stitch', 2, 8192, 20);
+    //
+    // 35 min, up from 20: TARGET_DURATION went 60s -> 75s, so a piece is now
+    // ~2250 frames rather than ~1300 — 74% more 1080x1920 PNGs to pull out of S3
+    // and feed to libx264, and the download is the slow half.
+    const stitchJobDef = createJobDef('StitchJobDef', 'stitch', 2, 8192, 35);
     // postprocess: caption + copy the MP4 to the public bucket + schedule to
     // Metricool. It is HTTP-bound, not CPU-bound — 1 vCPU / 2 GiB, the same
     // shape IrisFlowStack gives its own postprocess job. It runs on the FARGATE
@@ -387,7 +391,7 @@ export class IrisMotionStack extends cdk.Stack {
     // slide typography with Pillow at 1080x1350, cuts a story teaser, and makes
     // up to four Metricool calls. 20-minute timeout for the same reason.
     const postprocessJobDef = createJobDef(
-      'PostprocessJobDef', 'postprocess', 2, 4096, 20,
+      'PostprocessJobDef', 'postprocess', 2, 4096, 30,
       {
         // The PUBLIC bucket, NOT MOTION_BUCKET — this is the one Metricool
         // fetches from. app/postprocess.py defaults it to the same name, but
