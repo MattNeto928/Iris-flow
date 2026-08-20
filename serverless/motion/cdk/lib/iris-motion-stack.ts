@@ -287,7 +287,14 @@ export class IrisMotionStack extends cdk.Stack {
         secrets: { ...batchSecrets, ...extraSecrets },
         logging: ecs.LogDrivers.awsLogs({
           streamPrefix: jobDefName,
-          logRetention: logs.RetentionDays.ONE_WEEK,
+          // ONE_MONTH, not ONE_WEEK. A week is shorter than the time it takes
+          // to notice a pipeline has stopped: the 2026-08-02..08-10 prep
+          // failures were diagnosed on 08-20, by which point every container
+          // log had expired (storedBytes 0) and the root cause was
+          // unrecoverable. These groups hold kilobytes, so retention is
+          // effectively free and the only cost of a short window is a blind
+          // post-mortem.
+          logRetention: logs.RetentionDays.ONE_MONTH,
         }),
         // No NAT Gateway in this VPC, so a task with no public IP has no route
         // to ECR, S3 or the model APIs and hangs until the timeout.
@@ -517,7 +524,8 @@ export class IrisMotionStack extends cdk.Stack {
       secrets: batchSecrets,
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'iris-motion-gpu-render',
-        logRetention: logs.RetentionDays.ONE_WEEK,
+        // See the note in createJobDef: a week expires before anyone notices.
+        logRetention: logs.RetentionDays.ONE_MONTH,
       }),
     });
 
@@ -828,7 +836,8 @@ export class IrisMotionStack extends cdk.Stack {
       logs: {
         destination: new logs.LogGroup(this, 'MotionSfnLogGroup', {
           logGroupName: '/iris-motion/state-machine',
-          retention: logs.RetentionDays.ONE_WEEK,
+          // See the note in createJobDef: a week expires before anyone notices.
+          retention: logs.RetentionDays.ONE_MONTH,
           removalPolicy: cdk.RemovalPolicy.DESTROY,
         }),
         level: sfn.LogLevel.ERROR,

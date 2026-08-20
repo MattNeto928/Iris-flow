@@ -8,8 +8,18 @@ difference below is deliberate.
   - The topic comes off the SHARED queue `iris-flow-topic-queue`, not a new
     motion-only one. Both pipelines drawing from the one curated queue is the
     point: `iris-flow-topic-queue-low` is the alarm that says "go refill topics"
-    (scripts/populate_mega_topics.py), and a second queue would leave that alarm
-    watching a pipeline that no longer runs.
+    (scripts/populate_motion_phenomena.py for THIS pipeline —
+    populate_mega_topics.py fills the same queue with chart/manim topics for the
+    STEM renderer, which produce poor Three.js scenes), and a second queue would
+    leave that alarm watching a pipeline that no longer runs.
+
+    TWO THINGS THAT SHARING COSTS, both learned the hard way in 2026-08:
+    a topic is DELETED as soon as it is read (see below), so a run that fails
+    burns it; and SQS caps message retention at 14 days, so the queue cannot be
+    used as a long-term backlog. On 2026-08-10 a batch of ~99 queued on 07-27
+    hit that ceiling and ~53 topics expired unread in a single day — only 1 was
+    consumed. Refill in batches of ~40 (3/day x 14 days), or hold the backlog
+    somewhere durable and top the queue up from it.
 
   - The queue body is a JSON envelope, but motion's app/prep.py reads TOPIC as
     prose and drops it straight into the authoring prompt — it does NOT
@@ -178,7 +188,13 @@ def handler(event, context):
         # A skipped slot is the same trade seed_fallback:false already makes:
         # publish nothing rather than publish filler.
         logger.warning('No queued topic in %s — skipping this slot. '
-                       'Refill with scripts/populate_mega_topics.py',
+                       'Refill with scripts/populate_motion_phenomena.py '
+                       '(NOT populate_mega_topics.py — that one is shaped for the '
+                       'STEM chart renderer, not for Three.js scenes). Enqueue at '
+                       'most ~40: SQS retention is capped at 14 days and this '
+                       'pipeline consumes 3/day, so a larger batch expires '
+                       'unconsumed — which is what emptied the queue on '
+                       '2026-08-10.',
                        TOPIC_QUEUE_URL)
         return {'started': False, 'reason': 'topic-queue-empty'}
 
