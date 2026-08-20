@@ -26,6 +26,7 @@ output/
 !package.json
 !package-lock.json
 !tsconfig.json
+!tsconfig.node.json
 !cdk.json
 !cdk.context.json
 
