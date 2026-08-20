@@ -102,7 +102,37 @@ def main():
     ap.add_argument("--beats", default="", help='name:a-b,name:a-b for a per-beat report')
     ap.add_argument("--lit-threshold", type=int, default=28)
     ap.add_argument("--max-black", type=float, default=24.0,
-                    help="max allowed 1st-percentile luma outside exempt frames")
+                    help="a frame whose 1st-percentile luma exceeds this counts as lifted")
+    # LIFTED BLACKS ARE GATED ON A FRACTION, NOT ON THE WORST FRAME.
+    #
+    # This was `black.max() > 24.0`, and a single frame over the line failed the
+    # whole piece. MEASURED on the two runs that stopped the pipeline in
+    # 2026-08 (p1 luma recomputed from the surviving MP4s):
+    #
+    #   Jul 30, passed     0 of 2345 frames over 24  (0.00%)
+    #   Jul 31, failed   172 of 1883 frames over 24  (9.13%), longest run 126
+    #                    frames = 4.2 s. Looked at: a flat blue gradient with a
+    #                    data card and a caption and NO subject geometry. An
+    #                    empty render. It deserved to fail.
+    #   Aug  1, failed     7 of 2205 frames over 24  (0.32%), longest run 4
+    #                    frames = 0.13 s, in three bursts around f1750. Looked
+    #                    at: translucent vortex geometry stacking up into one
+    #                    washed-out flash. A real defect, but 0.23 s of one, and
+    #                    a 73-second piece was discarded for it.
+    #
+    # 1% separates 0.32% from 9.13% with an order of magnitude of margin either
+    # side. The alternative to publishing the Aug 1 piece was an empty slot.
+    #
+    # This mirrors --max-dark-frac below, which already gates a look defect on
+    # the fraction of frames affected rather than on the single worst one.
+    ap.add_argument("--max-black-frac", type=float, default=0.01,
+                    help="max allowed fraction of lifted frames (0 = gate on the worst frame)")
+    # Insurance against the fraction rule swallowing a catastrophe: a frame this
+    # washed out is a broken render however brief it is. 96 is ~38% grey, far
+    # above the 44-48 the real failures produced, so it only trips on a frame
+    # with essentially no dark pixels anywhere.
+    ap.add_argument("--max-black-hard", type=float, default=96.0,
+                    help="any single frame above this fails regardless of --max-black-frac")
     ap.add_argument("--max-clipped", type=float, default=0.16,
                     help="max allowed fraction of a frame at >=254")
     # BRIGHTNESS FLOOR. Everything else here catches a render that is BROKEN;
@@ -202,7 +232,35 @@ def main():
     if 0 in idx and peak[idx.index(0)] < 24:
         fails.append(f"first frame is blank (peak {peak[idx.index(0)]:.0f}/255) "
                      f"-- it is the thumbnail")
-    if black[keep].max() > args.max_black:
+    lifted = black[keep] > args.max_black
+    if args.max_black_frac:
+        # Perceptibility is about how LONG the blacks stay lifted, so report the
+        # longest contiguous run alongside the fraction: 4 frames is a flash,
+        # 126 frames is four seconds of washed-out picture.
+        worst = idx[int(keep[black[keep].argmax()])]
+        runs, start = [], None
+        for j, v in enumerate(lifted):
+            if v and start is None:
+                start = j
+            elif not v and start is not None:
+                runs.append(j - start)
+                start = None
+        if start is not None:
+            runs.append(len(lifted) - start)
+        longest = max(runs) if runs else 0
+        if float(lifted.mean()) > args.max_black_frac:
+            fails.append(
+                f"blacks lifted: {lifted.sum()} of {len(lifted)} frames over p1 luma "
+                f"{args.max_black:.0f} ({lifted.mean()*100:.2f}%, limit "
+                f"{args.max_black_frac*100:.2f}%), longest run {longest} frames, "
+                f"worst {black[keep].max():.1f} at f{worst} -- bloom threshold likely "
+                f"too low, or the scene has no subject and you are gating background")
+        if black[keep].max() > args.max_black_hard:
+            fails.append(
+                f"blacks blown: p1 luma {black[keep].max():.1f} at f{worst} "
+                f"(hard limit {args.max_black_hard:.0f}) -- no dark pixels anywhere "
+                f"in that frame; a single frame this washed out is a broken render")
+    elif black[keep].max() > args.max_black:
         worst = idx[int(keep[black[keep].argmax()])]
         fails.append(f"blacks lifted: p1 luma {black[keep].max():.1f} at f{worst} "
                      f"(limit {args.max_black}) -- bloom threshold likely too low")
@@ -238,6 +296,10 @@ def main():
     print(f"black level (p1)  median {np.median(black[keep]):.1f}  "
           f"p98 {np.percentile(black[keep],98):.1f}  max {black[keep].max():.1f}   "
           f"(target: low single digits)")
+    print(f"                  {int((black[keep] > args.max_black).sum())} of "
+          f"{len(keep)} frames over {args.max_black:.0f} "
+          f"({(black[keep] > args.max_black).mean()*100:.2f}%, "
+          f"limit {args.max_black_frac*100:.2f}%)")
     print(f"clipped px        max {clipped[keep].max()*100:.2f}% of a frame")
     print(f"lit px outside    max {outside.max()} ({outside.max()/(W_PX*H_PX)*100:.1f}% of frame)   "
           f"box x{safe[0]}-{safe[1]} y{safe[2]}-{safe[3]}")
