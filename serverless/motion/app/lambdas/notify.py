@@ -276,7 +276,16 @@ def _post_lines(plan):
     run. A run that rendered perfectly and silently published nothing looked
     identical to a complete success.
     """
-    post = plan.get('post') or {}
+    # `plan` is None whenever plan.json could not be read — a run that died in
+    # prep before writing it, or a compile run whose video_id is 'unknown'.
+    # Those are exactly the runs this email has to describe, so this must not
+    # raise. An AttributeError here does not lose the mail outright (handler
+    # falls back to a bare "notifier failed" note) but it DOES replace the
+    # report — status, gate output, video link, cost — with a tooling error,
+    # so a dead pipeline reads as a broken notifier. That is what disguised the
+    # 2026-08-02..08-10 prep failures. Every sibling helper (_probe,
+    # _cost_lines, _timing_lines) already guards this way; this one did not.
+    post = (plan or {}).get('post') or {}
     if not post:
         return None
     out = [f"  status         {post.get('status', 'unknown')}"
