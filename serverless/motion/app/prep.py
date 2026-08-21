@@ -37,6 +37,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -44,6 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from common import (logger as log, page_url_path, render_env, save_plan,
                     upload_bytes, upload_file, workdir)
+import failure_log
 from narrate import beats_from_durations
 
 APP = Path(os.path.dirname(os.path.abspath(__file__)))
@@ -708,7 +710,62 @@ def assert_authored(piece, spec):
             f"piece rewrites BEATS, SCENE, CAMKEYS, POSE and CAPTIONS")
 
 
-def apply_edits(template, edits, skip_consumed=False):
+def js_syntax_error(piece_html):
+    """
+    Parse-check the piece's module script with `node --check`. None if it parses.
+
+    WHY THIS EXISTS, MEASURED over 12 repair cycles on 2026-08-20: three of them
+    (25%) committed an edit list that left piece.html unparseable, and the only
+    thing that noticed was the probe render — 30 s later, after Chrome had booted.
+    Two were `SyntaxError` (an edit skipped as superseded orphaned the edits that
+    followed it, leaving a construct opened by one edit and closed by another)
+    and one was a `ReferenceError`.
+
+    `node --check` PARSES ONLY, so browser globals being undefined is irrelevant
+    and it costs ~50 ms. It catches the SyntaxError class outright. It cannot
+    catch the ReferenceError class, which is a runtime temporal-dead-zone fault —
+    probe_render remains the backstop for that, and is still called.
+
+    The point is not only speed: a parse failure here is reported against the
+    edit list, naming the skipped edits, rather than surfacing as an opaque
+    render failure the model cannot act on.
+    """
+    m = re.search(r'<script\s+type="module"\s*>(.*?)</script>', piece_html,
+                  re.S | re.I)
+    if not m:
+        # No module script found. Do not invent a failure — the probe render is
+        # authoritative and will catch a genuinely broken document.
+        log.warning("js_syntax_error: no <script type=\"module\"> found, skipping "
+                    "the parse check")
+        return None
+
+    with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+        f.write(m.group(1))
+        path = f.name
+    try:
+        r = subprocess.run(["node", "--check", path],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            return None
+        # node prints the offending line and a caret; keep it, that is the part
+        # the model can actually use. Strip the temp path so the message does
+        # not change between runs for the same fault.
+        err = (r.stderr or r.stdout or "node --check failed with no output")
+        return err.replace(path, "piece.html").strip()[:1200]
+    except FileNotFoundError:
+        log.warning("js_syntax_error: node not on PATH, skipping the parse check")
+        return None
+    except subprocess.TimeoutExpired:
+        log.warning("js_syntax_error: node --check timed out, skipping")
+        return None
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def apply_edits(template, edits, skip_consumed=False, skipped_out=None):
     """
     Apply {find, replace} in order, failing loudly on a stale anchor.
 
@@ -762,6 +819,14 @@ def apply_edits(template, edits, skip_consumed=False):
                 "edit %d SKIPPED: an earlier edit in this list already rewrote "
                 "the region it anchors on, so it is superseded. Keeping the rest "
                 "of the list. anchor was: %r", i, find[:120])
+            # Recorded, not just logged. A skip is the strongest predictor we
+            # have that the result will not parse: MEASURED over 12 repair
+            # cycles, every cycle that skipped an edit produced unparseable
+            # JavaScript and every cycle that skipped none applied cleanly.
+            # The caller uses this to name the suspect edits in the error it
+            # feeds back, instead of reporting a bare SyntaxError.
+            if skipped_out is not None:
+                skipped_out.append(i)
             continue
         why = ("it was still in the ORIGINAL template, so an EARLIER edit in "
                "this list replaced the region containing it — your edits "
@@ -810,9 +875,25 @@ for these first, in this order — they are the failures that actually happen:
    ground plane, suspended particles. InstancedMesh makes the third one cheap.
 5. WASHED OUT. A flat pastel frame with no dark anywhere. The gates report the
    1st percentile of luma; low single digits is the target.
+   THIS IS THE FAILURE THAT BLOCKS PUBLISHING. MEASURED across 20 archived runs,
+   11 of 12 gate failures were "blacks lifted" and nothing else, at p1 luma up to
+   200/255 — a frame whose darkest 1% is nearly white. Treat it as the default
+   suspect, not an edge case.
+   It is almost never the bloom pass alone. The cause recorded again and again is
+   an OVERSIZED EMISSIVE SUBJECT with the camera inside its glow: the object
+   fills or overflows the frame, its `emissive` and `emissiveIntensity` light the
+   whole plate, bloom multiplies it, and there is no unlit background left to be
+   black. So fix it in this order:
+     - Pull the camera back until the subject is seen WHOLE with visible space
+       around it. At least one beat must show it entire against black.
+     - Then reduce `emissiveIntensity`, and the bloom `strength`/`radius`, and
+       raise the bloom `threshold` so only genuine highlights bloom.
+     - Only then touch tone mapping or exposure.
+   A frame with no black in it reads as a mistake even to someone who could not
+   say why, and the gate will not let it publish.
 6. BLOWN OUT. Large white areas, or a clipped-pixel figure above ~2%.
-7. THE CAMERA IS NOT WORKING. Two versions of this, and the second is the one
-   that keeps shipping:
+7. THE CAMERA IS NOT WORKING. Three versions of this, and the third is the one
+   that costs the most cycles:
    (a) STATIC — consecutive tiles framed identically. Add a push, an orbit or a
        pull back.
    (b) JUMPY BUT STILL — there ARE cuts, and every shot is from the same side at
@@ -821,6 +902,20 @@ for these first, in this order — they are the failures that actually happen:
        from at least three clearly different ANGLES and at least two clearly
        different DISTANCES. If it is not, move the camera keys round the
        subject; do not just add more cuts.
+   (c) AIMED WHERE THE SUBJECT ISN'T. The camera keys hold hardcoded coordinate
+       LITERALS while the objects they are supposed to frame sit somewhere else,
+       so the beat renders empty backdrop with captions floating over nothing.
+       MEASURED: this is the single most common fault in this loop — 8 of 12
+       repair cycles on 2026-08-20 were spent on an empty or near-empty beat,
+       and the clearest was a camera at x≈27 looking at (27,0,0) "where the Moon
+       used to be" while the Moon was at x=58.
+       So: for EVERY beat, name the object that beat is about and confirm it is
+       actually inside the frustum at that camera key. Derive camera positions
+       and lookAt targets FROM the object's own position or a variable holding
+       it — `moon.position` — never from a number you typed. If an edit moves,
+       scales or re-times an object, every camera key that frames it has to move
+       in the same edit. A beat whose subject has left the frame is a dead beat
+       no matter how good the lighting is.
 8. PLACEHOLDER GEOMETRY. A shape that is recognisably a three.js primitive doing
    duty for something organic — flat extruded rectangles as continents, a bare
    sphere as a planet, a cylinder as a limb. It will pass every gate and still
@@ -845,6 +940,14 @@ newline and backslash correctly across thousands of characters. One slip
 invalidates the whole payload.
 
 ASSESSMENT: one or two sentences on what is actually wrong
+
+THE ASSESSMENT LINE IS MANDATORY AND MUST COME FIRST, on every reply, including
+a reply with no edits. It is the only human-readable record of what you saw:
+when it is missing, the operator reading the log has an edit list and no idea
+what it was for. MEASURED: 3 of 12 cycles on 2026-08-20 returned edits with no
+assessment. Name the beat or the tile numbers you are talking about, not just
+the symptom — "tiles 4-6 are empty starfield, the Moon is out of frame" is
+usable; "some frames are empty" is not.
 
 <<<<<<< FIND
 the exact text to find, verbatim, newlines and all
@@ -878,6 +981,22 @@ So, before you send:
   six edits inside it, and costs the same.
 - Each `find` must appear EXACTLY ONCE in the current document.
 - Anything you delete must not still be referenced by pose().
+
+DECLARE BEFORE YOU USE. Every identifier your replacement text reads must be
+declared EARLIER IN THE FILE than the place you are inserting it. `const` and
+`let` are not hoisted: reading one above its declaration throws
+`ReferenceError: Cannot access 'x' before initialization` at render time, which
+costs the whole cycle. MEASURED: this happened on a live run with a `starOrb`
+referenced from a camera block above the `const starOrb = ...` that creates it.
+So if a repair needs an object earlier than it currently exists, MOVE THE
+DECLARATION UP in the same edit — do not add a second reference and hope.
+The same applies to anything you introduce: declare it once, before first use.
+
+YOUR EDIT LIST IS APPLIED, THEN PARSED, BEFORE ANYTHING IS RENDERED. If the
+patched file does not parse, the whole list is reverted and you will be asked
+again with node's own error. An unbalanced brace or paren spanning two edits is
+the usual cause, and it is why "fewer, larger edits" is a correctness rule and
+not a style preference.
 
 CLEAN GATES DO NOT MEAN A GOOD PIECE. The gates detect a BROKEN render — dead
 frames, lifted blacks, blown highlights, an unlit scene. They cannot see a
@@ -1110,6 +1229,9 @@ def preflight_repair(piece_path, wd, plan_frames, fps, attempt_cost,
     import anthropic
 
     cycles = max_cycles if max_cycles is not None else REPAIR_CYCLES
+    # wd is /work/<video_id>; derived rather than passed so this signature stays
+    # as it was. Only used to label failure records.
+    vid = Path(wd).name
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     total_cost = 0.0
     repaired = False
@@ -1148,6 +1270,14 @@ def preflight_repair(piece_path, wd, plan_frames, fps, attempt_cost,
         gates_clean = "gates FAILED" not in gates and "FAIL:" not in gates
         log.info("repair cycle %d: gates %s", cycle,
                  "clean" if gates_clean else "FAILING")
+        if not gates_clean:
+            # The gate text itself is the corpus entry worth having: 11 of 12
+            # gate failures across 20 archived runs were "blacks lifted", which
+            # is only knowable because those gates.txt files happened to outlive
+            # their logs in S3. This makes that durable by design.
+            failure_log.record(
+                "GATE_FAILED", video_id=vid, cycle=cycle,
+                error=gates, cost_usd=total_cost)
 
         piece = piece_path.read_text()
         ask = (f"{n} frames, evenly spaced across the whole piece.\n\n"
@@ -1186,6 +1316,14 @@ def preflight_repair(piece_path, wd, plan_frames, fps, attempt_cost,
 
         log.info("repair cycle %d assessment: %s", cycle,
                  (spec.get("assessment") or "(none given)")[:400])
+        # An edit list with no ASSESSMENT line costs the operator the only
+        # human-readable account of what the model thought was wrong. MEASURED:
+        # 3 of 12 cycles on 2026-08-20 logged "(none given)". Recorded so the
+        # rate can be tracked against prompt changes rather than guessed at.
+        if not (spec.get("assessment") or "").strip():
+            failure_log.record(
+                "ASSESSMENT_MISSING", video_id=vid, cycle=cycle,
+                n_edits=len(spec.get("edits") or []), cost_usd=total_cost)
         edits = spec.get("edits") or []
         if not edits:
             log.info("model reports nothing to fix — stopping")
@@ -1195,16 +1333,51 @@ def preflight_repair(piece_path, wd, plan_frames, fps, attempt_cost,
         # one is still on disk and still works -- a repair must never be able to
         # make things worse than not repairing.
         backup = piece_path.read_text()
+        skipped = []
         try:
             # skip_consumed: a superseded edit costs one skipped tweak; a
             # rejected LIST costs the whole cycle, and three cycles in a row
             # were lost to exactly that.
-            piece_path.write_text(apply_edits(backup, edits, skip_consumed=True))
+            piece_path.write_text(
+                apply_edits(backup, edits, skip_consumed=True,
+                            skipped_out=skipped))
         except Exception as e:                              # noqa: BLE001
             piece_path.write_text(backup)
             apply_error = str(e)
             log.warning("repair cycle %d: edits did not apply (%s) — "
                         "re-asking with the error", cycle, apply_error)
+            failure_log.record(
+                "EDIT_APPLY_FAILED", video_id=vid, cycle=cycle,
+                error=apply_error, n_edits=len(edits),
+                assessment=spec.get("assessment"), cost_usd=total_cost)
+            continue
+
+        # PARSE-CHECK BEFORE PAYING FOR A PROBE RENDER. ~50 ms against ~30 s,
+        # and it turns an opaque render failure into an error the model can act
+        # on. Skipping an edit is the strongest predictor of this firing, so the
+        # skipped indices are named: MEASURED, every cycle that skipped an edit
+        # produced unparseable JavaScript.
+        syntax_error = js_syntax_error(piece_path.read_text())
+        if syntax_error:
+            piece_path.write_text(backup)
+            hint = ""
+            if skipped:
+                hint = (
+                    f" Edit(s) {', '.join(str(i) for i in skipped)} were SKIPPED "
+                    "as superseded — an earlier edit had already rewritten the "
+                    "region they anchor on. Dropping them very likely orphaned "
+                    "the edits that came after, leaving a construct opened by "
+                    "one edit and closed by another. Send ONE wider edit that "
+                    "covers that whole region instead of several inside it.")
+            apply_error = (f"your edit list left piece.html unparseable, so "
+                           f"NOTHING was changed:\n{syntax_error}{hint}")
+            log.warning("repair cycle %d: edits did not PARSE (skipped=%s) — "
+                        "reverting and re-asking:\n%s",
+                        cycle, skipped or "none", syntax_error)
+            failure_log.record(
+                "EDIT_SYNTAX_ERROR", video_id=vid, cycle=cycle,
+                error=syntax_error, skipped_edits=skipped, n_edits=len(edits),
+                assessment=spec.get("assessment"), cost_usd=total_cost)
             continue
 
         ok, out = probe_render(piece_path, wd)
@@ -1218,6 +1391,10 @@ def preflight_repair(piece_path, wd, plan_frames, fps, attempt_cost,
             log.warning("repair cycle %d: repaired piece failed its probe "
                         "render — reverting and re-asking:\n%s",
                         cycle, out[:1200])
+            failure_log.record(
+                "PROBE_RENDER_FAILED", video_id=vid, cycle=cycle,
+                error=out[:1200], skipped_edits=skipped, n_edits=len(edits),
+                assessment=spec.get("assessment"), cost_usd=total_cost)
             continue
 
         apply_error = None
