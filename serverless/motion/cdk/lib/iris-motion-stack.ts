@@ -13,6 +13,7 @@ import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as sfn from 'aws-cdk-lib/aws-stepfunctions';
 import * as tasks from 'aws-cdk-lib/aws-stepfunctions-tasks';
+import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import { Construct } from 'constructs';
 
 /**
@@ -169,6 +170,55 @@ export class IrisMotionStack extends cdk.Stack {
     // =====================
     // IAM roles for Batch
     // =====================
+    // =====================
+    // Failure corpus — DynamoDB
+    // =====================
+    // WHY A TABLE AND NOT JUST LOGS. The interesting question about a repair
+    // failure is longitudinal: "did adding a camera-target rule to
+    // REPAIR_SYSTEM reduce EDIT_SYNTAX_ERROR over the next month?" CloudWatch
+    // cannot answer that at any retention, and the 2026-08 outage proved the
+    // weaker version of the point — the prep failures of 08-02..08-10 were
+    // investigated on 08-20 against log groups that had already expired, so
+    // their root cause is permanently unknown. This table is the durable record
+    // the prompts get curated against.
+    //
+    // KEY DESIGN. Partition on `failure_class` and sort on
+    // `<created_at>#<video_id>#<cycle>`, because the query that matters is "read
+    // every EDIT_SYNTAX_ERROR in time order". Partition cardinality is low by
+    // design — there are a handful of classes — which would be a hot-partition
+    // problem at volume but is irrelevant here: three runs a day of at most six
+    // cycles is single-digit writes per day, six orders of magnitude below a
+    // 1000 WCU/s partition limit.
+    //
+    // A GSI on video_id answers the other question, "everything that went wrong
+    // in this one run", which is what you want when reading a failure email.
+    const failureTable = new dynamodb.Table(this, 'FailureTable', {
+      tableName: 'iris-motion-failures',
+      partitionKey: { name: 'failure_class', type: dynamodb.AttributeType.STRING },
+      sortKey: {
+        name: 'occurred_at_video_cycle',
+        type: dynamodb.AttributeType.STRING,
+      },
+      // On-demand: the write rate is single-digit per day and bursty around a
+      // bad deploy. Provisioning for that is pure overhead.
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      // RETAIN, deliberately. This is hand-curated training data about our own
+      // mistakes and it is not reproducible — every other resource in this stack
+      // can be rebuilt from source, this one cannot. A `cdk destroy` must not be
+      // able to delete it.
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+      // NO TTL. Accumulating history IS the feature; expiring it would delete
+      // exactly the baseline a prompt change has to be measured against.
+    });
+
+    failureTable.addGlobalSecondaryIndex({
+      indexName: 'by-video',
+      partitionKey: { name: 'video_id', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'epoch_ms', type: dynamodb.AttributeType.NUMBER },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+
     const batchJobRole = new iam.Role(this, 'BatchJobRole', {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
     });
@@ -189,6 +239,15 @@ export class IrisMotionStack extends cdk.Stack {
     // the METRICOOL_* keys injected below.
     apiSecrets.grantRead(batchJobRole);
 
+    // APPEND-ONLY, not grantWriteData. grantWriteData would also hand out
+    // DeleteItem and UpdateItem, and this corpus is a record of what went wrong
+    // — a job should be able to add to it and to do nothing else. app/
+    // failure_log.py only ever calls put_item. Reading it back (summarise())
+    // needs Scan, which you run from a shell with your own credentials.
+    batchJobRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['dynamodb:PutItem'],
+      resources: [failureTable.tableArn],
+    }));
     const batchExecRole = new iam.Role(this, 'BatchExecRole', {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
       managedPolicies: [
@@ -243,6 +302,9 @@ export class IrisMotionStack extends cdk.Stack {
       // `Tagging` value; without the tag the expire-frames lifecycle rule above
       // matches nothing and frames accumulate forever.
       FRAME_OBJECT_TAGGING: `${FRAME_TAG_KEY}=${FRAME_TAG_VALUE}`,
+      // app/failure_log.py no-ops entirely when this is unset, so a local run
+      // or a test writes nothing and needs no credentials.
+      FAILURE_TABLE: failureTable.tableName,
     };
 
     // Only the two keys this pipeline actually uses. Injected by the ECS agent
@@ -1012,6 +1074,11 @@ export class IrisMotionStack extends cdk.Stack {
     // =====================
     // Outputs
     // =====================
+    new cdk.CfnOutput(this, 'FailureTableName', {
+      value: failureTable.tableName,
+      description: 'DynamoDB failure corpus, for curating REPAIR_SYSTEM against real data',
+    });
+
     new cdk.CfnOutput(this, 'MotionBucketName', {
       value: motionBucket.bucketName,
       description: 'S3 bucket for iris-motion jobs, frames and output',
